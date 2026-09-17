@@ -14,7 +14,17 @@
 //! - Alternatives must be attempted before producing output or side effects.
 //! - A successful prefix match commits the handler to that branch by
 //!   convention: the handler must `return` when the branch finishes, even when
-//!   no response was produced. Dispatch supplies the fallback 404.
+//!   no response was produced. Dispatch supplies the fallback 404. Because a
+//!   consumed prefix can itself reach the root (`GET /users` becomes root after
+//!   consuming `users`), omitting the branch return lets a request fall
+//!   through to a later root handler; a handler delegating a whole branch must
+//!   use `return child(ctx, req, res)`.
+//! - Matching never returns from the caller: a matcher that succeeds only
+//!   consumes segments, and the handler decides whether (and how) to return.
+//! - Unsupported methods are unhandled and initially become 404; automatic
+//!   405/Allow and HEAD-to-GET fallback are outside this slice.
+//! - Match cost depends on attempted siblings and string comparisons; there is
+//!   no unconditional O(depth) guarantee.
 const std = @import("std");
 
 /// HTTP request methods. Phase 0 supports method-only matching (`isGet`).
@@ -265,6 +275,110 @@ test "explicit branch returns commit the prefix" {
     // GET /other
     var other = req(.get, &.{"other"});
     try std.testing.expectEqual(Outcome.unmatched, route(&other));
+}
+
+test "consumed prefix cannot fall through to the root route" {
+    const Outcome = enum { root, user, committed_404, unmatched };
+
+    // Correct: the users branch commits with an explicit return, so a
+    // consumed `/users` never reaches the root handler below.
+    const committed = struct {
+        fn run(request: *Request) Outcome {
+            if (request.onLiteral("users")) {
+                if (request.onSegment()) |_| {
+                    if (request.isRoot() and request.isGet()) return .user;
+                }
+                return .committed_404; // branch boundary
+            }
+            if (request.isRoot() and request.isGet()) return .root;
+            return .unmatched;
+        }
+    }.run;
+
+    var root_path = req(.get, &.{});
+    try std.testing.expectEqual(Outcome.root, committed(&root_path));
+
+    // GET /users consumes the prefix and commits; it does not hit the root.
+    var users = req(.get, &.{"users"});
+    try std.testing.expectEqual(Outcome.committed_404, committed(&users));
+    try std.testing.expect(users.isRoot()); // consumed, yet committed
+
+    var user = req(.get, &.{ "users", "42" });
+    try std.testing.expectEqual(Outcome.user, committed(&user));
+
+    // Broken for contrast: without the branch `return`, a consumed `/users`
+    // is root by the time control reaches the root handler, so it is served
+    // as the root route — the fall-through the convention forbids.
+    const fallen_through = struct {
+        fn run(request: *Request) Outcome {
+            if (request.onLiteral("users")) {
+                if (request.onSegment()) |_| {
+                    if (request.isRoot() and request.isGet()) return .user;
+                }
+                // missing branch return
+            }
+            if (request.isRoot() and request.isGet()) return .root;
+            return .unmatched;
+        }
+    }.run;
+
+    var fallthrough = req(.get, &.{"users"});
+    try std.testing.expectEqual(Outcome.root, fallen_through(&fallthrough));
+}
+
+test "delegated branches use return child(...)" {
+    const Outcome = enum { root, user, committed_404, unmatched };
+
+    const child = struct {
+        fn run(request: *Request) Outcome {
+            if (request.isRoot() and request.isGet()) return .user;
+            return .committed_404;
+        }
+    }.run;
+
+    // A whole branch is delegated with `return child(request, id)`; the child
+    // decides and returns to the caller.
+    const parent = struct {
+        fn run(request: *Request) Outcome {
+            if (request.isRoot() and request.isGet()) return .root;
+            if (request.onLiteral("users")) {
+                if (request.onSegment()) |_| {
+                    return child(request);
+                }
+                return .committed_404;
+            }
+            return .unmatched;
+        }
+    }.run;
+
+    var root_path = req(.get, &.{});
+    try std.testing.expectEqual(Outcome.root, parent(&root_path));
+
+    var user = req(.get, &.{ "users", "42" });
+    try std.testing.expectEqual(Outcome.user, parent(&user));
+
+    var extra = req(.get, &.{ "users", "42", "extra" });
+    try std.testing.expectEqual(Outcome.committed_404, parent(&extra));
+
+    var users = req(.get, &.{"users"});
+    try std.testing.expectEqual(Outcome.committed_404, parent(&users));
+
+    // Broken for contrast: discarding the child's result loses the branch
+    // decision; the parent continues past the delegated branch.
+    const lost_child = struct {
+        fn run(request: *Request) Outcome {
+            if (request.onLiteral("users")) {
+                if (request.onSegment()) |_| {
+                    _ = child(request); // missing `return`
+                }
+                return .unmatched; // reached after the delegated branch
+            }
+            return .unmatched;
+        }
+    }.run;
+
+    var user_lost = req(.get, &.{ "users", "42" });
+    try std.testing.expectEqual(Outcome.unmatched, lost_child(&user_lost));
 }
 
 test "slash rules preserve trailing and repeated slash segments" {

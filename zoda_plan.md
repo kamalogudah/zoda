@@ -286,6 +286,26 @@ Recorded for Phase 0 on the primary platform with the pinned compiler
   compiler at commit `8f43b69` — run
   [35215723208](https://github.com/kamalogudah/zoda/actions/runs/35215723208).
 
+### §4.0.2 Phase 0 verification (terminal routes and committed branches)
+
+Verification-only pass for terminal routes and committed branch semantics
+(§3.1, §3.5, §5.3), on the pinned compiler (`0.16.0`, `x86_64-linux`):
+
+- Socket-free, plugin-free tests in `src/router.zig` cover method-only and
+  terminal checks, failed and nested matches, restoration, root, trailing and
+  repeated slashes, explicit branch returns, the consumed-`/users` fall-through
+  hazard (with and without the branch `return`), and `return child(...)`
+  delegation — plus the discarded-result variant that loses the child's
+  decision.
+- Documented in `src/router.zig` header docs and §3.1/§3.5/§5.3: matchers do
+  not return from callers; unsupported methods initially use 404; automatic
+  405/Allow and HEAD-to-GET fallback are outside this slice; and cost depends
+  on attempted siblings and string comparisons (no O(depth) guarantee).
+- Validation: `zig fmt --check build.zig src`, `zig build`, `zig build test`
+  (15/15 tests), and `./zig-out/bin/zoda` smoke-run all pass.
+- CI: both jobs pass on the pinned compiler at commit `#next` — run
+  `#pending`.
+
 ### Phase 0.5 — Request/response contract
 
 - [ ] Implement §3.4 ownership, bounded buffering, query/header semantics,
