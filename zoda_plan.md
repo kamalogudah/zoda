@@ -239,11 +239,16 @@ retain the earlier roadmap's identifiers where practical.
 
 ### Phase A — Toolchain prerequisite
 
-- [ ] Select and record an exact Zig version before Phase 0; the package's
+- [x] Select and record an exact Zig version before Phase 0; the package's
       existing minimum of 0.16.0 is not a reproducible pin.
-- [ ] Add CI for formatting, `zig build`, and `zig build test`; document the
+      Pinned: Zig **0.16.0**. See [PLATFORM.md](PLATFORM.md) §1.
+- [x] Add CI for formatting, `zig build`, and `zig build test`; document the
       primary supported OS/architecture and allocator/threading assumptions.
+      See `.github/workflows/ci.yml` and [PLATFORM.md](PLATFORM.md).
 - **Exit:** a clean checkout passes on the selected version and primary target.
+      Passed: `zig fmt --check`, `zig build`, `zig build test`, and the demo
+      smoke-run all succeed on `x86_64-linux` with the pinned compiler.
+      Evidence recorded in [PLATFORM.md](PLATFORM.md) §7.
 
 ### Phase 0 — Router core
 
@@ -515,7 +520,8 @@ examples must track the implemented public API once code lands.
 
 Remaining decisions have explicit gates:
 
-- Exact compiler version and primary platform: Phase A, before implementation.
+- ~~Exact compiler version and primary platform~~ — resolved in Phase A:
+  Zig 0.16.0 on `x86_64-linux` ([PLATFORM.md](PLATFORM.md)).
 - Concrete I/O/concurrency APIs: Phase 2, before the socket slice is accepted.
 - Response streaming API: separate ADR in Phase 2b, only if needed.
 - HTTP/2 support: Phase 2c feasibility result.
