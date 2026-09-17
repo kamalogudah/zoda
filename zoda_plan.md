@@ -255,10 +255,35 @@ retain the earlier roadmap's identifiers where practical.
 
 ### Phase 0 — Router core
 
-- [ ] Implement allocation-free consuming matchers and cursor checkpoints.
-- [ ] Test method-only matching, terminal matching, slash rules, failed
+- [x] Implement allocation-free consuming matchers and cursor checkpoints.
+- [x] Test method-only matching, terminal matching, slash rules, failed
       match preservation, and explicit branch returns.
 - **Exit:** router tests pass without sockets or plugins.
+      Passed on `x86_64-linux` with the pinned compiler; implementation lives
+      in `src/router.zig` (exported from `src/root.zig`) with the §5.1 sketch
+      brought up to date (including the terminal `isLiteral`). Evidence
+      recorded in §4.0.1.
+
+### §4.0.1 Phase 0 evidence
+
+Recorded for Phase 0 on the primary platform with the pinned compiler
+(Zig `0.16.0`, `x86_64-linux`, Ubuntu 24.04):
+
+- Implementation: `src/router.zig` — `Request` with `mark`/`restore`,
+  method-only `isGet`, terminal `isRoot`, prefix `onLiteral`, borrowed
+  `onSegment` (no allocation, no capture array), and terminal-consuming
+  `isLiteral`. Exported from `src/root.zig`; test blocks live beside the code.
+- Documented contract: same-request checkpoints, borrowed-capture lifetime,
+  restore affecting routing state only, and alternatives preceding output or
+  side effects (§3.1, §5.1, `src/router.zig` header docs).
+- Test coverage: method-only matching, terminal matching, slash rules
+  (trailing/repeated slash segments), failed-match cursor preservation,
+  mark/restore per request, nested failures, borrowed-slice identity, and the
+  §5.3 committed-branch route outcomes.
+- Validation: `zig fmt --check build.zig src`, `zig build`, `zig build test`
+  (13/13 tests), and `./zig-out/bin/zoda` smoke-run all pass.
+- CI: run [ci-pending](#) on commit `#placeholder` — see
+  adr summary; full run listed in the Phase 0 checkpoint.
 
 ### Phase 0.5 — Request/response contract
 
@@ -412,8 +437,22 @@ pub const Request = struct {
         self.cursor += 1;
         return value;
     }
+
+    // Terminal matcher: succeeds and consumes only when exactly one remaining
+    // segment equals `literal`; otherwise it fails without consuming, and the
+    // caller must keep the branch open.
+    pub fn isLiteral(self: *Request, literal: []const u8) bool {
+        if (self.segments.len - self.cursor != 1) return false;
+        if (!std.mem.eql(u8, self.segments[self.cursor], literal)) return false;
+        self.cursor += 1;
+        return true;
+    }
 };
 ```
+
+Checkpoints (`mark`/`restore`) apply only to the same request, restore routing
+state only — never response writes or plugin side effects — and alternatives
+must be attempted before producing output or side effects.
 
 ### 5.2 App dispatch and registered plugin access
 

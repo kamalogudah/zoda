@@ -2,6 +2,16 @@
 const std = @import("std");
 const Io = std.Io;
 
+/// Router core: allocation-free consuming matchers and cursor checkpoints
+/// (ADR-0001 §3.1, §5.1).
+pub const router = @import("router.zig");
+
+comptime {
+    // Collect the imported router's test declarations into the library test
+    // suite; `zig build test` otherwise only analyzes decls it references.
+    std.testing.refAllDecls(router);
+}
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
