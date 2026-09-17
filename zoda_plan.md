@@ -472,13 +472,43 @@ Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
 
 ### Phase 1 — Application and first plugin
 
-- [ ] Implement typed handler context, registered JSON instance, and plugin
+- [x] Implement typed handler context, registered JSON instance, and plugin
       request-state initialization and cleanup.
-- [ ] Test two differently configured apps, isolated request states, and
+- [x] Test two differently configured apps, isolated request states, and
       reverse cleanup after initialization or handler failure.
-- [ ] Exercise the routes in §5 with status/body assertions.
+- [x] Exercise the routes in §5 with status/body assertions.
 - **Exit:** JSON goes through the registered instance, with correct root,
       prefix-only, extra-segment, and unsupported-method outcomes.
+
+### §4.0.7 Phase 1 evidence — application dispatch, JSON plugin, and request state
+
+Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
+`x86_64-linux`, Ubuntu 24.04):
+
+- Implementation:
+  - `src/app.zig` — `App(Plugins)` with typed `Context`, `RequestState(Plugins)`
+    generated from plugin instances, declaration-order initialization, and
+    reverse-order cleanup on both success and partial failure.
+  - `src/plugins/json.zig` — stateless `Json` plugin instance with `render` that
+    serializes values through `Response.replaceJson`.
+  - Both modules are exported from `src/root.zig`.
+- Contract (ADR-0001 §3.2, §5.2, §5.3): plugins declare `State`,
+  `initRequest`, and `deinitRequest`; stateless plugins use an empty state;
+  cleanup runs in reverse declaration order and is infallible; dispatch returns
+  an independently owned response; unhandled routes receive the fallback 404.
+- Test coverage (8 new tests; 60/60 total): init/deinit order and reverse
+  cleanup on a partial initialization failure, §5.3 route outcomes for
+  `GET /`, `GET /users/42`, `GET /users`, `GET /users/42/extra`,
+  `GET /users/42/`, and `POST /users/42`, two differently configured apps,
+  state cleanup after handler failure, response lifetime after request arena
+  destruction, and JSON plugin rendering.
+- Validation:
+  - `zig version` → `0.16.0`.
+  - `zig fmt --check build.zig src` → clean.
+  - `zig build` → success.
+  - `zig test -Mroot=src/root.zig` → 60/60 tests pass.
+  - `zig build test` → success.
+  - `./zig-out/bin/zoda` → exits 0.
 
 ### Phase 2 — HTTP/1.1 vertical slice
 

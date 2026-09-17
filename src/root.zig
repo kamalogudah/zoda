@@ -17,6 +17,18 @@ pub const response = @import("response.zig");
 /// Bounded buffering and protocol error mappings (ADR-0001 §3.4).
 pub const buffering = @import("buffering.zig");
 
+/// Application dispatch and typed handler context (ADR-0001 §3.2, §5.2).
+pub const app = @import("app.zig");
+
+/// Built-in plugins.
+pub const plugins = struct {
+    /// Stateless JSON response plugin (ADR-0001 §5.3).
+    pub const json = @import("plugins/json.zig");
+};
+
+/// Re-export the JSON plugin instance type for convenience.
+pub const Json = plugins.json.Json;
+
 comptime {
     // Collect the imported modules' test declarations into the library test
     // suite; `zig build test` otherwise only analyzes decls it references.
@@ -24,6 +36,8 @@ comptime {
     std.testing.refAllDecls(request);
     std.testing.refAllDecls(response);
     std.testing.refAllDecls(buffering);
+    std.testing.refAllDecls(app);
+    std.testing.refAllDecls(plugins.json);
 }
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
