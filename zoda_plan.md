@@ -303,8 +303,8 @@ Verification-only pass for terminal routes and committed branch semantics
   on attempted siblings and string comparisons (no O(depth) guarantee).
 - Validation: `zig fmt --check build.zig src`, `zig build`, `zig build test`
   (15/15 tests), and `./zig-out/bin/zoda` smoke-run all pass.
-- CI: both jobs pass on the pinned compiler at commit `#next` — run
-  `#pending`.
+- CI: both jobs pass on the pinned compiler at commit `9a706b7` — run
+  [35216960748](https://github.com/kamalogudah/zoda/actions/runs/35216960748).
 
 ### Phase 0.5 — Request/response contract
 
