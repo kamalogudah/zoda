@@ -1,8 +1,8 @@
 //! Router core: allocation-free consuming matchers and cursor checkpoints
 //! (ADR-0001 §3.1, §5.1).
 //!
-//! A `Request` carries decoded path segments (and query pairs, populated by the
-//! Phase 0.5 request parser) and a single mutable `cursor`. Matchers only
+//! A `Request` carries the complete buffered HTTP request plus decoded path
+//! segments and a single mutable `cursor`. Matchers only
 //! read `segments` and never allocate; consumed values are borrowed slices into
 //! the request's own storage. There is deliberately no second capture array:
 //! `onSegment` returns the borrowed segment directly.
@@ -51,6 +51,13 @@ pub const QueryPair = struct {
     value: []const u8,
 };
 
+/// A request header. Names retain their wire spelling; lookup is
+/// case-insensitive and repeated fields remain separate and ordered.
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 /// Iterates every value for a query key, in request order, including
 /// duplicates. Allocation-free; backed by the request's query pair slice.
 pub const QueryValueIterator = struct {
@@ -68,7 +75,8 @@ pub const QueryValueIterator = struct {
     }
 };
 
-/// A request carrying decoded path segments and a consuming cursor.
+/// A complete buffered request carrying wire metadata, decoded path/query
+/// data, and a consuming routing cursor.
 ///
 /// The caller owns the request and its storage (an arena in later phases) and
 /// keeps it alive while routing reads borrowed segments. Returned capture
@@ -77,7 +85,11 @@ pub const Request = struct {
     method: Method,
     segments: []const []const u8,
     cursor: usize = 0,
+    /// Raw origin-form request target.
+    target: []const u8 = &.{},
     query: []const QueryPair = &.{},
+    headers: []const Header = &.{},
+    body: []const u8 = &.{},
 
     /// Same-request checkpoint: returns the current cursor position. A saved
     /// checkpoint is meaningful only for the request it came from; it must not
@@ -149,6 +161,37 @@ pub const Request = struct {
         var it = self.getAll(key);
         while (it.next()) |value| {
             if (found != null) return error.DuplicateQueryValue;
+            found = value;
+        }
+        return found;
+    }
+
+    pub const HeaderIterator = struct {
+        headers: []const Header,
+        name: []const u8,
+        index: usize = 0,
+
+        pub fn next(self: *HeaderIterator) ?[]const u8 {
+            while (self.index < self.headers.len) {
+                const header = self.headers[self.index];
+                self.index += 1;
+                if (std.ascii.eqlIgnoreCase(header.name, self.name)) return header.value;
+            }
+            return null;
+        }
+    };
+
+    /// Returns all values for a header name in wire order.
+    pub fn getAllHeaders(self: *const Request, name: []const u8) HeaderIterator {
+        return .{ .headers = self.headers, .name = name };
+    }
+
+    /// Returns one header value, reporting repeated fields explicitly.
+    pub fn getHeaderOne(self: *const Request, name: []const u8) error{DuplicateHeaderValue}!?[]const u8 {
+        var found: ?[]const u8 = null;
+        var it = self.getAllHeaders(name);
+        while (it.next()) |value| {
+            if (found != null) return error.DuplicateHeaderValue;
             found = value;
         }
         return found;

@@ -217,6 +217,23 @@ Recorded for Phase 1 verification (issue #11) on the primary platform:
   [35260529918](https://github.com/kamalogudah/zoda/actions/runs/35260529918);
   see `zoda_plan.md` §4.0.8 for the full evidence.
 
+Recorded locally for the Phase 2 bounded framing adapter (issue #12):
+
+- Compiler: `zig version` → `0.16.0`; target `x86_64-linux-gnu`.
+- Concrete pinned APIs: `std.http.Server.init/receiveHead`,
+  `std.http.Server.Request.iterateHeaders/respond`, and
+  `std.http.Reader.bodyReader` over caller-owned `std.Io.Reader` and
+  `std.Io.Writer` instances.
+- `src/transport.zig` owns sequential HTTP/1.x framing for a connection and
+  dispatches a complete arena-owned request. It intentionally does not own
+  socket acceptance, task/thread creation, deadlines, or shutdown; those are
+  still-open Phase 2 items.
+- Zig 0.16.0's body reader supplies Content-Length and decoded chunked reads.
+  Zoda rejects content codings and `Expect` rather than emitting output before
+  dispatch, and closes on every protocol/limit/dispatch rejection.
+- Validation commands and detailed coverage are recorded in `zoda_plan.md`
+  §4.2.1. Hosted CI evidence remains pending until the change is pushed.
+
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
 request. See `.github/workflows/ci.yml`.

@@ -60,10 +60,7 @@ pub const Limits = struct {
 
 /// A single header field. Repeated fields with the same name are retained as
 /// separate entries, preserving order (§3.4).
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
+pub const Header = router.Header;
 
 /// Errors produced while constructing a request arena from an origin-form
 /// target. Reading/limits and their protocol status mappings are transport
@@ -167,8 +164,11 @@ pub const RequestArena = struct {
     pub fn requestView(self: *const RequestArena, method: Method) router.Request {
         return .{
             .method = method,
+            .target = self.target,
             .segments = self.segments,
             .query = self.query,
+            .headers = self.headers,
+            .body = self.body,
         };
     }
 
@@ -513,6 +513,19 @@ test "headers and body are owned, repeated, and looked up case-insensitively" {
     try std.testing.expectEqualStrings("a", (try req.getHeaderOne("x-trace")).?);
     try std.testing.expect((try req.getHeaderOne("absent")) == null);
     try std.testing.expectError(error.DuplicateHeaderValue, req.getHeaderOne("accept"));
+}
+
+test "request view exposes the complete arena-owned request" {
+    var arena = try parseOriginForm(std.testing.allocator, .default, "/items?q=one");
+    defer arena.deinit();
+    try arena.copyHeaders(&.{.{ .name = "X-Test", .value = "yes" }});
+    try arena.copyBody("payload");
+
+    const view = arena.requestView(.post);
+    try std.testing.expectEqualStrings("/items?q=one", view.target);
+    try std.testing.expectEqualStrings("payload", view.body);
+    try std.testing.expectEqualStrings("yes", (try view.getHeaderOne("x-test")).?);
+    try std.testing.expectEqualStrings("one", (try view.getOne("q")).?);
 }
 
 test "limits: target, path segments, query pairs, headers, and body" {

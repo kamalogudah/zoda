@@ -567,20 +567,68 @@ against the acceptance criteria; no new public types were added.
 
 ### Phase 2 — HTTP/1.1 vertical slice
 
-- [ ] Adapt the pinned version's `std.http.Server` to the complete Request.
+- [x] Adapt the pinned version's `std.http.Server` to the complete Request.
 - [ ] Use bounded concurrent connection tasks/workers, initially capped at 128.
       Each connection processes requests sequentially with independent request
       storage; the accept loop must not wait for a client to finish its request.
 - [ ] Start with configurable 10-second header/body-read/write deadlines,
       5-second keep-alive idle timeout, and 100 requests per connection.
       Read deadlines are total operation budgets, not reset by every byte.
-- [ ] Implement chunked-body decoding through the transport, limit enforcement,
+- [x] Implement chunked-body decoding through the transport, limit enforcement,
       protocol-error handling, and safe close/drain rules for connection reuse.
 - [ ] On shutdown stop accepting, allow a configurable 10-second grace period,
       then cancel and release remaining connections.
 - **Exit:** automated real-socket tests verify the JSON slice and its negative
       cases; a stalled client cannot prevent a second client from completing.
       Record the concrete concurrency/I/O APIs supported by the pinned compiler.
+
+### §4.2.1 Phase 2 framing evidence — issue #12
+
+The bounded wire adapter is implemented in `src/transport.zig` and exported as
+`zoda.transport`. On pinned Zig 0.16.0 it uses `std.http.Server.receiveHead`,
+`Request.iterateHeaders`, `std.http.Reader.bodyReader`, and `Request.respond`.
+The caller supplies the connection reader/writer, allocator, and application;
+socket acceptance, deadlines, bounded connection concurrency, and shutdown
+remain separate Phase 2 work.
+
+- A fixed maximum head length bounds wire buffering. Target, header byte/count,
+  path-segment, query-pair, and decoded-body limits are checked before dispatch.
+- Content-Length plus Transfer-Encoding, unsupported content codings, malformed
+  chunks, unsafe headers, and unsupported expectations receive 400 and close.
+  Target, header, and body limits receive 414, 431, and 413 respectively.
+- Chunk framing is decoded by the standard-library body reader; the Zoda
+  accumulator bounds decoded bytes. Valid trailers share the request header
+  count/byte budget and are appended to the complete request.
+- Each keep-alive iteration constructs and destroys a fresh request arena.
+  Reuse occurs only after the body reader establishes the next boundary;
+  protocol and dispatch failures respond and close instead of attempting a
+  risky drain.
+- The transport strips application Content-Length/Transfer-Encoding fields and
+  lets `Request.respond` emit one Content-Length. It preserves representation
+  length while suppressing HEAD bodies and sends an empty representation for
+  1xx, 204, 205, and 304 statuses.
+- Dispatch completes before application output is written. Dispatch failures
+  produce a static generic 500 with no error detail and close; this fallback
+  requires no allocation. Response and request storage are released after the
+  send attempt.
+- In-memory wire tests exercise the real pinned `std.http.Server` parser and
+  writer for sequential requests, decoded chunked limits, malformed/conflicting
+  framing, status mappings, generic 500 behavior, and response semantics.
+
+Local validation on Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version
+zig fmt --check build.zig src
+zig build
+zig test -Mroot=src/root.zig
+zig build test
+./zig-out/bin/zoda
+```
+
+A passing hosted CI run must be linked before the remaining Phase 2 exit is
+marked complete. Real-socket concurrency/deadline/shutdown acceptance belongs
+to the unchecked Phase 2 items above.
 
 ### Phase 2b — HTTP/1.1 hardening
 
