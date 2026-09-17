@@ -225,9 +225,10 @@ Recorded locally for the Phase 2 bounded framing adapter (issue #12):
   `std.http.Reader.bodyReader` over caller-owned `std.Io.Reader` and
   `std.Io.Writer` instances.
 - `src/transport.zig` owns sequential HTTP/1.x framing for a connection and
-  dispatches a complete arena-owned request. It intentionally does not own
-  socket acceptance, task/thread creation, deadlines, or shutdown; those are
-  still-open Phase 2 items.
+  dispatches a complete arena-owned request. `src/server.zig` adds socket
+  acceptance with `std.Io.net.Server.accept`, bounded `std.Io.Group.concurrent`
+  tasks, atomic admission, and absolute POSIX socket budgets. Shutdown grace
+  remains a separate unchecked item.
 - Zig 0.16.0's body reader supplies Content-Length and decoded chunked reads.
   Zoda rejects content codings and `Expect` rather than emitting output before
   dispatch, and closes on every protocol/limit/dispatch rejection.

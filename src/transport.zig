@@ -1,7 +1,7 @@
 //! Bounded HTTP/1.x wire adapter (ADR-0001 §3.4, Phase 2).
 //!
-//! The adapter deliberately leaves connection acceptance, concurrency, and
-//! deadlines to its caller. It owns HTTP framing for one connection: every
+//! The adapter deliberately leaves connection acceptance and concurrency to
+//! its caller. It owns HTTP framing for one connection: every
 //! request is copied into a fresh `RequestArena`, dispatched only after the
 //! complete body has been decoded, and released after its buffered response is
 //! sent. Protocol rejections and application failures close the connection.
@@ -22,6 +22,29 @@ pub const Config = struct {
     request_limits: request.Limits = .default,
     /// Sequential requests accepted before the adapter closes the connection.
     max_requests: usize = 100,
+    /// Optional operation-boundary hooks used by the socket runtime.
+    deadlines: ?Deadlines = null,
+};
+
+/// Hooks mark total header, body-read, and response-write operations. A hook
+/// must set one absolute deadline; it must not refresh it for each byte.
+pub const Deadlines = struct {
+    context: *anyopaque,
+    begin_header: *const fn (context: *anyopaque, keep_alive: bool, buffered: bool) void,
+    begin_body: *const fn (context: *anyopaque) void,
+    begin_write: *const fn (context: *anyopaque) void,
+
+    fn header(self: Deadlines, keep_alive: bool, buffered: bool) void {
+        self.begin_header(self.context, keep_alive, buffered);
+    }
+
+    fn body(self: Deadlines) void {
+        self.begin_body(self.context);
+    }
+
+    fn write(self: Deadlines) void {
+        self.begin_write(self.context);
+    }
 };
 
 /// Upper bound needed for a syntactically valid request head at the configured
@@ -48,15 +71,20 @@ pub fn serveConnection(
 
     var request_index: usize = 0;
     while (request_index < config.max_requests) : (request_index += 1) {
+        if (config.deadlines) |deadlines| {
+            deadlines.header(request_index != 0, server.reader.in.bufferedLen() != 0);
+        }
         var wire_req = server.receiveHead() catch |err| switch (err) {
             error.HttpConnectionClosing => return,
             error.HttpHeadersOversize => {
+                if (config.deadlines) |deadlines| deadlines.write();
                 try writeRawError(server.out, .request_header_fields_too_large);
                 return;
             },
             error.HttpHeadersInvalid,
             error.HttpRequestTruncated,
             => {
+                if (config.deadlines) |deadlines| deadlines.write();
                 try writeRawError(server.out, .bad_request);
                 return;
             },
@@ -64,7 +92,7 @@ pub fn serveConnection(
         };
 
         const keep_alive = wire_req.head.keep_alive and request_index + 1 < config.max_requests;
-        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, keep_alive);
+        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, keep_alive, config.deadlines);
         if (outcome == .close) return;
     }
 }
@@ -78,6 +106,7 @@ fn processRequest(
     app: *const AppType,
     limits: request.Limits,
     keep_alive: bool,
+    deadlines: ?Deadlines,
 ) anyerror!Outcome {
     const version = wire_req.head.version;
     const wire_method = wire_req.head.method;
@@ -85,22 +114,22 @@ fn processRequest(
     const content_length = wire_req.head.content_length;
 
     if (content_length != null and transfer_encoding != .none) {
-        try reject(wire_req, .bad_request, version);
+        try reject(wire_req, .bad_request, version, deadlines);
         return .close;
     }
     if (wire_req.head.transfer_compression != .identity or wire_req.head.expect != null) {
-        try reject(wire_req, .bad_request, version);
+        try reject(wire_req, .bad_request, version, deadlines);
         return .close;
     }
     if (content_length) |len| {
         if (len > limits.max_body_bytes) {
-            try reject(wire_req, .payload_too_large, version);
+            try reject(wire_req, .payload_too_large, version, deadlines);
             return .close;
         }
     }
 
     var arena = request.parseOriginForm(allocator, limits, wire_req.head.target) catch |err| {
-        try reject(wire_req, statusFromCode(buffering.parseErrorStatus(err)), version);
+        try reject(wire_req, statusFromCode(buffering.parseErrorStatus(err)), version, deadlines);
         return .close;
     };
     defer arena.deinit();
@@ -112,45 +141,46 @@ fn processRequest(
     var header_it = wire_req.iterateHeaders();
     while (header_it.next()) |header| {
         if (!validHeader(header.name, header.value)) {
-            try reject(wire_req, .bad_request, version);
+            try reject(wire_req, .bad_request, version, deadlines);
             return .close;
         }
         if (headers.items.len >= limits.max_headers) {
-            try reject(wire_req, .request_header_fields_too_large, version);
+            try reject(wire_req, .request_header_fields_too_large, version, deadlines);
             return .close;
         }
         const field_bytes = std.math.add(usize, header.name.len, header.value.len) catch {
-            try reject(wire_req, .request_header_fields_too_large, version);
+            try reject(wire_req, .request_header_fields_too_large, version, deadlines);
             return .close;
         };
         header_bytes = std.math.add(usize, header_bytes, field_bytes) catch {
-            try reject(wire_req, .request_header_fields_too_large, version);
+            try reject(wire_req, .request_header_fields_too_large, version, deadlines);
             return .close;
         };
         if (header_bytes > limits.header_bytes) {
-            try reject(wire_req, .request_header_fields_too_large, version);
+            try reject(wire_req, .request_header_fields_too_large, version, deadlines);
             return .close;
         }
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) saw_content_length = true;
         if (std.ascii.eqlIgnoreCase(header.name, "transfer-encoding")) saw_transfer_encoding = true;
         const name = arena.allocator().dupe(u8, header.name) catch {
-            try reject(wire_req, .internal_server_error, version);
+            try reject(wire_req, .internal_server_error, version, deadlines);
             return .close;
         };
         const value = arena.allocator().dupe(u8, header.value) catch {
-            try reject(wire_req, .internal_server_error, version);
+            try reject(wire_req, .internal_server_error, version, deadlines);
             return .close;
         };
         headers.append(arena.allocator(), .{ .name = name, .value = value }) catch {
-            try reject(wire_req, .internal_server_error, version);
+            try reject(wire_req, .internal_server_error, version, deadlines);
             return .close;
         };
     }
     if (saw_transfer_encoding and (transfer_encoding != .chunked or saw_content_length)) {
-        try reject(wire_req, .bad_request, version);
+        try reject(wire_req, .bad_request, version, deadlines);
         return .close;
     }
     if (transfer_encoding != .none or content_length != null) {
+        if (deadlines) |operation_deadlines| operation_deadlines.body();
         var transfer_buffer: [8192]u8 = undefined;
         var chunk: [8192]u8 = undefined;
         var body = buffering.BoundedAccumulator.init(arena.allocator(), limits.max_body_bytes);
@@ -163,23 +193,23 @@ fn processRequest(
         );
         while (true) {
             const n = body_reader.readSliceShort(&chunk) catch {
-                try reject(wire_req, .bad_request, version);
+                try reject(wire_req, .bad_request, version, deadlines);
                 return .close;
             };
             if (n == 0) break;
             body.append(chunk[0..n]) catch |err| switch (err) {
                 error.BodyTooLarge => {
-                    try reject(wire_req, .payload_too_large, version);
+                    try reject(wire_req, .payload_too_large, version, deadlines);
                     return .close;
                 },
                 error.OutOfMemory => {
-                    try reject(wire_req, .internal_server_error, version);
+                    try reject(wire_req, .internal_server_error, version, deadlines);
                     return .close;
                 },
             };
         }
         arena.body = body.toOwnedSlice() catch {
-            try reject(wire_req, .internal_server_error, version);
+            try reject(wire_req, .internal_server_error, version, deadlines);
             return .close;
         };
 
@@ -188,14 +218,14 @@ fn processRequest(
         var trailers = wire_req.server.reader.trailers;
         while (trailers.len != 0) {
             const end = std.mem.indexOf(u8, trailers, "\r\n") orelse {
-                try reject(wire_req, .bad_request, version);
+                try reject(wire_req, .bad_request, version, deadlines);
                 return .close;
             };
             const line = trailers[0..end];
             trailers = trailers[end + 2 ..];
             if (line.len == 0) break;
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse {
-                try reject(wire_req, .bad_request, version);
+                try reject(wire_req, .bad_request, version, deadlines);
                 return .close;
             };
             const header: std.http.Header = .{
@@ -206,35 +236,35 @@ fn processRequest(
                 std.ascii.eqlIgnoreCase(header.name, "content-length") or
                 std.ascii.eqlIgnoreCase(header.name, "transfer-encoding"))
             {
-                try reject(wire_req, .bad_request, version);
+                try reject(wire_req, .bad_request, version, deadlines);
                 return .close;
             }
             if (headers.items.len >= limits.max_headers) {
-                try reject(wire_req, .request_header_fields_too_large, version);
+                try reject(wire_req, .request_header_fields_too_large, version, deadlines);
                 return .close;
             }
             const field_bytes = std.math.add(usize, header.name.len, header.value.len) catch {
-                try reject(wire_req, .request_header_fields_too_large, version);
+                try reject(wire_req, .request_header_fields_too_large, version, deadlines);
                 return .close;
             };
             header_bytes = std.math.add(usize, header_bytes, field_bytes) catch {
-                try reject(wire_req, .request_header_fields_too_large, version);
+                try reject(wire_req, .request_header_fields_too_large, version, deadlines);
                 return .close;
             };
             if (header_bytes > limits.header_bytes) {
-                try reject(wire_req, .request_header_fields_too_large, version);
+                try reject(wire_req, .request_header_fields_too_large, version, deadlines);
                 return .close;
             }
             const name = arena.allocator().dupe(u8, header.name) catch {
-                try reject(wire_req, .internal_server_error, version);
+                try reject(wire_req, .internal_server_error, version, deadlines);
                 return .close;
             };
             const value = arena.allocator().dupe(u8, header.value) catch {
-                try reject(wire_req, .internal_server_error, version);
+                try reject(wire_req, .internal_server_error, version, deadlines);
                 return .close;
             };
             headers.append(arena.allocator(), .{ .name = name, .value = value }) catch {
-                try reject(wire_req, .internal_server_error, version);
+                try reject(wire_req, .internal_server_error, version, deadlines);
                 return .close;
             };
         }
@@ -246,19 +276,19 @@ fn processRequest(
     }
 
     arena.headers = headers.toOwnedSlice(arena.allocator()) catch {
-        try reject(wire_req, .internal_server_error, version);
+        try reject(wire_req, .internal_server_error, version, deadlines);
         return .close;
     };
 
     var req = arena.requestView(methodFromStd(wire_method));
     var res = app.dispatch(&req) catch {
-        try reject(wire_req, .internal_server_error, version);
+        try reject(wire_req, .internal_server_error, version, deadlines);
         return .close;
     };
     defer res.deinit();
 
     if (!validStatus(res.status_code)) {
-        try reject(wire_req, .internal_server_error, version);
+        try reject(wire_req, .internal_server_error, version, deadlines);
         return .close;
     }
 
@@ -270,19 +300,20 @@ fn processRequest(
             std.ascii.eqlIgnoreCase(header.name, "transfer-encoding")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "content-type")) has_content_type = true;
         extra.append(allocator, .{ .name = header.name, .value = header.value }) catch {
-            try reject(wire_req, .internal_server_error, version);
+            try reject(wire_req, .internal_server_error, version, deadlines);
             return .close;
         };
     }
     if (!has_content_type and res.content_type.len != 0) {
         extra.append(allocator, .{ .name = "content-type", .value = res.content_type }) catch {
-            try reject(wire_req, .internal_server_error, version);
+            try reject(wire_req, .internal_server_error, version, deadlines);
             return .close;
         };
     }
 
     const status: std.http.Status = @enumFromInt(res.status_code);
     const content = if (statusAllowsBody(res.status_code)) res.body else "";
+    if (deadlines) |operation_deadlines| operation_deadlines.write();
     try wire_req.respond(content, .{
         .version = version,
         .status = status,
@@ -346,7 +377,8 @@ fn validHeader(name: []const u8, value: []const u8) bool {
     return true;
 }
 
-fn reject(req: *std.http.Server.Request, status: std.http.Status, version: std.http.Version) !void {
+fn reject(req: *std.http.Server.Request, status: std.http.Status, version: std.http.Version, deadlines: ?Deadlines) !void {
+    if (deadlines) |operation_deadlines| operation_deadlines.write();
     try req.respond(status.phrase() orelse "Error", .{
         .version = version,
         .status = status,

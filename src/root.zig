@@ -20,6 +20,9 @@ pub const buffering = @import("buffering.zig");
 /// Bounded HTTP/1.x framing over the pinned `std.http.Server` API.
 pub const transport = @import("transport.zig");
 
+/// Bounded concurrent socket runtime with total operation deadlines.
+pub const server = @import("server.zig");
+
 /// Application dispatch and typed handler context (ADR-0001 §3.2, §5.2).
 pub const app = @import("app.zig");
 
@@ -40,6 +43,7 @@ comptime {
     std.testing.refAllDecls(response);
     std.testing.refAllDecls(buffering);
     std.testing.refAllDecls(transport);
+    std.testing.refAllDecls(server);
     std.testing.refAllDecls(app);
     std.testing.refAllDecls(plugins.json);
 }

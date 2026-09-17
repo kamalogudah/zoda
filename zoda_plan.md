@@ -568,10 +568,10 @@ against the acceptance criteria; no new public types were added.
 ### Phase 2 — HTTP/1.1 vertical slice
 
 - [x] Adapt the pinned version's `std.http.Server` to the complete Request.
-- [ ] Use bounded concurrent connection tasks/workers, initially capped at 128.
+- [x] Use bounded concurrent connection tasks/workers, initially capped at 128.
       Each connection processes requests sequentially with independent request
       storage; the accept loop must not wait for a client to finish its request.
-- [ ] Start with configurable 10-second header/body-read/write deadlines,
+- [x] Start with configurable 10-second header/body-read/write deadlines,
       5-second keep-alive idle timeout, and 100 requests per connection.
       Read deadlines are total operation budgets, not reset by every byte.
 - [x] Implement chunked-body decoding through the transport, limit enforcement,
@@ -588,8 +588,8 @@ The bounded wire adapter is implemented in `src/transport.zig` and exported as
 `zoda.transport`. On pinned Zig 0.16.0 it uses `std.http.Server.receiveHead`,
 `Request.iterateHeaders`, `std.http.Reader.bodyReader`, and `Request.respond`.
 The caller supplies the connection reader/writer, allocator, and application;
-socket acceptance, deadlines, bounded connection concurrency, and shutdown
-remain separate Phase 2 work.
+`zoda.server` supplies socket acceptance, deadlines, and bounded connection
+concurrency. Shutdown grace remains a separate Phase 2 follow-up.
 
 - A fixed maximum head length bounds wire buffering. Target, header byte/count,
   path-segment, query-pair, and decoded-body limits are checked before dispatch.
@@ -627,8 +627,44 @@ zig build test
 ```
 
 A passing hosted CI run must be linked before the remaining Phase 2 exit is
-marked complete. Real-socket concurrency/deadline/shutdown acceptance belongs
-to the unchecked Phase 2 items above.
+marked complete. Real-socket shutdown grace acceptance remains an unchecked
+Phase 2 item.
+
+### §4.2.2 Phase 2 bounded runtime evidence — issue #13
+
+The bounded socket runtime is implemented in `src/server.zig` and exported as
+`zoda.server`. It uses the pinned Zig 0.16.0 `std.Io.net.Server.accept`,
+`std.Io.Group.concurrent`, atomic admission accounting, and independent
+per-connection reader/writer buffers. The initial admission cap is 128; excess
+accepted sockets are closed immediately, so accepting never waits for a client
+request. Each connection is processed sequentially by `transport.serveConnection`
+with a fresh request arena per request.
+
+The default budgets are 10 seconds for header reads, body reads, and writes; 5
+seconds for keep-alive idle; and 100 requests per connection. The runtime sets
+`SO_RCVTIMEO`/`SO_SNDTIMEO` to the remaining absolute monotonic budget before
+each operation, so partial reads cannot refresh a total deadline. The pinned
+POSIX backend maps `EAGAIN` to the runtime timeout path and all connection/task
+resources are released on overload, timeout, cancellation, or normal close.
+The supplied allocator is documented as concurrent; `std.heap.smp_allocator` is
+the recommended strategy.
+
+Tests in `src/server.zig` verify the defaults and cap, a total (not per-byte)
+header deadline over a real loopback socket, and that a stalled client does not
+prevent a second client from receiving a response. Validation on Zig 0.16.0:
+
+```sh
+zig version
+zig fmt --check build.zig src
+zig build
+zig test -Mroot=src/root.zig
+zig build test
+./zig-out/bin/zoda
+```
+
+Shutdown grace-period orchestration remains a conditional follow-up in the
+roadmap; closing/canceling the listener cancels the accept task and drains the
+connection group.
 
 ### Phase 2b — HTTP/1.1 hardening
 
