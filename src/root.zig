@@ -14,12 +14,16 @@ pub const request = @import("request.zig");
 /// (ADR-0001 §3.4, §3.5).
 pub const response = @import("response.zig");
 
+/// Bounded buffering and protocol error mappings (ADR-0001 §3.4).
+pub const buffering = @import("buffering.zig");
+
 comptime {
     // Collect the imported modules' test declarations into the library test
     // suite; `zig build test` otherwise only analyzes decls it references.
     std.testing.refAllDecls(router);
     std.testing.refAllDecls(request);
     std.testing.refAllDecls(response);
+    std.testing.refAllDecls(buffering);
 }
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.

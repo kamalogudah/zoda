@@ -317,8 +317,9 @@ Verification-only pass for terminal routes and committed branch semantics
       repeated header fields through an explicitly supplied allocator, with
       token/CR-LF validation, case-insensitive lookup, bounded storage, and
       `clear` for error recovery.
-- [ ] Implement §3.4 bounded buffering and error-to-status mappings
-      (issue #7).
+- [x] Implement §3.4 bounded buffering and error-to-status mappings
+      (issue #7): status mappings for malformed or oversized requests and a
+      `BoundedAccumulator` for incremental body reads within configured limits.
 - [x] Test malformed encodings, duplicate queries, repeated headers, limit
       boundaries, allocation failures, arena-owned copies, and request
       destruction before reading a returned response (issues #5/#6).
@@ -386,6 +387,41 @@ Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
   (`checkAllAllocationFailures`).
 - Validation: `zig fmt --check build.zig src`, `zig build`, and `zig test
   -Mroot=src/root.zig` all pass (39/39 tests).
+- CI: both jobs ("Format check" and "Build and test") pass on the pinned
+  compiler — see the workflow run for this commit.
+
+### §4.0.5 Phase 0.5 evidence — issue #7 (bounded buffering and protocol error mappings)
+
+Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
+`x86_64-linux`, Ubuntu 24.04):
+
+- Implementation: `src/buffering.zig` — exported from `src/root.zig` as
+  `zoda.buffering`.
+- Default limits re-exported from `request.Limits` and `response.Limits`
+  (`default_request_limits` / `default_response_limits`): 8 KiB target, 100
+  headers / 32 KiB header bytes, 128 path segments, 256 query pairs, and 1 MiB
+  request body; 100 response headers / 32 KiB header bytes and 1 MiB buffered
+  response body.
+- Protocol status mappings (`ProtocolStatus`): 400 for invalid syntax and
+  segment/query-count violations; 414 for target length; 431 for header count
+  or byte limits; 413 for body size; 500 for allocation failures / generic
+  error responses. Mapping functions cover `request.ParseError`,
+  `request.HeaderStoreError`, `request.BodyStoreError`, `response.HeaderError`,
+  and `response.BodyError`.
+- `BoundedAccumulator`: incremental byte accumulator bound by `max_bytes`. The
+  transport can append decoded chunked-body chunks without unbounded
+  intermediate allocations; `append` returns `error.BodyTooLarge` without
+  altering state when the limit would be exceeded.
+- Connection-close policy documented in the module header: the transport
+  closes the connection after sending a 400/414/431/413 response unless it can
+  safely establish the next request boundary.
+- Test coverage (8 buffering tests; 47/47 total): default-limit values,
+  parse/header/body error-to-status mappings, response error mappings,
+  accumulator chunking up to the limit, rejection without partial writes,
+  simulated decoded chunked-body reads, and allocation-failure propagation
+  without leaks (`checkAllAllocationFailures`).
+- Validation: `zig fmt --check build.zig src`, `zig build`, and `zig build
+  test` all pass (47/47 tests via `zig test -Mroot=src/root.zig`).
 - CI: both jobs ("Format check" and "Build and test") pass on the pinned
   compiler — see the workflow run for this commit.
 
