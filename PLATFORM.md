@@ -158,10 +158,13 @@ Recorded for Phase A on the primary platform:
   `std.testing.fuzz` example).
 - `zig fmt --check build.zig src` → clean.
 - `./zig-out/bin/zoda` → exits 0, prints the demo output.
-- CI: workflow run
+- CI: the CI workflow commit itself passes both jobs ("Format check" and
+  "Build and test") on the pinned compiler — run
+  [35214468944](https://github.com/kamalogudah/zoda/actions/runs/35214468944)
+  for commit `70e8583`, and run
   [35213342849](https://github.com/kamalogudah/zoda/actions/runs/35213342849)
-  passes both jobs ("Format check" and "Build and test") on the pinned
-  compiler; revalidated locally on a fresh clone (commit `801886b`).
+  for the original Phase A setup at commit `801886b`; also revalidated locally
+  on a fresh clone.
 
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
