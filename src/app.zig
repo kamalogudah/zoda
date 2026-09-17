@@ -281,6 +281,7 @@ test "demo app route outcomes" {
         var res = try app.dispatch(&req);
         defer res.deinit();
         try std.testing.expectEqual(@as(u16, 404), res.status_code);
+        try std.testing.expectEqualStrings("text/plain", res.content_type);
         try std.testing.expectEqualStrings("Not Found", res.body);
     }
 
@@ -291,6 +292,8 @@ test "demo app route outcomes" {
         var res = try app.dispatch(&req);
         defer res.deinit();
         try std.testing.expectEqual(@as(u16, 404), res.status_code);
+        try std.testing.expectEqualStrings("text/plain", res.content_type);
+        try std.testing.expectEqualStrings("Not Found", res.body);
     }
 
     {
@@ -300,6 +303,8 @@ test "demo app route outcomes" {
         var res = try app.dispatch(&req);
         defer res.deinit();
         try std.testing.expectEqual(@as(u16, 404), res.status_code);
+        try std.testing.expectEqualStrings("text/plain", res.content_type);
+        try std.testing.expectEqualStrings("Not Found", res.body);
     }
 
     {
@@ -309,6 +314,8 @@ test "demo app route outcomes" {
         var res = try app.dispatch(&req);
         defer res.deinit();
         try std.testing.expectEqual(@as(u16, 404), res.status_code);
+        try std.testing.expectEqualStrings("text/plain", res.content_type);
+        try std.testing.expectEqualStrings("Not Found", res.body);
     }
 }
 
@@ -354,6 +361,80 @@ test "two differently configured apps are independent" {
     }
 }
 
+test "sequential requests through one app get distinct per-request state" {
+    // A small configured stateful plugin whose per-request state captures the
+    // request's `v` query value. Two dispatches through the same app must each
+    // initialize, use, and clean up their own state with no leakage between
+    // requests (ADR-0001 §3.2).
+    const Capture = struct {
+        deinit_order: *std.ArrayList([]const u8),
+        init_calls: *usize,
+
+        pub const State = struct { value: []const u8 };
+
+        pub fn initRequest(self: *const @This(), req: *router.Request) !State {
+            self.init_calls.* += 1;
+            const value = (try req.getOne("v")) orelse "";
+            return .{ .value = value };
+        }
+
+        pub fn deinitRequest(self: *const @This(), state: *State) void {
+            // Copy the arena-borrowed value so the recorded entry stays valid
+            // after the request arena is destroyed.
+            const owned = std.testing.allocator.dupe(u8, state.value) catch unreachable;
+            self.deinit_order.append(std.testing.allocator, owned) catch unreachable;
+        }
+    };
+
+    var deinit_order: std.ArrayList([]const u8) = .empty;
+    defer deinit_order.deinit(std.testing.allocator);
+    defer for (deinit_order.items) |value| std.testing.allocator.free(value);
+    var init_calls: usize = 0;
+
+    const Plugins = struct { cap: Capture };
+    const CapApp = App(Plugins);
+
+    const route = struct {
+        fn run(ctx: *CapApp.Context, req: *router.Request, res: *response.Response) !void {
+            if (req.isRoot() and req.isGet()) {
+                return res.text(200, ctx.state.cap.value);
+            }
+        }
+    }.run;
+
+    const app = CapApp{
+        .response_allocator = std.testing.allocator,
+        .config = .{},
+        .plugins = .{ .cap = .{ .deinit_order = &deinit_order, .init_calls = &init_calls } },
+        .route_fn = route,
+    };
+
+    {
+        var arena = try request.parseOriginForm(std.testing.allocator, .default, "/?v=first");
+        defer arena.deinit();
+        var req = arena.requestView(.get);
+        var res = try app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqualStrings("first", res.body);
+    }
+
+    {
+        var arena = try request.parseOriginForm(std.testing.allocator, .default, "/?v=second");
+        defer arena.deinit();
+        var req = arena.requestView(.get);
+        var res = try app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqualStrings("second", res.body);
+    }
+
+    // Both requests initialized their own state and each one was released when
+    // its own dispatch unwound; neither request read the other's value.
+    try std.testing.expectEqual(@as(usize, 2), init_calls);
+    try std.testing.expectEqual(@as(usize, 2), deinit_order.items.len);
+    try std.testing.expectEqualStrings("first", deinit_order.items[0]);
+    try std.testing.expectEqualStrings("second", deinit_order.items[1]);
+}
+
 test "state cleanup runs after handler failure" {
     var init_dummy: std.ArrayList(u8) = .empty;
     defer init_dummy.deinit(std.testing.allocator);
@@ -365,7 +446,11 @@ test "state cleanup runs after handler failure" {
     const FailApp = App(Plugins);
 
     const route = struct {
-        fn run(_: *FailApp.Context, _: *router.Request, _: *response.Response) !void {
+        fn run(_: *FailApp.Context, _: *router.Request, res: *response.Response) !void {
+            // Write a partial response, then fail: dispatch must release the
+            // response storage as well as the request state on the way out.
+            try res.text(500, "partial");
+            try res.setHeader("X-Trace", "abc");
             return error.Boom;
         }
     }.run;
@@ -385,6 +470,8 @@ test "state cleanup runs after handler failure" {
     var req = arena.requestView(.get);
     try std.testing.expectError(error.Boom, app.dispatch(&req));
     try std.testing.expectEqualSlices(u8, "X", deinit_order.items);
+    // `std.testing.allocator` reports a leak if the partial response body and
+    // header are not released when dispatch unwinds after the handler error.
 }
 
 test "response remains valid after the request arena is destroyed" {
