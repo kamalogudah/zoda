@@ -476,7 +476,8 @@ Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
       request-state initialization and cleanup.
 - [x] Test two differently configured apps, isolated request states, and
       reverse cleanup after initialization or handler failure.
-- [x] Exercise the routes in §5 with status/body assertions.
+- [x] Exercise the routes in §5 with status/content-type/body assertions and a
+      compiling executable demo.
 - **Exit:** JSON goes through the registered instance, with correct root,
       prefix-only, extra-segment, and unsupported-method outcomes.
 
@@ -489,26 +490,35 @@ Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
   - `src/app.zig` — `App(Plugins)` with typed `Context`, `RequestState(Plugins)`
     generated from plugin instances, declaration-order initialization, and
     reverse-order cleanup on both success and partial failure.
-  - `src/plugins/json.zig` — stateless `Json` plugin instance with `render` that
-    serializes values through `Response.replaceJson`.
-  - Both modules are exported from `src/root.zig`.
+  - `src/plugins/json.zig` — stateless `Json` plugin instance with empty `State`,
+    request hooks, and `render` that serializes values through
+    `Response.replaceJson`.
+  - `src/main.zig` — compiling route demo using the registered JSON plugin:
+    `GET /` returns 200 text, `GET /users/42` returns 200 JSON, and
+    `GET /users`, `GET /users/42/extra`, `GET /users/42/`, and `POST /users/42`
+    return 404.
+  - All modules are exported from `src/root.zig`.
 - Contract (ADR-0001 §3.2, §5.2, §5.3): plugins declare `State`,
   `initRequest`, and `deinitRequest`; stateless plugins use an empty state;
-  cleanup runs in reverse declaration order and is infallible; dispatch returns
-  an independently owned response; unhandled routes receive the fallback 404.
-- Test coverage (8 new tests; 60/60 total): init/deinit order and reverse
-  cleanup on a partial initialization failure, §5.3 route outcomes for
+  handlers call `ctx.plugins.json.render(res, T, value)` so registration controls
+  available capabilities; serialization uses bounded response-owned storage with
+  replacement semantics and error propagation; cleanup runs in reverse
+  declaration order and is infallible; dispatch returns an independently owned
+  response; unhandled routes receive the fallback 404.
+- Test coverage: init/deinit order and reverse cleanup on partial initialization
+  failure, §5.3 route outcomes with status/content-type/body assertions for
   `GET /`, `GET /users/42`, `GET /users`, `GET /users/42/extra`,
   `GET /users/42/`, and `POST /users/42`, two differently configured apps,
   state cleanup after handler failure, response lifetime after request arena
-  destruction, and JSON plugin rendering.
+  destruction, and JSON plugin rendering. Library tests pass 60/60; executable
+  tests cover the same route demo.
 - Validation:
   - `zig version` → `0.16.0`.
   - `zig fmt --check build.zig src` → clean.
   - `zig build` → success.
   - `zig test -Mroot=src/root.zig` → 60/60 tests pass.
   - `zig build test` → success.
-  - `./zig-out/bin/zoda` → exits 0.
+  - `./zig-out/bin/zoda` → exits 0 and prints the route demo output.
 
 ### Phase 2 — HTTP/1.1 vertical slice
 

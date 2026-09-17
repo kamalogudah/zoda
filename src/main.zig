@@ -3,32 +3,68 @@ const Io = std.Io;
 
 const zoda = @import("zoda");
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+const router = zoda.router;
+const request = zoda.request;
+const response = zoda.response;
+const app = zoda.app;
+const Json = zoda.Json;
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+const User = struct {
+    id: []const u8,
+    name: []const u8,
+};
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+const Plugins = struct { json: Json = .{} };
+const Demo = app.App(Plugins);
+
+fn route(ctx: *Demo.Context, req: *router.Request, res: *response.Response) !void {
+    if (req.isRoot() and req.isGet()) return res.text(200, "hello from zoda");
+    if (req.onLiteral("users")) {
+        if (req.onSegment()) |id| {
+            if (req.isRoot() and req.isGet()) {
+                return ctx.plugins.json.render(res, User, .{ .id = id, .name = "unknown" });
+            }
+        }
+        return;
     }
+}
 
-    // In order to do I/O operations need an `Io` instance.
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
     const io = init.io;
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
 
-    try zoda.printAnotherMessage(stdout_writer);
+    const demo_app = Demo{
+        .response_allocator = arena,
+        .config = .{ .name = "demo" },
+        .plugins = .{},
+        .route_fn = route,
+    };
 
-    try stdout_writer.flush(); // Don't forget to flush!
+    const cases = .{
+        .{ .method = router.Method.get, .path = "/" },
+        .{ .method = router.Method.get, .path = "/users/42" },
+        .{ .method = router.Method.get, .path = "/users" },
+        .{ .method = router.Method.get, .path = "/users/42/extra" },
+        .{ .method = router.Method.get, .path = "/users/42/" },
+        .{ .method = router.Method.post, .path = "/users/42" },
+    };
+
+    inline for (cases) |case| {
+        var req_arena = try request.parseOriginForm(arena, .default, case.path);
+        defer req_arena.deinit();
+        var req = req_arena.requestView(case.method);
+        var res = try demo_app.dispatch(&req);
+        defer res.deinit();
+        try stdout_writer.print("{s} {s} -> {d} {s}\n", .{
+            @tagName(case.method), case.path, res.status_code, res.content_type,
+        });
+    }
+
+    try stdout_writer.flush();
 }
 
 test "simple test" {
@@ -37,6 +73,60 @@ test "simple test" {
     defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
     try list.append(gpa, 42);
     try std.testing.expectEqual(@as(i32, 42), list.pop());
+}
+
+test "route demo outcomes" {
+    const demo_app = Demo{
+        .response_allocator = std.testing.allocator,
+        .config = .{ .name = "demo" },
+        .plugins = .{},
+        .route_fn = route,
+    };
+
+    {
+        var req_arena = try request.parseOriginForm(std.testing.allocator, .default, "/");
+        defer req_arena.deinit();
+        var req = req_arena.requestView(.get);
+        var res = try demo_app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqual(@as(u16, 200), res.status_code);
+        try std.testing.expectEqualStrings("text/plain", res.content_type);
+        try std.testing.expectEqualStrings("hello from zoda", res.body);
+    }
+
+    {
+        var req_arena = try request.parseOriginForm(std.testing.allocator, .default, "/users/42");
+        defer req_arena.deinit();
+        var req = req_arena.requestView(.get);
+        var res = try demo_app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqual(@as(u16, 200), res.status_code);
+        try std.testing.expectEqualStrings("application/json", res.content_type);
+        try std.testing.expectEqualStrings("{\"id\":\"42\",\"name\":\"unknown\"}", res.body);
+    }
+
+    const not_found_paths = .{ "/users", "/users/42/extra", "/users/42/" };
+    inline for (not_found_paths) |path| {
+        var req_arena = try request.parseOriginForm(std.testing.allocator, .default, path);
+        defer req_arena.deinit();
+        var req = req_arena.requestView(.get);
+        var res = try demo_app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqual(@as(u16, 404), res.status_code);
+        try std.testing.expectEqualStrings("text/plain", res.content_type);
+        try std.testing.expectEqualStrings("Not Found", res.body);
+    }
+
+    {
+        var req_arena = try request.parseOriginForm(std.testing.allocator, .default, "/users/42");
+        defer req_arena.deinit();
+        var req = req_arena.requestView(.post);
+        var res = try demo_app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqual(@as(u16, 404), res.status_code);
+        try std.testing.expectEqualStrings("text/plain", res.content_type);
+        try std.testing.expectEqualStrings("Not Found", res.body);
+    }
 }
 
 test "fuzz example" {

@@ -166,6 +166,30 @@ Recorded for Phase A on the primary platform:
   for the original Phase A setup at commit `801886b`; also revalidated locally
   on a fresh clone.
 
+Recorded for Phase 1 on the primary platform:
+
+- Compiler: `zig version` → `0.16.0`.
+- Host: Ubuntu 24.04.4 LTS, `x86_64-linux-gnu`.
+- `zig build` → success.
+- `zig build test` → all tests pass (library + executable suites).
+- `zig fmt --check build.zig src` → clean.
+- `./zig-out/bin/zoda` → exits 0 and prints the registered-JSON route demo:
+  `GET /` → 200 text, `GET /users/42` → 200 JSON, and `GET /users`,
+  `GET /users/42/extra`, `GET /users/42/`, `POST /users/42` → 404.
+- Implementation: `src/plugins/json.zig` (stateless `Json` plugin with empty
+  `State` and request hooks), `src/app.zig` (`App(Plugins)` dispatch and
+  per-request state), and `src/main.zig` (compiling route demo).
+- Validation command summary:
+  ```sh
+  zig version                 # 0.16.0
+  zig fmt --check build.zig src
+  zig build
+  zig build test
+  ./zig-out/bin/zoda
+  ```
+- CI: passing run recorded on the next push after this change; see
+  `.github/workflows/ci.yml` for the exact commands.
+
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
 request. See `.github/workflows/ci.yml`.
