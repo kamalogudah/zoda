@@ -282,8 +282,9 @@ Recorded for Phase 0 on the primary platform with the pinned compiler
   §5.3 committed-branch route outcomes.
 - Validation: `zig fmt --check build.zig src`, `zig build`, `zig build test`
   (13/13 tests), and `./zig-out/bin/zoda` smoke-run all pass.
-- CI: run [ci-pending](#) on commit `#placeholder` — see
-  adr summary; full run listed in the Phase 0 checkpoint.
+- CI: both jobs ("Format check" and "Build and test") pass on the pinned
+  compiler at commit `8f43b69` — run
+  [35215723208](https://github.com/kamalogudah/zoda/actions/runs/35215723208).
 
 ### Phase 0.5 — Request/response contract
 
