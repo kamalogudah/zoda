@@ -562,7 +562,8 @@ against the acceptance criteria; no new public types were added.
   - `zig build test` → success (64/64 total: 61 library + 3 executable).
   - `./zig-out/bin/zoda` → exits 0 and prints the six route outcomes.
 - CI: both jobs ("Format check" and "Build and test") pass on the pinned
-  compiler at commit <sha> — run <ci-run-url>.
+  compiler at commit `0780726` — run
+  [35260529918](https://github.com/kamalogudah/zoda/actions/runs/35260529918).
 
 ### Phase 2 — HTTP/1.1 vertical slice
 

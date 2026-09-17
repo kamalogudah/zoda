@@ -213,7 +213,9 @@ Recorded for Phase 1 verification (issue #11) on the primary platform:
   ./zig-out/bin/zoda
   ```
 - CI: both jobs ("Format check" and "Build and test") pass on the pinned
-  compiler — see `zoda_plan.md` §4.0.8 for the run link.
+  compiler at commit `0780726` — run
+  [35260529918](https://github.com/kamalogudah/zoda/actions/runs/35260529918);
+  see `zoda_plan.md` §4.0.8 for the full evidence.
 
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
