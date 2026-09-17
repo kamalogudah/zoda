@@ -248,7 +248,8 @@ retain the earlier roadmap's identifiers where practical.
 - **Exit:** a clean checkout passes on the selected version and primary target.
       Passed: `zig fmt --check`, `zig build`, `zig build test`, and the demo
       smoke-run all succeed on `x86_64-linux` with the pinned compiler.
-      Evidence recorded in [PLATFORM.md](PLATFORM.md) §7.
+      Evidence recorded in [PLATFORM.md](PLATFORM.md) §7; passing CI run
+      [35213342849](https://github.com/kamalogudah/zoda/actions/runs/35213342849).
 
 ### Phase 0 — Router core
 

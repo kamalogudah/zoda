@@ -22,8 +22,8 @@ The exact compiler version Zoda is developed and tested against:
 | **Notes** | [ziglang.org release notes](https://ziglang.org/download/0.16.0/) |
 
 This is an exact, reproducible pin. Toolchain upgrades are deliberate
-decisions: update this file, the CI matrix, and validate that a clean checkout
-still passes before merging an upgrade. The build.zig.zon
+decisions: update this file and the CI workflow, and validate that a clean
+checkout still passes before merging an upgrade. The build.zig.zon
 `minimum_zig_version = "0.16.0"` remains the compatibility floor and must never
 exceed the pinned version.
 
@@ -88,6 +88,28 @@ Guidance:
 - `.zig-cache/` and `zig-out/` are local build output and must not be
   committed (see `.gitignore`).
 
+### 4.1 How implementation and acceptance tests join CI
+
+The workflow in `.github/workflows/ci.yml` runs on every push to `main` and
+on every pull request, so ordinary Phase 0–5 work joins CI automatically:
+
+- **Formatting.** `zig fmt --check build.zig src` gates `build.zig` and every
+  file under `src/`. New implementation files are format-checked with no
+  workflow edits.
+- **Build.** `zig build` compiles the library (`src/root.zig`) and the `zoda`
+  executable (`src/main.zig`) and installs `zig-out/bin/zoda`.
+- **Unit and acceptance tests.** `zig build test` compiles and runs every
+  `test` block reachable from `src/root.zig` and `src/main.zig`, including
+  files those roots `@import`. Add tests as `test` blocks in `src/` and they
+  run on the next push with no workflow change.
+
+When a phase introduces a verification command that is not one of the above —
+real-socket integration tests (Phase 2), repeatable load tests (Phase 2b), or
+another bespoke acceptance harness — add the exact command to
+`.github/workflows/ci.yml`, record it in §4, and record the passing run in §7
+before marking that phase complete (ADR §6). Keep the pinned version in
+`ci.yml`, `build.zig.zon`, and §1 in sync whenever the toolchain moves.
+
 ## 5. Allocator assumptions
 
 Allocation behavior is a public contract, not an implementation detail:
@@ -136,6 +158,11 @@ Recorded for Phase A on the primary platform:
   `std.testing.fuzz` example).
 - `zig fmt --check build.zig src` → clean.
 - `./zig-out/bin/zoda` → exits 0, prints the demo output.
+- CI: workflow run
+  [35213342849](https://github.com/kamalogudah/zoda/actions/runs/35213342849)
+  passes both jobs ("Format check" and "Build and test") on the pinned
+  compiler; revalidated locally on a fresh clone (commit `801886b`).
 
-CI (`zig build`, `zig build test`, `zig fmt --check`) enforces this on every
-push. See `.github/workflows/ci.yml`.
+CI (`zig fmt --check`, `zig build`, `zig build test`, plus the `zoda` demo
+smoke-run and an exact-version assertion) enforces this on every push and pull
+request. See `.github/workflows/ci.yml`.
