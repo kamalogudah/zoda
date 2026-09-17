@@ -6,10 +6,20 @@ const Io = std.Io;
 /// (ADR-0001 §3.1, §5.1).
 pub const router = @import("router.zig");
 
+/// Owned request storage and strict origin-form target/query parsing
+/// (ADR-0001 §3.4, §5.1).
+pub const request = @import("request.zig");
+
+/// Independently owned buffered responses and safe header handling
+/// (ADR-0001 §3.4, §3.5).
+pub const response = @import("response.zig");
+
 comptime {
-    // Collect the imported router's test declarations into the library test
+    // Collect the imported modules' test declarations into the library test
     // suite; `zig build test` otherwise only analyzes decls it references.
     std.testing.refAllDecls(router);
+    std.testing.refAllDecls(request);
+    std.testing.refAllDecls(response);
 }
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.

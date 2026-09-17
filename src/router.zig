@@ -42,11 +42,30 @@ pub const Method = enum {
     connect,
 };
 
-/// An ordered query pair. Parsing, deduplication policy, and request ownership
-/// of query storage are covered by Phase 0.5 (§3.4).
+/// An ordered query pair. The Phase 0.5 request parser (`src/request.zig`)
+/// populates an arena-owned slice of these from an origin-form target; order
+/// and duplicates survive, and `getAll`/`getOne` read the slice
+/// allocation-free (§3.4).
 pub const QueryPair = struct {
     key: []const u8,
     value: []const u8,
+};
+
+/// Iterates every value for a query key, in request order, including
+/// duplicates. Allocation-free; backed by the request's query pair slice.
+pub const QueryValueIterator = struct {
+    pairs: []const QueryPair,
+    key: []const u8,
+    index: usize = 0,
+
+    pub fn next(self: *QueryValueIterator) ?[]const u8 {
+        while (self.index < self.pairs.len) {
+            const pair = self.pairs[self.index];
+            self.index += 1;
+            if (std.mem.eql(u8, pair.key, self.key)) return pair.value;
+        }
+        return null;
+    }
 };
 
 /// A request carrying decoded path segments and a consuming cursor.
@@ -113,6 +132,26 @@ pub const Request = struct {
         if (!std.mem.eql(u8, self.segments[self.cursor], literal)) return false;
         self.cursor += 1;
         return true;
+    }
+
+    /// Returns every query value for `key` in request order, preserving
+    /// duplicates, as an allocation-free iterator. Query keys compare exactly
+    /// (they are case-sensitive per the origin-form grammar).
+    pub fn getAll(self: *const Request, key: []const u8) QueryValueIterator {
+        return .{ .pairs = self.query, .key = key };
+    }
+
+    /// Returns the single query value for `key`, `null` when the key is
+    /// absent, and `error.DuplicateQueryValue` when the key appears more than
+    /// once — never silently choosing between duplicate values (§3.4).
+    pub fn getOne(self: *const Request, key: []const u8) error{DuplicateQueryValue}!?[]const u8 {
+        var found: ?[]const u8 = null;
+        var it = self.getAll(key);
+        while (it.next()) |value| {
+            if (found != null) return error.DuplicateQueryValue;
+            found = value;
+        }
+        return found;
     }
 };
 
@@ -398,4 +437,33 @@ test "slash rules preserve trailing and repeated slash segments" {
     try std.testing.expect(repeated.onLiteral(""));
     try std.testing.expectEqualSlices(u8, "users", repeated.onSegment().?);
     try std.testing.expect(repeated.isRoot());
+}
+
+test "query getAll preserves order, duplicates, and case sensitivity" {
+    const pairs: []const QueryPair = &.{
+        .{ .key = "tag", .value = "one" },
+        .{ .key = "sort", .value = "asc" },
+        .{ .key = "tag", .value = "two" },
+        .{ .key = "TAG", .value = "case-matters" },
+        .{ .key = "tag", .value = "three" },
+    };
+    var r = req(.get, &.{});
+    r.query = pairs;
+
+    // getAll returns every duplicate value in request order.
+    var all = r.getAll("tag");
+    try std.testing.expectEqualStrings("one", all.next().?);
+    try std.testing.expectEqualStrings("two", all.next().?);
+    try std.testing.expectEqualStrings("three", all.next().?);
+    try std.testing.expect(all.next() == null);
+
+    // Query key matching is exact: "TAG" is a distinct key.
+    var other = r.getAll("TAG");
+    try std.testing.expectEqualStrings("case-matters", other.next().?);
+    try std.testing.expect(other.next() == null);
+
+    // getOne reports duplicates instead of choosing a value.
+    try std.testing.expectError(error.DuplicateQueryValue, r.getOne("tag"));
+    try std.testing.expectEqualStrings("asc", (try r.getOne("sort")).?);
+    try std.testing.expect((try r.getOne("absent")) == null);
 }

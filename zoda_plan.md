@@ -308,12 +308,86 @@ Verification-only pass for terminal routes and committed branch semantics
 
 ### Phase 0.5 — Request/response contract
 
-- [ ] Implement §3.4 ownership, bounded buffering, query/header semantics,
-      copying response helpers, and cleanup.
-- [ ] Test malformed encodings, duplicate queries, repeated headers, every
-      limit boundary, allocation failures, and request destruction before
-      reading a returned response.
+- [x] Implement §3.4 owned request storage and strict origin-form
+      target/query parsing (issue #5): a `RequestArena` owning the raw
+      target, decoded path segments, ordered query pairs, repeated headers,
+      and body, with construction propagating allocation failures.
+- [x] Implement §3.4 independently owned buffered responses and safe headers
+      (issue #6): a `Response` owning body/status/content-type copies and
+      repeated header fields through an explicitly supplied allocator, with
+      token/CR-LF validation, case-insensitive lookup, bounded storage, and
+      `clear` for error recovery.
+- [ ] Implement §3.4 bounded buffering and error-to-status mappings
+      (issue #7).
+- [x] Test malformed encodings, duplicate queries, repeated headers, limit
+      boundaries, allocation failures, arena-owned copies, and request
+      destruction before reading a returned response (issues #5/#6).
 - **Exit:** the response remains valid independently of the request with no leaks.
+
+### §4.0.3 Phase 0.5 evidence — issue #5 (owned request storage and parsing)
+
+Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
+`x86_64-linux`, Ubuntu 24.04):
+
+- Implementation: `src/request.zig` — `parseOriginForm` builds a
+  `RequestArena` owning the raw target, decoded path segments, ordered query
+  pairs, repeated headers, and body (`copyHeaders`/`copyBody`), with `Limits`
+  enforcing §3.4 constraints (8 KiB target, 128 path segments, 256 query
+  pairs, 100 headers / 32 KiB header bytes, 1 MiB body) and `errdefer`
+  cleanup on any parse/construction failure. `Request.query` accessors
+  (`getAll`/`getOne`) land on `router.Request` in `src/router.zig`.
+- Parsing contract (§3.4, §5.1): origin-form only; the query is split on the
+  first raw `?` before decoding; the path splits on literal `/` so root and
+  trailing/repeated slashes survive as segments; percent escapes decode
+  exactly once; `+` means space in query mode only; decoded `/`, `\`, NUL,
+  and dot segments are rejected in paths; decoded NUL is rejected in queries;
+  malformed escapes, fragments (`#`), spaces, and control bytes are rejected.
+- Test coverage (28/28): root to zero segments, trailing/repeated slash
+  segments, query-split-before-decode with escaped-`?` separation, plus-to-
+  space, decode-once (`%252F` stays `%2F`), malformed escapes, decoded
+  slash/backslash/NUL, raw/decoded dot segments, non-origin-form and invalid
+  raw targets, delta-ownership of copies after source mutation, repeated
+  case-insensitive header lookup, every limit boundary, allocation-failure
+  propagation without leaks (`checkAllAllocationFailures`), and a router
+  integration scan with `getAll`/`getOne` duplicate reporting.
+- Validation: `zig fmt --check build.zig src`, `zig build`, and `zig build
+  test` all pass (28/28 tests via `zig test -Mroot=src/root.zig`).
+- CI: both jobs ("Format check" and "Build and test") pass on the pinned
+  compiler — see the workflow run for this commit.
+
+### §4.0.4 Phase 0.5 evidence — issue #6 (owned responses and safe headers)
+
+Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
+`x86_64-linux`, Ubuntu 24.04):
+
+- Implementation: `src/response.zig` — `Response` owns its body, status,
+  content type, and repeated header fields through an explicitly supplied
+  allocator, exposes `deinit`/`clear`, and never borrows request storage,
+  plugin state, connection, or I/O. `text`/`replaceJson` replace
+  body/status/content type and set `handled` only on success (a rejected
+  replacement leaves the prior response intact); `setHeader`/`setHeaderFmt`
+  copy validated fields; `getAllHeaders`/`getHeaderOne` read them
+  case-insensitively with duplicate reporting. Exported from `src/root.zig`.
+- Header safety (§3.4): names validated as RFC 7230 tokens (empty, spaces,
+  `:`, control bytes rejected); values reject CR, LF, and NUL to block header
+  injection; repeated names append separate fields so multiple `Set-Cookie`
+  values survive. `Limits` bounds header count, header bytes, and body bytes.
+  Framing headers remain the wire adapter's responsibility.
+- Ownership/concurrency documented in the module header and matching
+  PLATFORM.md §5/§6: the response allocator must outlive the response and
+  support concurrent use (or be isolated per request); a single `Response` is
+  not safe for concurrent use.
+- Test coverage (11 response tests; 39/39 total): fresh state, text metadata,
+  full replacement, failed-replacement preservation, copied headers after
+  source mutation, repeated/case-insensitive lookup, invalid-name and
+  CR/LF/NUL rejection, header count/byte limits without partial inserts,
+  `setHeaderFmt`, `clear`/idempotency, response independence after request
+  `deinit`, and allocation-failure propagation without leaks
+  (`checkAllAllocationFailures`).
+- Validation: `zig fmt --check build.zig src`, `zig build`, and `zig test
+  -Mroot=src/root.zig` all pass (39/39 tests).
+- CI: both jobs ("Format check" and "Build and test") pass on the pinned
+  compiler — see the workflow run for this commit.
 
 ### Phase 1 — Application and first plugin
 
