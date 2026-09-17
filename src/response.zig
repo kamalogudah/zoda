@@ -450,3 +450,52 @@ test "response helpers propagate allocation failures without leaking" {
     }.build;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, build, .{});
 }
+
+test "body limit accepts at-limit length and rejects one byte over" {
+    var res = Response.initWithLimits(std.testing.allocator, .{ .max_body_bytes = 5 });
+    defer res.deinit();
+    try res.text(200, "12345");
+    try std.testing.expectEqualStrings("12345", res.body);
+    try std.testing.expectError(error.BodyTooLarge, res.text(200, "123456"));
+    try std.testing.expectEqualStrings("12345", res.body);
+}
+
+test "allocation failure during response replacement leaves prior response intact" {
+    const build = struct {
+        fn build(allocator: std.mem.Allocator) !void {
+            var res = Response.init(allocator);
+            defer res.deinit();
+            try res.text(200, "first");
+            const User = struct { id: u32, name: []const u8 };
+            res.replaceJson(201, User, .{ .id = 42, .name = "replacement" }) catch |err| {
+                try std.testing.expectEqualStrings("first", res.body);
+                try std.testing.expectEqual(@as(u16, 200), res.status_code);
+                return err;
+            };
+            try std.testing.expectEqualStrings("{\"id\":42,\"name\":\"replacement\"}", res.body);
+            try std.testing.expectEqual(@as(u16, 201), res.status_code);
+        }
+    }.build;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, build, .{});
+}
+
+test "response with repeated Set-Cookie fields remains valid after request destruction" {
+    const request = @import("request.zig");
+    var req = try request.parseOriginForm(std.testing.allocator, .default, "/users/42?tag=one");
+
+    var res = Response.init(std.testing.allocator);
+    defer res.deinit();
+    try res.text(200, req.segments[1]);
+    try res.setHeader("Set-Cookie", "sid=a");
+    try res.setHeader("Set-Cookie", "csrf=b");
+    try res.setHeader("X-Path", req.target);
+
+    req.deinit();
+
+    try std.testing.expectEqualStrings("42", res.body);
+    var it = res.getAllHeaders("set-cookie");
+    try std.testing.expectEqualStrings("sid=a", it.next().?);
+    try std.testing.expectEqualStrings("csrf=b", it.next().?);
+    try std.testing.expect(it.next() == null);
+    try std.testing.expectEqualStrings("/users/42?tag=one", (try res.getHeaderOne("x-path")).?);
+}

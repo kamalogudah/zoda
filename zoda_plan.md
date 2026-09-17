@@ -323,6 +323,8 @@ Verification-only pass for terminal routes and committed branch semantics
 - [x] Test malformed encodings, duplicate queries, repeated headers, limit
       boundaries, allocation failures, arena-owned copies, and request
       destruction before reading a returned response (issues #5/#6).
+- [x] Verification pass for parsing boundaries, allocation-failure
+      propagation, and independent response lifetime (issue #8).
 - **Exit:** the response remains valid independently of the request with no leaks.
 
 ### §4.0.3 Phase 0.5 evidence — issue #5 (owned request storage and parsing)
@@ -424,6 +426,49 @@ Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
   test` all pass (47/47 tests via `zig test -Mroot=src/root.zig`).
 - CI: both jobs ("Format check" and "Build and test") pass on the pinned
   compiler — see the workflow run for this commit.
+
+### §4.0.6 Phase 0.5 verification evidence — issue #8 (parsing boundaries, allocation failures, and independent response lifetime)
+
+Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
+`x86_64-linux`, Ubuntu 24.04):
+
+- Scope: verification-only pass over the Phase 0.5 contract in ADR-0001 §3.4
+  and the issues that implemented it (#5, #6, #7). No new implementation
+  types were added; the existing `RequestArena`, `Response`, and
+  `BoundedAccumulator` are exercised against the acceptance criteria.
+- Parsing boundary coverage (`src/request.zig`): malformed and double
+  percent-encodings (`%`, `%2`, `%2G`, `%252F`); forbidden decoded characters
+  (`%2F`, `%5C`, `%00`, raw `\`); dot segments raw and decoded (`/..`,
+  `/%2E`); slash preservation (`/`, `/users/`, `//users`, `//`); duplicate
+  query pairs with `getAll`/`getOne`; and repeated/case-insensitive header
+  lookup.
+- Limit boundary coverage (`src/request.zig`, `src/response.zig`): below/at/above
+  checks for target length, path-segment count, query-pair count, header count,
+  header byte total, and request/response body size. Response header insertion
+  rejects invalid names (empty, spaces, `:`, control bytes) and unsafe values
+  (`\r`, `\n`, `\x00`). Separate `Set-Cookie` fields are preserved as distinct
+  entries.
+- Allocation-failure injection: `std.testing.checkAllAllocationFailures`
+  exercises every allocation point during request construction
+  (`parseOriginForm`, `copyHeaders`, `copyBody`) and response replacement
+  (`text`, `replaceJson`, `setHeader`, `setHeaderFmt`, `clear`). A dedicated
+  test also asserts that the first induced allocation failure returns
+  `error.OutOfMemory` rather than a route "no match" error. Failures
+  propagate without leaks and the prior response remains intact.
+- Independent response lifetime (`src/response.zig`): tests construct a
+  response that borrows request segments/target, destroy the request arena,
+  and then read body and headers (including repeated `Set-Cookie` values).
+  The response allocator remains alive and the response cleans up without
+  leaks.
+- Validation:
+  - `zig version` → `0.16.0`.
+  - `zig fmt --check build.zig src` → clean.
+  - `zig build` → success.
+  - `zig test -Mroot=src/root.zig` → 52/52 tests pass.
+  - `zig build test` → success.
+  - `./zig-out/bin/zoda` → exits 0.
+- CI: run by `.github/workflows/ci.yml` on the next push; recorded locally on
+  the pinned compiler above.
 
 ### Phase 1 — Application and first plugin
 

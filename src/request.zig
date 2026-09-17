@@ -560,6 +560,20 @@ test "construction propagates allocation failures without leaking" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, build, .{});
 }
 
+test "body limit accepts at-limit length and rejects one byte over" {
+    var req = try parseOriginForm(std.testing.allocator, Limits{ .max_body_bytes = 3 }, "/");
+    defer req.deinit();
+    try req.copyBody("123");
+    try std.testing.expectEqualStrings("123", req.body);
+    try std.testing.expectError(error.BodyTooLarge, req.copyBody("1234"));
+}
+
+test "allocation failure during request construction returns OutOfMemory, not a route error" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const err = parseOriginForm(failing.allocator(), .default, "/users/42");
+    try std.testing.expectError(error.OutOfMemory, err);
+}
+
 test "parsed request routes through the router with query accessors" {
     var req = try parseOriginForm(std.testing.allocator, .default, "/users/42?tag=one&sort=asc&tag=two");
     defer req.deinit();
