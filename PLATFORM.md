@@ -190,6 +190,33 @@ Recorded for Phase 1 on the primary platform:
 - CI: passing run recorded on the next push after this change; see
   `.github/workflows/ci.yml` for the exact commands.
 
+Recorded for Phase 1 verification (issue #11) on the primary platform:
+
+- Compiler: `zig version` → `0.16.0`.
+- Host: Ubuntu 24.04.4 LTS, `x86_64-linux-gnu`.
+- `zig build` → success.
+- `zig build test` → success (64/64 tests: 61 library + 3 executable).
+- `zig fmt --check build.zig src` → clean.
+- `./zig-out/bin/zoda` → exits 0 and prints the six §5.3 route outcomes.
+- Added/strengthened tests in `src/app.zig`: full status/content-type/body
+  assertions across the whole §5.3 route matrix, a new sequential-request test
+  proving distinct per-request state with a configured stateful test plugin,
+  and a handler-failure test that writes a partial response before failing so
+  response cleanup is verified alongside request-state cleanup. Evidence in
+  `zoda_plan.md` §4.0.8.
+- Validation command summary:
+  ```sh
+  zig version                 # 0.16.0
+  zig fmt --check build.zig src
+  zig build
+  zig build test
+  ./zig-out/bin/zoda
+  ```
+- CI: both jobs ("Format check" and "Build and test") pass on the pinned
+  compiler at commit `0780726` — run
+  [35260529918](https://github.com/kamalogudah/zoda/actions/runs/35260529918);
+  see `zoda_plan.md` §4.0.8 for the full evidence.
+
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
 request. See `.github/workflows/ci.yml`.

@@ -520,6 +520,51 @@ Recorded on the primary platform with the pinned compiler (Zig `0.16.0`,
   - `zig build test` → success.
   - `./zig-out/bin/zoda` → exits 0 and prints the route demo output.
 
+### §4.0.8 Phase 1 verification evidence — issue #11 (configured apps, request isolation, and failure cleanup)
+
+Verification-only pass for the Phase 1 contract in ADR-0001 §3.2 and §5.3, on
+the pinned compiler (Zig `0.16.0`, `x86_64-linux`). The implementation from
+issue #10 (`src/app.zig`, `src/plugins/json.zig`, `src/main.zig`) is exercised
+against the acceptance criteria; no new public types were added.
+
+- Configured apps and request isolation (`src/app.zig`):
+  - `two differently configured apps are independent` dispatches the same
+    route through two apps with different configs and asserts each response
+    reflects only its own app's config.
+  - New `sequential requests through one app get distinct per-request state`
+    uses a small configured stateful test plugin (`Capture`) whose per-request
+    state captures the request's `v` query value. Two dispatches through the
+    same app each initialize, use, and release their own state: the responses
+    carry only their own request's value, both states are released, and no
+    state leaks across requests. This stands in for the sessions plugin until
+    Phase 5.
+- Reverse cleanup and failure paths (`src/app.zig`):
+  - Partial initialization failure: `request state initializes in order and
+    cleans up in reverse on failure` asserts `initRequest` runs in declaration
+    order (`A`, `B`, then failing `G`) and cleanup runs in reverse (`B`, `A`).
+  - Handler failure: `state cleanup runs after handler failure` now writes a
+    partial response (body plus header) before returning `error.Boom`;
+    dispatch must release the response storage as well as deinitializing the
+    request state. The response release is verified explicitly:
+    `std.testing.allocator` reports a leak if the partial body/header survive
+    the unwinding.
+- §5.3 route matrix through socket-free dispatch and the registered JSON
+  instance (`src/app.zig` `demo app route outcomes`, `src/main.zig` route
+  demo): every case asserts status, content type, and body — `GET /` → 200
+  `text/plain` "hello from zoda"; `GET /users/42` → 200 `application/json`
+  `{"id":"42","name":"unknown"}`; and `GET /users`, `GET /users/42/extra`,
+  `GET /users/42/`, `POST /users/42` → 404 `text/plain` "Not Found".
+- Validation:
+  - `zig version` → `0.16.0`.
+  - `zig fmt --check build.zig src` → clean.
+  - `zig build` → success.
+  - `zig test -Mroot=src/root.zig` → 61/61 library tests pass.
+  - `zig build test` → success (64/64 total: 61 library + 3 executable).
+  - `./zig-out/bin/zoda` → exits 0 and prints the six route outcomes.
+- CI: both jobs ("Format check" and "Build and test") pass on the pinned
+  compiler at commit `0780726` — run
+  [35260529918](https://github.com/kamalogudah/zoda/actions/runs/35260529918).
+
 ### Phase 2 — HTTP/1.1 vertical slice
 
 - [ ] Adapt the pinned version's `std.http.Server` to the complete Request.
