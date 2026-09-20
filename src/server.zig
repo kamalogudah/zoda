@@ -12,6 +12,31 @@ const transport = @import("transport.zig");
 
 const Io = std.Io;
 const net = Io.net;
+const app_framework = @import("app.zig");
+const response_types = @import("response.zig");
+const router_types = @import("router.zig");
+const Json = @import("plugins/json.zig").Json;
+
+const SocketUser = struct { id: []const u8, name: []const u8 };
+const SocketPlugins = struct { json: Json = .{} };
+const SocketApp = app_framework.App(SocketPlugins);
+
+fn socketRoute(ctx: *SocketApp.Context, req: *router_types.Request, res: *response_types.Response) !void {
+    if (req.isRoot() and (req.isGet() or req.method == .head)) {
+        return res.text(200, "hello from zoda");
+    }
+    if (req.onLiteral("users")) {
+        if (req.onSegment()) |id| {
+            if (req.isRoot() and (req.isGet() or req.method == .head)) {
+                return ctx.plugins.json.render(res, SocketUser, .{ .id = id, .name = "unknown" });
+            }
+        }
+        return;
+    }
+    if (req.isLiteral("echo") and req.method == .post) return res.text(200, req.body);
+    if (req.isLiteral("empty") and req.isGet()) return res.text(204, "must not be sent");
+    if (req.isLiteral("fail") and req.isGet()) return error.DispatchFailed;
+}
 
 pub const Config = struct {
     max_connections: usize = 128,
@@ -357,37 +382,8 @@ fn readSocket(io: Io, stream: net.Stream, vectors: [][]u8) ConnectionIo.ReadErro
 }
 
 fn writeSocket(io: Io, stream: net.Stream, header: []const u8, data: []const []const u8, splat: usize) ConnectionIo.WriteError!usize {
-    if (comptime @import("builtin").os.tag == .windows) return io.vtable.netWrite(io.userdata, stream.socket.handle, header, data, splat);
-    var total: usize = 0;
-    if (header.len != 0) {
-        total = writeOne(stream.socket.handle, header) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            else => return error.Unexpected,
-        };
-        if (total != header.len) return total;
-    }
-    for (data[0 .. data.len - 1]) |part| {
-        total += writeOne(stream.socket.handle, part) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            else => return error.Unexpected,
-        };
-    }
-    const pattern = data[data.len - 1];
-    for (0..splat) |_| total += writeOne(stream.socket.handle, pattern) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        else => return error.Unexpected,
-    };
-    return total;
-}
-
-fn writeOne(fd: std.posix.fd_t, bytes: []const u8) ConnectionIo.WriteError!usize {
-    const rc = std.posix.system.write(fd, bytes.ptr, bytes.len);
-    return switch (std.posix.errno(rc)) {
-        .SUCCESS => (rc),
-        .AGAIN => error.Timeout,
-        .INTR => error.Canceled,
-        else => error.Unexpected,
-    };
+    const n = try io.vtable.netWrite(io.userdata, stream.socket.handle, header, data, splat);
+    return n;
 }
 
 test "defaults match the Phase 2 connection contract" {
@@ -510,4 +506,90 @@ test "a stalled connection does not block a second client" {
     _ = server_future.cancel(io) catch {};
     const shutdown_elapsed = shutdown_started.durationFromNow(io);
     try std.testing.expect(shutdown_elapsed.raw.nanoseconds < @as(i96, std.time.ns_per_s));
+}
+
+fn expectSocketResponse(reader: *Io.Reader, expected_status: u16, expected_body: []const u8, representation_length: usize) !void {
+    const status_line = std.mem.trim(u8, try reader.takeDelimiterInclusive('\n'), "\r\n");
+    var expected_status_line: [32]u8 = undefined;
+    const status_text = try std.fmt.bufPrint(&expected_status_line, "HTTP/1.1 {d}", .{expected_status});
+    try std.testing.expect(std.mem.startsWith(u8, status_line, status_text));
+
+    var content_length: ?usize = null;
+    while (true) {
+        const line = std.mem.trim(u8, try reader.takeDelimiterInclusive('\n'), "\r\n");
+        if (line.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " \t\r\n"), 10);
+        }
+    }
+    try std.testing.expectEqual(representation_length, content_length.?);
+    if (expected_body.len != 0) {
+        var body: [256]u8 = undefined;
+        try std.testing.expect(expected_body.len <= body.len);
+        try reader.readSliceAll(body[0..expected_body.len]);
+        try std.testing.expectEqualStrings(expected_body, body[0..expected_body.len]);
+    }
+}
+
+test "JSON vertical slice runs over real sockets" {
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, run_io: Io, run_listener: *net.Server, run_app: *const SocketApp, run_config: Config) !void {
+            return serve(SocketApp, allocator, run_io, run_listener, run_app, run_config);
+        }
+    };
+
+    const io = std.testing.io;
+    const address: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const socket_app: SocketApp = .{ .response_allocator = std.testing.allocator, .config = .{ .name = "socket-test" }, .plugins = .{}, .route_fn = socketRoute };
+    var server_future = try io.concurrent(Runner.run, .{ std.testing.allocator, io, &listener, &socket_app, Config{ .shutdown_grace_period = .{ .raw = .fromMilliseconds(25), .clock = .awake } } });
+
+    const client = try net.IpAddress.connect(&listener.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client.close(io);
+    var write_buffer: [1024]u8 = undefined;
+    var writer = client.writer(io, &write_buffer);
+    var read_buffer: [2048]u8 = undefined;
+    var reader = client.reader(io, &read_buffer);
+    const requests = .{
+        .{ "GET / HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 200), "hello from zoda", @as(usize, 15) },
+        .{ "GET /users/42 HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 200), "{\"id\":\"42\",\"name\":\"unknown\"}", @as(usize, 28) },
+        .{ "GET /users HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 404), "Not Found", @as(usize, 9) },
+        .{ "GET /users/42/extra HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 404), "Not Found", @as(usize, 9) },
+        .{ "GET /users/42/ HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 404), "Not Found", @as(usize, 9) },
+        .{ "POST /users/42 HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n", @as(u16, 404), "Not Found", @as(usize, 9) },
+        .{ "POST /echo HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", @as(u16, 200), "hello", @as(usize, 5) },
+        .{ "HEAD / HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 200), "", @as(usize, 15) },
+        .{ "GET /empty HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 204), "", @as(usize, 0) },
+    };
+    inline for (requests) |request_case| {
+        try writer.interface.writeAll(request_case[0]);
+        try writer.interface.flush();
+        try expectSocketResponse(&reader.interface, request_case[1], request_case[2], request_case[3]);
+    }
+    _ = server_future.cancel(io) catch {};
+}
+
+test "real socket dispatch failure is generic and closes" {
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, run_io: Io, run_listener: *net.Server, run_app: *const SocketApp, run_config: Config) !void {
+            return serve(SocketApp, allocator, run_io, run_listener, run_app, run_config);
+        }
+    };
+    const io = std.testing.io;
+    const address: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const socket_app: SocketApp = .{ .response_allocator = std.testing.allocator, .config = .{ .name = "socket-test" }, .plugins = .{}, .route_fn = socketRoute };
+    var server_future = try io.concurrent(Runner.run, .{ std.testing.allocator, io, &listener, &socket_app, Config{ .shutdown_grace_period = .{ .raw = .fromMilliseconds(25), .clock = .awake } } });
+    const client = try net.IpAddress.connect(&listener.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer client.close(io);
+    var write_buffer: [256]u8 = undefined;
+    var writer = client.writer(io, &write_buffer);
+    try writer.interface.writeAll("GET /fail HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+    var read_buffer: [512]u8 = undefined;
+    var reader = client.reader(io, &read_buffer);
+    try expectSocketResponse(&reader.interface, 500, "Internal Server Error", 21);
+    _ = server_future.cancel(io) catch {};
 }

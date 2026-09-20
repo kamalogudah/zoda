@@ -558,8 +558,8 @@ against the acceptance criteria; no new public types were added.
   - `zig version` → `0.16.0`.
   - `zig fmt --check build.zig src` → clean.
   - `zig build` → success.
-  - `zig test -Mroot=src/root.zig` → 61/61 library tests pass.
-  - `zig build test` → success (64/64 total: 61 library + 3 executable).
+  - `zig test -Mroot=src/root.zig` → 73/73 library tests pass.
+  - `zig build test` → success (76/76 total: 73 library + 3 executable).
   - `./zig-out/bin/zoda` → exits 0 and prints the six route outcomes.
 - CI: both jobs ("Format check" and "Build and test") pass on the pinned
   compiler at commit `0780726` — run

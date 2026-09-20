@@ -195,7 +195,7 @@ Recorded for Phase 1 verification (issue #11) on the primary platform:
 - Compiler: `zig version` → `0.16.0`.
 - Host: Ubuntu 24.04.4 LTS, `x86_64-linux-gnu`.
 - `zig build` → success.
-- `zig build test` → success (64/64 tests: 61 library + 3 executable).
+- `zig build test` → success (76/76 tests: 73 library + 3 executable).
 - `zig fmt --check build.zig src` → clean.
 - `./zig-out/bin/zoda` → exits 0 and prints the six §5.3 route outcomes.
 - Added/strengthened tests in `src/app.zig`: full status/content-type/body
