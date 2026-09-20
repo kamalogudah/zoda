@@ -19,12 +19,15 @@ pub const Config = struct {
     body_read_timeout: Io.Clock.Duration = .{ .raw = .fromSeconds(10), .clock = .awake },
     write_timeout: Io.Clock.Duration = .{ .raw = .fromSeconds(10), .clock = .awake },
     keep_alive_idle_timeout: Io.Clock.Duration = .{ .raw = .fromSeconds(5), .clock = .awake },
+    shutdown_grace_period: Io.Clock.Duration = .{ .raw = .fromSeconds(10), .clock = .awake },
     max_requests_per_connection: usize = 100,
     request_limits: @import("request.zig").Limits = .default,
 };
 
 /// Accepts connections until the listener is closed or this task is canceled.
 /// Admission above `max_connections` is rejected immediately; the accept loop
+/// Shutdown stops acceptance, waits `shutdown_grace_period`, then force-closes
+/// registered sockets before canceling remaining connection tasks.
 /// never waits for an admitted client to finish a request.
 pub fn serve(
     comptime AppType: type,
@@ -36,12 +39,17 @@ pub fn serve(
 ) !void {
     var active: std.atomic.Value(usize) = .init(0);
     var connections: Io.Group = .init;
-    errdefer connections.cancel(io);
+    var registry: ConnectionRegistry = .{};
+    errdefer {
+        registry.closeAll(io);
+        connections.cancel(io);
+    }
 
     const Context = struct {
         allocator: std.mem.Allocator,
         io: Io,
-        stream: net.Stream,
+        connection: *Connection,
+        registry: *ConnectionRegistry,
         app: *const AppType,
         config: Config,
         active: *std.atomic.Value(usize),
@@ -49,13 +57,15 @@ pub fn serve(
         fn run(context: *@This()) Io.Cancelable!void {
             defer context.allocator.destroy(context);
             defer _ = context.active.fetchSub(1, .acq_rel);
-            defer context.stream.close(context.io);
+            defer context.allocator.destroy(context.connection);
+            defer context.registry.remove(context.connection, context.io);
+            defer context.connection.close(context.io);
 
             var read_buffer: [8192]u8 = undefined;
             var write_buffer: [8192]u8 = undefined;
             var connection_io = ConnectionIo.init(
                 context.io,
-                context.stream,
+                context.connection.stream,
                 &read_buffer,
                 &write_buffer,
                 context.config,
@@ -81,35 +91,114 @@ pub fn serve(
     while (true) {
         const stream = listener.accept(io) catch |err| switch (err) {
             error.SocketNotListening => break,
-            else => return err,
+            error.Canceled => {
+                shutdown(&connections, &registry, &active, io, config.shutdown_grace_period);
+                return error.Canceled;
+            },
+            else => {
+                connections.cancel(io);
+                return err;
+            },
         };
         if (!reserve(&active, config.max_connections)) {
             stream.close(io);
             continue;
         }
 
-        const context = allocator.create(Context) catch |err| {
+        const connection = allocator.create(Connection) catch |err| {
             _ = active.fetchSub(1, .acq_rel);
             stream.close(io);
+            return err;
+        };
+        connection.* = .{ .stream = stream };
+        registry.add(connection, io);
+        const context = allocator.create(Context) catch |err| {
+            registry.remove(connection, io);
+            connection.close(io);
+            allocator.destroy(connection);
+            _ = active.fetchSub(1, .acq_rel);
             return err;
         };
         context.* = .{
             .allocator = allocator,
             .io = io,
-            .stream = stream,
+            .connection = connection,
+            .registry = &registry,
             .app = app,
             .config = config,
             .active = &active,
         };
         connections.concurrent(io, Context.run, .{context}) catch |err| {
             allocator.destroy(context);
+            registry.remove(connection, io);
+            connection.close(io);
+            allocator.destroy(connection);
             _ = active.fetchSub(1, .acq_rel);
-            stream.close(io);
             return err;
         };
     }
 
-    try connections.await(io);
+    shutdown(&connections, &registry, &active, io, config.shutdown_grace_period);
+}
+
+const Connection = struct {
+    stream: net.Stream,
+    closed: std.atomic.Value(bool) = .init(false),
+    next: ?*Connection = null,
+
+    fn close(self: *Connection, io: Io) void {
+        if (!self.closed.swap(true, .acq_rel)) self.stream.close(io);
+    }
+};
+
+const ConnectionRegistry = struct {
+    mutex: Io.Mutex = .init,
+    head: ?*Connection = null,
+
+    fn add(self: *ConnectionRegistry, connection: *Connection, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        connection.next = self.head;
+        self.head = connection;
+    }
+
+    fn remove(self: *ConnectionRegistry, connection: *Connection, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var cursor = &self.head;
+        while (cursor.*) |current| {
+            if (current == connection) {
+                cursor.* = current.next;
+                return;
+            }
+            cursor = &current.next;
+        }
+    }
+
+    fn closeAll(self: *ConnectionRegistry, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var cursor = self.head;
+        while (cursor) |connection| : (cursor = connection.next) {
+            connection.close(io);
+        }
+    }
+};
+
+fn shutdown(
+    connections: *Io.Group,
+    registry: *ConnectionRegistry,
+    active: *std.atomic.Value(usize),
+    io: Io,
+    grace_period: Io.Clock.Duration,
+) void {
+    if (active.load(.acquire) != 0) {
+        const old_protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(old_protection);
+        grace_period.sleep(io) catch {};
+        registry.closeAll(io);
+    }
+    connections.cancel(io);
 }
 
 fn reserve(active: *std.atomic.Value(usize), limit: usize) bool {
@@ -308,6 +397,7 @@ test "defaults match the Phase 2 connection contract" {
     try std.testing.expectEqual(@as(i96, 10 * std.time.ns_per_s), config.body_read_timeout.raw.nanoseconds);
     try std.testing.expectEqual(@as(i96, 10 * std.time.ns_per_s), config.write_timeout.raw.nanoseconds);
     try std.testing.expectEqual(@as(i96, 5 * std.time.ns_per_s), config.keep_alive_idle_timeout.raw.nanoseconds);
+    try std.testing.expectEqual(@as(i96, 10 * std.time.ns_per_s), config.shutdown_grace_period.raw.nanoseconds);
     try std.testing.expectEqual(@as(usize, 100), config.max_requests_per_connection);
 }
 
@@ -388,6 +478,7 @@ test "a stalled connection does not block a second client" {
         Config{
             .max_connections = 2,
             .header_timeout = .{ .raw = .fromSeconds(1), .clock = .awake },
+            .shutdown_grace_period = .{ .raw = .fromMilliseconds(25), .clock = .awake },
         },
     });
 
@@ -406,7 +497,6 @@ test "a stalled connection does not block a second client" {
     });
     defer stalled.close(io);
     defer healthy.close(io);
-    defer _ = server_future.cancel(io) catch {};
     var healthy_buffer: [128]u8 = undefined;
     var healthy_writer = healthy.writer(io, &healthy_buffer);
     try healthy_writer.interface.writeAll("GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
@@ -416,4 +506,8 @@ test "a stalled connection does not block a second client" {
     var healthy_reader = healthy.reader(io, &healthy_read_buffer);
     const n = try healthy_reader.interface.readSliceShort(&healthy_read_buffer);
     try std.testing.expect(std.mem.startsWith(u8, healthy_read_buffer[0..n], "HTTP/1.1 200 OK"));
+    const shutdown_started = Io.Clock.Timestamp.now(io, .awake);
+    _ = server_future.cancel(io) catch {};
+    const shutdown_elapsed = shutdown_started.durationFromNow(io);
+    try std.testing.expect(shutdown_elapsed.raw.nanoseconds < @as(i96, std.time.ns_per_s));
 }

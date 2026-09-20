@@ -576,8 +576,8 @@ against the acceptance criteria; no new public types were added.
       Read deadlines are total operation budgets, not reset by every byte.
 - [x] Implement chunked-body decoding through the transport, limit enforcement,
       protocol-error handling, and safe close/drain rules for connection reuse.
-- [ ] On shutdown stop accepting, allow a configurable 10-second grace period,
-      then cancel and release remaining connections.
+- [x] On shutdown stop accepting, allow a configurable 10-second grace period,
+      then force-close, cancel, and release remaining connections.
 - **Exit:** automated real-socket tests verify the JSON slice and its negative
       cases; a stalled client cannot prevent a second client from completing.
       Record the concrete concurrency/I/O APIs supported by the pinned compiler.
@@ -589,7 +589,7 @@ The bounded wire adapter is implemented in `src/transport.zig` and exported as
 `Request.iterateHeaders`, `std.http.Reader.bodyReader`, and `Request.respond`.
 The caller supplies the connection reader/writer, allocator, and application;
 `zoda.server` supplies socket acceptance, deadlines, and bounded connection
-concurrency. Shutdown grace remains a separate Phase 2 follow-up.
+concurrency. Shutdown grace is implemented in `src/server.zig`; the framing adapter delegates lifecycle ownership to the server runtime.
 
 - A fixed maximum head length bounds wire buffering. Target, header byte/count,
   path-segment, query-pair, and decoded-body limits are checked before dispatch.
@@ -627,8 +627,8 @@ zig build test
 ```
 
 A passing hosted CI run must be linked before the remaining Phase 2 exit is
-marked complete. Real-socket shutdown grace acceptance remains an unchecked
-Phase 2 item.
+marked complete. Real-socket shutdown grace acceptance is covered by the
+`a stalled connection does not block a second client` test in `src/server.zig`.
 
 ### §4.2.2 Phase 2 bounded runtime evidence — issue #13
 
@@ -647,7 +647,11 @@ each operation, so partial reads cannot refresh a total deadline. The pinned
 POSIX backend maps `EAGAIN` to the runtime timeout path and all connection/task
 resources are released on overload, timeout, cancellation, or normal close.
 The supplied allocator is documented as concurrent; `std.heap.smp_allocator` is
-the recommended strategy.
+the recommended strategy. Shutdown stops accepting on cancellation or listener
+closure, waits the configurable 10-second grace period, then closes every
+registered socket before canceling the connection group. Connection records use
+one-shot close ownership and are removed and destroyed on normal completion,
+cancellation, and forced shutdown.
 
 Tests in `src/server.zig` verify the defaults and cap, a total (not per-byte)
 header deadline over a real loopback socket, and that a stalled client does not
@@ -662,9 +666,13 @@ zig build test
 ./zig-out/bin/zoda
 ```
 
-Shutdown grace-period orchestration remains a conditional follow-up in the
-roadmap; closing/canceling the listener cancels the accept task and drains the
-connection group.
+Shutdown is implemented in `src/server.zig`: `Config.shutdown_grace_period`
+defaults to 10 seconds; cancellation or listener closure stops acceptance,
+allows the grace period, force-closes registered sockets, and cancels the group.
+The loopback acceptance test uses a stalled client with a 25 ms configured grace
+period and asserts shutdown completes in under one second. Connection records
+and all per-connection resources are released through one-shot close and
+registry removal on every exit path.
 
 ### Phase 2b — HTTP/1.1 hardening
 

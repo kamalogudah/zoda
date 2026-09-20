@@ -235,6 +235,6 @@ Recorded locally for the Phase 2 bounded framing adapter (issue #12):
 - Validation commands and detailed coverage are recorded in `zoda_plan.md`
   §4.2.1. Hosted CI evidence remains pending until the change is pushed.
 
-CI (`zig fmt --check`, `zig build`, `zig build test`, plus the `zoda` demo
+CI (`zig fmt --check`, `zig build`, `zig build test`, plus the real-socket shutdown acceptance test via `zig build test` and the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
 request. See `.github/workflows/ci.yml`.
