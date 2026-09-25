@@ -142,6 +142,34 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Phase 2b adversarial real-socket suite, runnable on its own so CI can
+    // repeat it under other optimize modes, e.g.
+    // `zig build test-hardening -Doptimize=ReleaseSafe`. It gets its own
+    // module because `mod` does not take the optimize option.
+    const hardening_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"hardening"},
+    });
+    const hardening_step = b.step("test-hardening", "Run adversarial HTTP/1.1 and resource-recovery tests");
+    hardening_step.dependOn(&b.addRunArtifact(hardening_tests).step);
+
+    // Deliberately separate from CI's quick tests: this runs a full 60-second
+    // closed-loop load followed by an above-cap admission measurement.
+    const load_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/load.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"load measurement"},
+    });
+    const load_step = b.step("test-load", "Measure 60-second load and above-cap overload on loopback");
+    load_step.dependOn(&b.addRunArtifact(load_tests).step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

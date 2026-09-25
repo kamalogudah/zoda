@@ -558,8 +558,8 @@ against the acceptance criteria; no new public types were added.
   - `zig version` → `0.16.0`.
   - `zig fmt --check build.zig src` → clean.
   - `zig build` → success.
-  - `zig test -Mroot=src/root.zig` → 61/61 library tests pass.
-  - `zig build test` → success (64/64 total: 61 library + 3 executable).
+  - `zig test -Mroot=src/root.zig` → 73/73 library tests pass.
+  - `zig build test` → success (76/76 total: 73 library + 3 executable).
   - `./zig-out/bin/zoda` → exits 0 and prints the six route outcomes.
 - CI: both jobs ("Format check" and "Build and test") pass on the pinned
   compiler at commit `0780726` — run
@@ -596,7 +596,9 @@ concurrency. Shutdown grace is implemented in `src/server.zig`; the framing adap
 - Content-Length plus Transfer-Encoding, unsupported content codings, malformed
   chunks, unsafe headers, and unsupported expectations receive 400 and close.
   Target, header, and body limits receive 414, 431, and 413 respectively.
-- Chunk framing is decoded by the standard-library body reader; the Zoda
+- Content-Length bodies use the standard-library body reader. Chunked bodies
+  are decoded by Zoda's strict RFC 9112 §7.1 decoder (`readChunked`), because
+  the pinned `std.http.ChunkParser` is lenient (see §4.2.3); the Zoda
   accumulator bounds decoded bytes. Valid trailers share the request header
   count/byte budget and are appended to the complete request.
 - Each keep-alive iteration constructs and destroys a fresh request arena.
@@ -668,7 +670,8 @@ zig build test
 
 Shutdown is implemented in `src/server.zig`: `Config.shutdown_grace_period`
 defaults to 10 seconds; cancellation or listener closure stops acceptance,
-allows the grace period, force-closes registered sockets, and cancels the group.
+allows the grace period, shuts down registered sockets, and cancels the group
+(`shutdown(2)` rather than `close(2)` since issue #16; see §4.2.3).
 The loopback acceptance test uses a stalled client with a 25 ms configured grace
 period and asserts shutdown completes in under one second. Connection records
 and all per-connection resources are released through one-shot close and
@@ -676,15 +679,141 @@ registry removal on every exit path.
 
 ### Phase 2b — HTTP/1.1 hardening
 
-- [ ] Test concurrent keep-alive clients, slow reads/writes, malformed framing,
-      oversized chunked bodies, disconnects, and shutdown cleanup.
-- [ ] Run a repeatable 60-second load test at 64 connections and an overload
+- [x] Test concurrent keep-alive clients, slow reads/writes, malformed framing,
+      oversized chunked bodies, disconnects, and shutdown cleanup (issue #16,
+      §4.2.3).
+- [x] Run a repeatable 60-second load test at 64 connections and an overload
       test above the 128-connection cap; record tool, hardware, errors, and latency.
 - **Exit:** no hangs, application crashes, leaked connections, or cap violations;
       allocations/connections return to baseline after clients finish.
 - [ ] Decide whether streaming is needed; if so, approve its separate design
       and test producer cleanup, bounded memory, backpressure, and cancellation
       before implementing chunked response streaming.
+
+### §4.2.3 Phase 2b adversarial and resource-recovery evidence — issue #16
+
+The suite lives in `src/hardening.zig`. Every scenario runs `server.serve` on
+a real loopback listener with a thread-safe counting allocator and
+caller-owned `server.Stats`, a new optional `Config.stats` field with `active`,
+`peak`, `admitted`, and `rejected` counters. The connection task now releases
+its admission slot last, so `active == 0` means every per-connection
+allocation has already been freed. After each scenario the harness waits for
+`active == 0`, then asserts zero live allocations and bytes. Teardown asserts
+that shutdown finishes in under 2 s with no connection or allocation left. Test clients set their
+own `SO_RCVTIMEO` (3 s), so a server hang fails a test instead of blocking the
+run.
+
+| Scenario | What it asserts |
+| --- | --- |
+| Concurrent keep-alive | 16 clients × 25 requests alternate Content-Length and chunked bodies. Every echo matches, `admitted == 16` (each client reuses one connection), and `peak ≤ 16`. |
+| Pipelining and request cap | Five pipelined requests (Content-Length, chunked with trailer, HEAD, Content-Length, GET) with a cap of 4. Response boundaries hold, the 4th response says `connection: close`, and the 5th request is never read. |
+| Malformed or ambiguous framing | 34 payloads: CL+TE in both orders; duplicate, list, signed, non-numeric, and overflowing lengths; unsupported or obfuscated codings; malformed chunks; obs-fold; colonless or NUL-containing fields; bad request lines; absolute-form targets; `Expect`; TE on HTTP/1.0. Each gets 400 and a close. A request pipelined behind each payload is never dispatched or answered. |
+| Oversized bodies and heads | Content-Length above the limit; 64 small chunks crossing the limit; one 1 GiB declared chunk that is refused before its data. Target, header count, header bytes, and wire head each map to 414/431. Peak allocator bytes stay below 16 KiB. |
+| Slow trickles | One byte per 20 ms into the head, a Content-Length body, and a chunked body. Each connection closes after its total 250 ms budget (measured about 264 ms), not per byte. An idle keep-alive connection closes after its idle budget. |
+| Slow reader | A 32 MiB response to a client that never reads is abandoned within the 250 ms write budget. A second client is served meanwhile. |
+| Disconnects | FIN and RST (SO_LINGER 0) before the head, mid-head, mid-body, mid-chunk, and after a complete request, including a 1 MiB response. Each returns to baseline, and the server keeps serving. |
+| Bounded admission | 128 held connections (the default cap) plus 32 overflow connections, each closed immediately. `rejected == 32`, `peak == 128`, held clients still complete, and capacity is reusable afterwards. |
+| Shutdown during active requests | Clients in dispatch, mid-body, mid-head, and keep-alive idle all close within the 50 ms grace. No late success body is sent; a canceled dispatch may receive the generic 500. |
+
+Defects found by the suite and fixed in the same change:
+
+1. **Forced shutdown panicked (`src/server.zig`).** Closing registered
+   descriptors raced the owning task's next `setsockopt`. The pinned std
+   treats `EBADF` as `unreachable`, and the race also allowed fd reuse.
+   Shutdown now calls `shutdown(2)` on each socket, which wakes blocked
+   syscalls. Each task unregisters before closing its own descriptor.
+2. **An expired write budget panicked (`src/server.zig`).** `SO_SNDTIMEO`
+   reports expiry as `EAGAIN`, which the pinned `Io.Threaded.netWrite`
+   treats as a programmer bug. POSIX writes now use `sendmsg` directly, with
+   `MSG_NOSIGNAL`, `EAGAIN` → `Timeout`, and cancellation checks on `EINTR`.
+3. **Lenient chunk parsing (`src/transport.zig`).** The pinned
+   `std.http.ChunkParser` reads `g`–`z` as size digits (`zz` = 595, so the
+   server waited for a body timeout). It also treats an empty size or `-1`
+   as the final chunk and accepts bare LF and extensions without a `;`.
+   Zoda now decodes chunked bodies itself. Sizes must be `1*HEXDIG` with
+   overflow checks and line endings must be CRLF. Extensions must start with
+   `;` and contain no control bytes. A chunk-size line is limited to
+   1024 bytes, and a declared size above the remaining body budget gets 413
+   before any data is read.
+4. **Lenient header fields (`src/transport.zig`).** Lines without `:` were
+   accepted as empty fields, and `Content-Length: +1` was accepted. Both now
+   get 400. So does Transfer-Encoding on an HTTP/1.0 request (RFC 9112 §6.1).
+5. **An interim response before rejection (`src/transport.zig`).** `respond`
+   wrote `100 Continue` ahead of the 400 for an `Expect` request, inviting
+   the body of a request that was being refused. Rejections now clear
+   `expect` first.
+
+In-memory regressions for items 3–5 are in `src/transport.zig`. Validation on
+Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test                                       # 89/89 (86 library + 3 exe)
+zig build test-hardening -Doptimize=ReleaseSafe      # adversarial suite only
+./zig-out/bin/zoda
+```
+
+For stability, the suite binary ran 10/10 times in Debug and 10/10 in
+ReleaseSafe, and 4 copies ran in parallel under CPU contention without
+failure. CI runs `zig build test-hardening -Doptimize=ReleaseSafe` as a
+separate step. Hosted CI passed in
+[run 36151521763](https://github.com/kamalogudah/zoda/actions/runs/36151521763).
+The load and overload measurements are recorded in §4.2.4.
+
+### §4.2.4 Phase 2b load and overload measurements — issue #17
+
+The opt-in `zig build test-load -Doptimize=ReleaseSafe --summary all` step runs
+two real-loopback measurements from `src/load.zig`, using the same counting
+allocator and admission counters as §4.2.3. CI also runs this step. Each client
+has a 3-second socket read timeout, so a hang fails the run. The load test uses
+64 closed-loop clients, each sending `GET / HTTP/1.1` with `Host: load` and
+checking a `200` response containing `ok` before its next request. It raises
+only `max_requests_per_connection` above the default to keep the same 64
+connections open for the full 60 seconds. A start gate waits until all 64
+clients are connected and the server reports 64 active admissions. It records every send-through-body
+latency using monotonic time and a bounded logarithmic histogram. Reported
+percentiles are inclusive bucket **upper bounds**, not interpolated values.
+The overload test holds 128 incomplete request heads, then connects 32 excess
+clients and times each server-initiated close. It completes the 128 held
+requests and waits for all sockets and counted allocations to drain.
+
+Local measurement on 2026-09-25, repository base `65591be`, pinned Zig
+`0.16.0`, native `x86_64-linux-gnu`, `-Doptimize=ReleaseSafe`:
+
+| Environment | Value |
+| --- | --- |
+| Host | Intel Core i5-8365U, 4 cores / 8 logical CPUs; 15 GiB RAM |
+| OS | Ubuntu 24.04.1, Linux `7.0.0-31-generic` x86_64 |
+| Tool | Zig's built-in test runner and the Zoda loopback harness; no external load generator |
+
+| Measurement | Result |
+| --- | --- |
+| 64-connection load | 60,011 ms; 384,921 successful requests; 0 client errors; 6,414 requests/s |
+| Load latency, send through response body | Mean 9,052 µs; p50 ≤16,383 µs; p95 ≤32,767 µs; p99 ≤32,767 µs; max 57,620 µs |
+| Load server state | Peak/admitted 64/64; rejected 0; peak counted allocator bytes 49,098; active and counted live allocations/bytes returned to 0 |
+| 160-connection overload | 128 held/admitted; 32/32 excess rejected; peak 128; 128 held requests completed successfully |
+| Overload rejection latency | Mean 350 µs; p50 ≤511 µs; p95 ≤511 µs; max 465 µs |
+| Overload recovery | Active connections and counted live allocations/bytes returned to 0; bounded teardown passed |
+
+Reproduce from the repository root:
+
+```sh
+zig version                                            # 0.16.0
+zig fmt --check build.zig src
+zig build test
+zig build test-hardening -Doptimize=ReleaseSafe --summary all
+zig build test-load -Doptimize=ReleaseSafe --summary all
+```
+
+The final local load step passed 2/2 selected tests; the normal test and
+ReleaseSafe hardening suites also passed after the test-root split.
+There were no observed hangs, application crashes, leaks, or admission-cap
+violations. These loopback numbers characterize this host and workload only.
+Hosted CI passed on pinned Zig 0.16.0 in
+[run 36153064159](https://github.com/kamalogudah/zoda/actions/runs/36153064159),
+including the dedicated 60-second step.
 
 ### Phase 2c — HTTP/2 feasibility
 

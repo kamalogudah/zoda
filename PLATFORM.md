@@ -195,7 +195,7 @@ Recorded for Phase 1 verification (issue #11) on the primary platform:
 - Compiler: `zig version` → `0.16.0`.
 - Host: Ubuntu 24.04.4 LTS, `x86_64-linux-gnu`.
 - `zig build` → success.
-- `zig build test` → success (64/64 tests: 61 library + 3 executable).
+- `zig build test` → success (76/76 tests: 73 library + 3 executable).
 - `zig fmt --check build.zig src` → clean.
 - `./zig-out/bin/zoda` → exits 0 and prints the six §5.3 route outcomes.
 - Added/strengthened tests in `src/app.zig`: full status/content-type/body
@@ -233,7 +233,52 @@ Recorded locally for the Phase 2 bounded framing adapter (issue #12):
   Zoda rejects content codings and `Expect` rather than emitting output before
   dispatch, and closes on every protocol/limit/dispatch rejection.
 - Validation commands and detailed coverage are recorded in `zoda_plan.md`
-  §4.2.1. Hosted CI evidence remains pending until the change is pushed.
+  §4.2.1. Hosted CI passed with this prerequisite commit in
+  [run 36151521763](https://github.com/kamalogudah/zoda/actions/runs/36151521763).
+
+Recorded locally for Phase 2b adversarial HTTP/1.1 tests (issue #16):
+
+- Compiler: `zig version` → `0.16.0`; target `x86_64-linux-gnu`.
+- `src/hardening.zig` exercises `zoda.server` over real loopback sockets. It
+  covers concurrent keep-alive, pipelining, malformed or ambiguous framing,
+  oversized bodies, slow trickles, a slow reader, disconnects, admission above
+  the 128 cap, and shutdown during active requests. Each scenario checks that
+  connections and allocations return to baseline.
+- The suite found pinned-std behavior that Zoda now works around:
+  `std.http.ChunkParser` is lenient, so Zoda decodes chunked bodies itself.
+  `Io.Threaded.netWrite` panics on `EAGAIN` from `SO_SNDTIMEO`, so POSIX
+  writes use `sendmsg`. `posix.setsockopt` panics on `EBADF`, so forced
+  shutdown uses `shutdown(2)` instead of `close(2)`. `Head.parse` accepts
+  colonless fields, `parseInt` accepts a signed Content-Length, and
+  `respond` emits `100 Continue`; the transport rejects the first two and
+  suppresses the third on rejection. Details are in `zoda_plan.md` §4.2.3.
+- Validation commands:
+  ```sh
+  zig version                 # 0.16.0
+  zig fmt --check build.zig src
+  zig build
+  zig build test              # 89/89
+  zig build test-hardening -Doptimize=ReleaseSafe
+  ./zig-out/bin/zoda
+  ```
+- CI: hosted run passed with this prerequisite commit in
+  [run 36151521763](https://github.com/kamalogudah/zoda/actions/runs/36151521763).
+
+Recorded locally for Phase 2b load and overload measurements (issue #17):
+
+- Zig `0.16.0`, native `x86_64-linux-gnu`, `ReleaseSafe`; Intel Core i5-8365U
+  (4 cores / 8 threads), 15 GiB RAM, Ubuntu 24.04.1 / Linux 7.0.0-31-generic.
+- `zig build test-load -Doptimize=ReleaseSafe --summary all` runs 64 persistent
+  loopback keep-alive clients for at least 60 seconds and then holds 128
+  connections while probing 32 above-cap clients. It checks responses,
+  client errors, admission counters, and allocation/connection recovery.
+- Local run: 384,921 successful requests in 60.011 s (6,414/s), zero client
+  errors, p50 latency ≤16.383 ms, p95/p99 ≤32.767 ms, peak 64 connections,
+  zero rejections. Overload rejected 32/32, peaked at exactly 128, and
+  returned to zero active connections and counted allocations. The latency
+  percentiles are histogram bucket upper bounds. Full methods and numbers are
+  in `zoda_plan.md` §4.2.4. Hosted CI passed on Zig 0.16.0 in
+  [run 36153064159](https://github.com/kamalogudah/zoda/actions/runs/36153064159).
 
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the real-socket shutdown acceptance test via `zig build test` and the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull

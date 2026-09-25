@@ -48,6 +48,11 @@ comptime {
     std.testing.refAllDecls(plugins.json);
 }
 
+test {
+    // Adversarial real-socket suite (Phase 2b); not part of the public API.
+    _ = @import("hardening.zig");
+}
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
