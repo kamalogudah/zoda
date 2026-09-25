@@ -183,7 +183,9 @@ framing headers, preventing conflicting lengths or transfer encodings.
 Response streaming requires a later ADR covering a body producer, ownership,
 backpressure, cancellation, and errors after headers are sent. It is not
 implicitly supported by returning a buffered `Response`. HTTP/1.1 chunked
-request decoding remains part of the initial transport contract.
+request decoding remains part of the initial transport contract. Issue #18
+decided responses are **buffered-only** for the first HTTP/1.1 release; the
+decision, its evidence, and its reopening conditions are in §4.2.5.
 
 ### 3.5 Errors and early returns
 
@@ -686,9 +688,10 @@ registry removal on every exit path.
       test above the 128-connection cap; record tool, hardware, errors, and latency.
 - **Exit:** no hangs, application crashes, leaked connections, or cap violations;
       allocations/connections return to baseline after clients finish.
-- [ ] Decide whether streaming is needed; if so, approve its separate design
+- [x] Decide whether streaming is needed; if so, approve its separate design
       and test producer cleanup, bounded memory, backpressure, and cancellation
-      before implementing chunked response streaming.
+      before implementing chunked response streaming. Decided buffered-only
+      (issue #18, §4.2.5); streaming is deferred, not implemented.
 
 ### §4.2.3 Phase 2b adversarial and resource-recovery evidence — issue #16
 
@@ -814,6 +817,85 @@ violations. These loopback numbers characterize this host and workload only.
 Hosted CI passed on pinned Zig 0.16.0 in
 [run 36153064159](https://github.com/kamalogudah/zoda/actions/runs/36153064159),
 including the dedicated 60-second step.
+
+### §4.2.5 Phase 2b response-streaming decision — issue #18
+
+**Outcome: buffered responses only.** The first HTTP/1.1 release does not
+support response streaming. No streaming ADR is approved, no streaming API
+exists, and the roadmap must not count streaming as implemented.
+
+No demonstrated need exists on the current roadmap:
+
+- The JSON slice (Phases 1–2) produces bodies well under the 1 MiB buffered
+  limit. The §4.2.4 load run held peak counted allocator bytes at 49,098
+  across 64 connections.
+- Static files (issue #25) already require "enforce buffered response
+  limits". A file above `response.Limits.max_body_bytes` is a configuration
+  error, not a reason to stream.
+- Templates (issues #28, #29) render typed data into a bounded body. Sessions,
+  CSRF, and timing middleware (issues #24, #33, #34) add headers or small
+  bodies only.
+- No roadmap item calls for server-sent events, long polling, large downloads,
+  or proxying.
+
+Buffering also keeps guarantees that streaming would need a new design for.
+Dispatch completes before any output (§3.5), so a handler error can still
+become a clean generic 500. Every response is framed with one transport-owned
+Content-Length. Memory per connection is bounded by `max_body_bytes`.
+
+What this means for the current API:
+
+- `Response` owns a complete body. `text` and `replaceJson` return
+  `error.BodyTooLarge` above `max_body_bytes` (default 1 MiB) and leave the
+  previous body unchanged. If a handler propagates that error, the transport
+  sends the generic 500 and closes.
+- Applications cannot choose streaming or chunked framing. The transport
+  strips any application `Content-Length` or `Transfer-Encoding` header and
+  emits exactly one Content-Length.
+- Raising `max_body_bytes` is the supported path for larger bounded bodies.
+  It raises per-request memory, so size the allocator for it.
+
+Evidence (existing tests, no code change needed):
+
+| Test | What it proves |
+| --- | --- |
+| `src/response.zig` "body limit accepts at-limit length and rejects one byte over" | The buffered body is bounded; rejection keeps the prior body. |
+| `src/transport.zig` "dispatch failures are generic and response framing is transport owned" | An application `Transfer-Encoding: chunked` or false `Content-Length` never reaches the wire. |
+| `src/transport.zig` "HEAD retains representation length and emits no body" | Framing is computed by the transport from the complete body. |
+| `src/hardening.zig` slow-reader scenario (§4.2.3) | A 32 MiB buffered response (limit raised for the test) to a non-reading client is abandoned within the write budget without blocking other clients. |
+
+Reopening conditions. Revisit this decision only when one of these is
+accepted on the roadmap:
+
+1. An endpoint whose body cannot be bounded in advance, such as server-sent
+   events or long polling.
+2. Static or generated downloads that must exceed a buffered limit that is
+   reasonable per connection.
+3. Proxying or relaying an upstream body.
+
+Reopening requires, in order:
+
+1. A separate ADR defining body-producer ownership and cleanup, bounded
+   memory, backpressure against slow readers under the write budget,
+   cancellation on disconnect and shutdown, and error handling after headers
+   are sent (abort the connection, never a second status line).
+2. Separately scoped implementation and test issues, linked from the roadmap
+   (#38), with acceptance tests for producer cleanup on every exit path,
+   bounded memory, backpressure, and cancellation.
+3. Only then, implementation. Buffered `Response` keeps its current contract.
+
+No follow-up issues are opened now because no condition is met. The
+roadmap records streaming as explicitly deferred.
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`). This change only edits
+documentation, so the existing suites confirm the cited tests still pass:
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build test --summary all                         # 89/89 (86 library + 3 exe)
+zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+```
 
 ### Phase 2c — HTTP/2 feasibility
 
@@ -1047,7 +1129,9 @@ Remaining decisions have explicit gates:
 - ~~Exact compiler version and primary platform~~ — resolved in Phase A:
   Zig 0.16.0 on `x86_64-linux` ([PLATFORM.md](PLATFORM.md)).
 - Concrete I/O/concurrency APIs: Phase 2, before the socket slice is accepted.
-- Response streaming API: separate ADR in Phase 2b, only if needed.
+- ~~Response streaming API~~ — resolved in Phase 2b as buffered-only for the
+  first HTTP/1.1 release (issue #18, §4.2.5). Streaming stays unsupported
+  until a reopening condition there is met and a separate ADR is approved.
 - HTTP/2 support: Phase 2c feasibility result.
 - Named capture convenience: Phase 4, based on demonstrated need.
 

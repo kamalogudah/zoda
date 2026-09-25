@@ -26,6 +26,10 @@
 //!
 //! Response framing (Content-Length, Transfer-Encoding, HEAD/bodyless rules)
 //! is the wire adapter's responsibility and intentionally absent here (§3.4).
+//!
+//! Buffered only: a `Response` holds its complete body, bounded by
+//! `Limits.max_body_bytes`. Response streaming is not supported and is not
+//! implied by this type (ADR-0001 §4.2.5).
 const std = @import("std");
 
 /// Configurable response bounds (§3.4 defaults: 100 headers / 32 KiB header
