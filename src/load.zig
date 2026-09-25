@@ -91,7 +91,9 @@ test "load measurement: 64 keep-alive clients for 60 seconds" {
     const connecting = Io.Clock.Timestamp.now(h.io, .awake);
     while (gate.ready.load(.acquire) != clients or h.stats.active.load(.acquire) != clients) {
         if (elapsedMs(h.io, connecting) > 3000) {
-            gate.started = Io.Clock.Timestamp.now(h.io, .awake);
+            // Backdate the start so connected clients exit immediately
+            // instead of running the full measurement before we fail.
+            gate.started = Io.Clock.Timestamp.now(h.io, .awake).subDuration(.{ .raw = .fromMilliseconds(duration_ms), .clock = .awake });
             gate.go.store(true, .release);
             try group.await(h.io);
             return error.LoadClientsDidNotConnect;
@@ -154,13 +156,15 @@ test "load measurement: 160 simultaneous connections respect the 128 cap" {
     }
     const peak = h.stats.peak.load(.acquire);
     const rejected = h.stats.rejected.load(.acquire);
-    for (held[0..opened]) |*client| {
+    // Close from the end so the deferred cleanup never sees a closed client.
+    while (opened > 0) {
+        const client = &held[opened - 1];
         try client.send("Host: load\r\nConnection: close\r\n\r\n");
         const reply = try client.expectResponse(200, "ok");
         reply.deinit();
         client.close();
+        opened -= 1;
     }
-    opened = 0;
     try h.expectBaseline();
     std.debug.print("overload: held={d} excess={d} admitted={d} rejected={d} peak={d} rejection_latency_us_mean={d} p50_upper={d} p95_upper={d} max={d} active_after={d} live_allocations_after={d} live_bytes_after={d}\n", .{
         cap,                                                          excess,                                h.stats.admitted.load(.acquire),       rejected,                 peak,

@@ -812,7 +812,7 @@ ReleaseSafe hardening suites also passed after the test-root split.
 There were no observed hangs, application crashes, leaks, or admission-cap
 violations. These loopback numbers characterize this host and workload only.
 Hosted CI passed on pinned Zig 0.16.0 in
-[run 36151521763](https://github.com/kamalogudah/zoda/actions/runs/36151521763),
+[run 36153064159](https://github.com/kamalogudah/zoda/actions/runs/36153064159),
 including the dedicated 60-second step.
 
 ### Phase 2c — HTTP/2 feasibility
