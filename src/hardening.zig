@@ -22,12 +22,17 @@ const client_timeout_ms = 3000;
 /// Upper bound for the server to return to baseline after a scenario.
 const idle_timeout_ms = 3000;
 
-fn ms(n: i64) Io.Clock.Duration {
+pub fn ms(n: i64) Io.Clock.Duration {
     return .{ .raw = .fromMilliseconds(n), .clock = .awake };
 }
 
-fn elapsedMs(io: Io, started: Io.Clock.Timestamp) i64 {
+pub fn elapsedMs(io: Io, started: Io.Clock.Timestamp) i64 {
     return @intCast(@divFloor(started.durationFromNow(io).raw.nanoseconds, std.time.ns_per_ms) * -1);
+}
+
+pub fn elapsedUs(io: Io, started: Io.Clock.Timestamp) u64 {
+    const nanos = started.durationFromNow(io).raw.nanoseconds * -1;
+    return @intCast(@divFloor(nanos, std.time.ns_per_us));
 }
 
 /// Thread-safe allocation accounting over the leak-checking testing allocator.
@@ -124,7 +129,7 @@ const TestApp = struct {
 
 /// A running server bound to an ephemeral loopback port. Must not move after
 /// `start`; the server task holds pointers into it.
-const Harness = struct {
+pub const Harness = struct {
     io: Io,
     counting: CountingAllocator,
     listener: net.Server,
@@ -138,7 +143,7 @@ const Harness = struct {
         return server.serve(TestApp, allocator, io, listener, app, config);
     }
 
-    fn start(self: *Harness, config: server.Config, big_body_len: usize) !void {
+    pub fn start(self: *Harness, config: server.Config, big_body_len: usize) !void {
         const io = testing.io;
         self.io = io;
         self.counting = .{ .child = testing.allocator };
@@ -163,17 +168,17 @@ const Harness = struct {
         return &self.listener.socket.address;
     }
 
-    fn connect(self: *const Harness) !Client {
+    pub fn connect(self: *const Harness) !Client {
         return Client.connect(self.io, self.address());
     }
 
-    fn dispatches(self: *const Harness) usize {
+    pub fn dispatches(self: *const Harness) usize {
         return self.counters.dispatches.load(.acquire);
     }
 
     /// Waits until every connection has been released, then asserts that all
     /// server and application allocations have been returned.
-    fn expectBaseline(self: *Harness) !void {
+    pub fn expectBaseline(self: *Harness) !void {
         const started = Io.Clock.Timestamp.now(self.io, .awake);
         while (self.stats.active.load(.acquire) != 0) {
             if (elapsedMs(self.io, started) > idle_timeout_ms) return error.ConnectionsDidNotDrain;
@@ -183,7 +188,7 @@ const Harness = struct {
         try testing.expectEqual(@as(isize, 0), self.counting.live_bytes.load(.acquire));
     }
 
-    fn waitActive(self: *Harness, count: usize) !void {
+    pub fn waitActive(self: *Harness, count: usize) !void {
         const started = Io.Clock.Timestamp.now(self.io, .awake);
         while (self.stats.active.load(.acquire) != count) {
             if (elapsedMs(self.io, started) > idle_timeout_ms) return error.AdmissionTimedOut;
@@ -193,7 +198,7 @@ const Harness = struct {
 
     /// Cancels the server (stop accepting, grace, force close) and asserts a
     /// bounded shutdown that releases every connection and allocation.
-    fn stop(self: *Harness) !void {
+    pub fn stop(self: *Harness) !void {
         const started = Io.Clock.Timestamp.now(self.io, .awake);
         self.deinit();
         try testing.expect(elapsedMs(self.io, started) < 2000);
@@ -203,7 +208,7 @@ const Harness = struct {
 
     /// Idempotent teardown so a failed assertion never leaves the server task
     /// running against a dead stack frame.
-    fn deinit(self: *Harness) void {
+    pub fn deinit(self: *Harness) void {
         if (self.stopped) return;
         self.stopped = true;
         _ = self.future.cancel(self.io) catch {};
@@ -217,13 +222,13 @@ const Reply = struct {
     content_length: ?usize,
     body: []u8,
 
-    fn deinit(self: Reply) void {
+    pub fn deinit(self: Reply) void {
         testing.allocator.free(self.body);
     }
 };
 
 /// Minimal HTTP/1.1 client with a bounded read timeout on every syscall.
-const Client = struct {
+pub const Client = struct {
     io: Io,
     stream: net.Stream,
     buffer: [16 * 1024]u8 = undefined,
@@ -241,7 +246,7 @@ const Client = struct {
         return .{ .io = io, .stream = stream };
     }
 
-    fn close(self: *Client) void {
+    pub fn close(self: *Client) void {
         self.stream.close(self.io);
     }
 
@@ -252,7 +257,7 @@ const Client = struct {
         self.close();
     }
 
-    fn send(self: *Client, bytes: []const u8) !void {
+    pub fn send(self: *Client, bytes: []const u8) !void {
         var writer = self.stream.writer(self.io, &.{});
         try writer.interface.writeAll(bytes);
         try writer.interface.flush();
@@ -330,7 +335,7 @@ const Client = struct {
         return .{ .status = status, .close = closing, .content_length = content_length, .body = body };
     }
 
-    fn expectResponse(self: *Client, status: u16, body: []const u8) !Reply {
+    pub fn expectResponse(self: *Client, status: u16, body: []const u8) !Reply {
         const reply = try self.readResponse(false);
         errdefer reply.deinit();
         try testing.expectEqual(status, reply.status);
@@ -340,7 +345,7 @@ const Client = struct {
 
     /// Asserts the peer closes without sending further bytes, e.g. a response
     /// to a smuggled request after a protocol rejection.
-    fn expectClosed(self: *Client) !void {
+    pub fn expectClosed(self: *Client) !void {
         if (self.start != self.end) return error.UnexpectedData;
         if (try self.fill() != 0) return error.UnexpectedData;
     }

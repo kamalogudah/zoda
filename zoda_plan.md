@@ -682,7 +682,7 @@ registry removal on every exit path.
 - [x] Test concurrent keep-alive clients, slow reads/writes, malformed framing,
       oversized chunked bodies, disconnects, and shutdown cleanup (issue #16,
       §4.2.3).
-- [ ] Run a repeatable 60-second load test at 64 connections and an overload
+- [x] Run a repeatable 60-second load test at 64 connections and an overload
       test above the 128-connection cap; record tool, hardware, errors, and latency.
 - **Exit:** no hangs, application crashes, leaked connections, or cap violations;
       allocations/connections return to baseline after clients finish.
@@ -759,8 +759,58 @@ For stability, the suite binary ran 10/10 times in Debug and 10/10 in
 ReleaseSafe, and 4 copies ran in parallel under CPU contention without
 failure. CI runs `zig build test-hardening -Doptimize=ReleaseSafe` as a
 separate step. A passing hosted CI run must be linked here before this item
-is closed. The 60-second load and overload measurements remain the separate
-unchecked item below.
+is closed. The load and overload measurements are recorded in §4.2.4.
+
+### §4.2.4 Phase 2b load and overload measurements — issue #17
+
+The opt-in `zig build test-load -Doptimize=ReleaseSafe --summary all` step runs
+two real-loopback measurements from `src/load.zig`, using the same counting
+allocator and admission counters as §4.2.3. CI also runs this step. Each client
+has a 3-second socket read timeout, so a hang fails the run. The load test uses
+64 closed-loop clients, each sending `GET / HTTP/1.1` with `Host: load` and
+checking a `200` response containing `ok` before its next request. It raises
+only `max_requests_per_connection` above the default to keep the same 64
+connections open for the full 60 seconds. A start gate waits until all 64
+clients are connected and the server reports 64 active admissions. It records every send-through-body
+latency using monotonic time and a bounded logarithmic histogram. Reported
+percentiles are inclusive bucket **upper bounds**, not interpolated values.
+The overload test holds 128 incomplete request heads, then connects 32 excess
+clients and times each server-initiated close. It completes the 128 held
+requests and waits for all sockets and counted allocations to drain.
+
+Local measurement on 2026-09-25, repository base `65591be`, pinned Zig
+`0.16.0`, native `x86_64-linux-gnu`, `-Doptimize=ReleaseSafe`:
+
+| Environment | Value |
+| --- | --- |
+| Host | Intel Core i5-8365U, 4 cores / 8 logical CPUs; 15 GiB RAM |
+| OS | Ubuntu 24.04.1, Linux `7.0.0-31-generic` x86_64 |
+| Tool | Zig's built-in test runner and the Zoda loopback harness; no external load generator |
+
+| Measurement | Result |
+| --- | --- |
+| 64-connection load | 60,011 ms; 384,921 successful requests; 0 client errors; 6,414 requests/s |
+| Load latency, send through response body | Mean 9,052 µs; p50 ≤16,383 µs; p95 ≤32,767 µs; p99 ≤32,767 µs; max 57,620 µs |
+| Load server state | Peak/admitted 64/64; rejected 0; peak counted allocator bytes 49,098; active and counted live allocations/bytes returned to 0 |
+| 160-connection overload | 128 held/admitted; 32/32 excess rejected; peak 128; 128 held requests completed successfully |
+| Overload rejection latency | Mean 350 µs; p50 ≤511 µs; p95 ≤511 µs; max 465 µs |
+| Overload recovery | Active connections and counted live allocations/bytes returned to 0; bounded teardown passed |
+
+Reproduce from the repository root:
+
+```sh
+zig version                                            # 0.16.0
+zig fmt --check build.zig src
+zig build test
+zig build test-hardening -Doptimize=ReleaseSafe --summary all
+zig build test-load -Doptimize=ReleaseSafe --summary all
+```
+
+The final local load step passed 2/2 selected tests; the normal test and
+ReleaseSafe hardening suites also passed after the test-root split.
+There were no observed hangs, application crashes, leaks, or admission-cap
+violations. These loopback numbers characterize this host and workload only.
+A passing hosted CI run for this change must be linked after it is pushed.
 
 ### Phase 2c — HTTP/2 feasibility
 

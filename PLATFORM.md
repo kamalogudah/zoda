@@ -262,6 +262,21 @@ Recorded locally for Phase 2b adversarial HTTP/1.1 tests (issue #16):
   ```
 - CI: hosted run pending until the change is pushed.
 
+Recorded locally for Phase 2b load and overload measurements (issue #17):
+
+- Zig `0.16.0`, native `x86_64-linux-gnu`, `ReleaseSafe`; Intel Core i5-8365U
+  (4 cores / 8 threads), 15 GiB RAM, Ubuntu 24.04.1 / Linux 7.0.0-31-generic.
+- `zig build test-load -Doptimize=ReleaseSafe --summary all` runs 64 persistent
+  loopback keep-alive clients for at least 60 seconds and then holds 128
+  connections while probing 32 above-cap clients. It checks responses,
+  client errors, admission counters, and allocation/connection recovery.
+- Local run: 384,921 successful requests in 60.011 s (6,414/s), zero client
+  errors, p50 latency ≤16.383 ms, p95/p99 ≤32.767 ms, peak 64 connections,
+  zero rejections. Overload rejected 32/32, peaked at exactly 128, and
+  returned to zero active connections and counted allocations. The latency
+  percentiles are histogram bucket upper bounds. Full methods and numbers are
+  in `zoda_plan.md` §4.2.4. Hosted CI evidence awaits a pushed run.
+
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the real-socket shutdown acceptance test via `zig build test` and the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
 request. See `.github/workflows/ci.yml`.
