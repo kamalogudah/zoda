@@ -235,6 +235,33 @@ Recorded locally for the Phase 2 bounded framing adapter (issue #12):
 - Validation commands and detailed coverage are recorded in `zoda_plan.md`
   §4.2.1. Hosted CI evidence remains pending until the change is pushed.
 
+Recorded locally for Phase 2b adversarial HTTP/1.1 tests (issue #16):
+
+- Compiler: `zig version` → `0.16.0`; target `x86_64-linux-gnu`.
+- `src/hardening.zig` exercises `zoda.server` over real loopback sockets. It
+  covers concurrent keep-alive, pipelining, malformed or ambiguous framing,
+  oversized bodies, slow trickles, a slow reader, disconnects, admission above
+  the 128 cap, and shutdown during active requests. Each scenario checks that
+  connections and allocations return to baseline.
+- The suite found pinned-std behavior that Zoda now works around:
+  `std.http.ChunkParser` is lenient, so Zoda decodes chunked bodies itself.
+  `Io.Threaded.netWrite` panics on `EAGAIN` from `SO_SNDTIMEO`, so POSIX
+  writes use `sendmsg`. `posix.setsockopt` panics on `EBADF`, so forced
+  shutdown uses `shutdown(2)` instead of `close(2)`. `Head.parse` accepts
+  colonless fields, `parseInt` accepts a signed Content-Length, and
+  `respond` emits `100 Continue`; the transport rejects the first two and
+  suppresses the third on rejection. Details are in `zoda_plan.md` §4.2.3.
+- Validation commands:
+  ```sh
+  zig version                 # 0.16.0
+  zig fmt --check build.zig src
+  zig build
+  zig build test              # 89/89
+  zig build test-hardening -Doptimize=ReleaseSafe
+  ./zig-out/bin/zoda
+  ```
+- CI: hosted run pending until the change is pushed.
+
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the real-socket shutdown acceptance test via `zig build test` and the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
 request. See `.github/workflows/ci.yml`.

@@ -35,5 +35,7 @@ jobs:
         run: zig build
       - name: Run tests
         run: zig build test
+      - name: Adversarial HTTP/1.1 suite (ReleaseSafe)
+        run: zig build test-hardening -Doptimize=ReleaseSafe --summary all
       - name: Smoke-run executable
         run: ./zig-out/bin/zoda
