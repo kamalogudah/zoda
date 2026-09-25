@@ -758,8 +758,9 @@ zig build test-hardening -Doptimize=ReleaseSafe      # adversarial suite only
 For stability, the suite binary ran 10/10 times in Debug and 10/10 in
 ReleaseSafe, and 4 copies ran in parallel under CPU contention without
 failure. CI runs `zig build test-hardening -Doptimize=ReleaseSafe` as a
-separate step. A passing hosted CI run must be linked here before this item
-is closed. The load and overload measurements are recorded in §4.2.4.
+separate step. Hosted CI passed in
+[run 36151521763](https://github.com/kamalogudah/zoda/actions/runs/36151521763).
+The load and overload measurements are recorded in §4.2.4.
 
 ### §4.2.4 Phase 2b load and overload measurements — issue #17
 
@@ -810,7 +811,9 @@ The final local load step passed 2/2 selected tests; the normal test and
 ReleaseSafe hardening suites also passed after the test-root split.
 There were no observed hangs, application crashes, leaks, or admission-cap
 violations. These loopback numbers characterize this host and workload only.
-A passing hosted CI run for this change must be linked after it is pushed.
+Hosted CI passed on pinned Zig 0.16.0 in
+[run 36151521763](https://github.com/kamalogudah/zoda/actions/runs/36151521763),
+including the dedicated 60-second step.
 
 ### Phase 2c — HTTP/2 feasibility
 

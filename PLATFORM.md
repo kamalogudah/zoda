@@ -233,7 +233,8 @@ Recorded locally for the Phase 2 bounded framing adapter (issue #12):
   Zoda rejects content codings and `Expect` rather than emitting output before
   dispatch, and closes on every protocol/limit/dispatch rejection.
 - Validation commands and detailed coverage are recorded in `zoda_plan.md`
-  §4.2.1. Hosted CI evidence remains pending until the change is pushed.
+  §4.2.1. Hosted CI passed with this prerequisite commit in
+  [run 36151521763](https://github.com/kamalogudah/zoda/actions/runs/36151521763).
 
 Recorded locally for Phase 2b adversarial HTTP/1.1 tests (issue #16):
 
@@ -260,7 +261,8 @@ Recorded locally for Phase 2b adversarial HTTP/1.1 tests (issue #16):
   zig build test-hardening -Doptimize=ReleaseSafe
   ./zig-out/bin/zoda
   ```
-- CI: hosted run pending until the change is pushed.
+- CI: hosted run passed with this prerequisite commit in
+  [run 36151521763](https://github.com/kamalogudah/zoda/actions/runs/36151521763).
 
 Recorded locally for Phase 2b load and overload measurements (issue #17):
 
@@ -275,7 +277,8 @@ Recorded locally for Phase 2b load and overload measurements (issue #17):
   zero rejections. Overload rejected 32/32, peaked at exactly 128, and
   returned to zero active connections and counted allocations. The latency
   percentiles are histogram bucket upper bounds. Full methods and numbers are
-  in `zoda_plan.md` §4.2.4. Hosted CI evidence awaits a pushed run.
+  in `zoda_plan.md` §4.2.4. Hosted CI passed on Zig 0.16.0 in
+  [run 36151521763](https://github.com/kamalogudah/zoda/actions/runs/36151521763).
 
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the real-socket shutdown acceptance test via `zig build test` and the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
