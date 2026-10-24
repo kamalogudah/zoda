@@ -280,6 +280,23 @@ Recorded locally for Phase 2b load and overload measurements (issue #17):
   in `zoda_plan.md` §4.2.4. Hosted CI passed on Zig 0.16.0 in
   [run 36153064159](https://github.com/kamalogudah/zoda/actions/runs/36153064159).
 
+Recorded locally for the Phase 2d development loop (issue #20):
+
+- Zig `0.16.0`, native `x86_64-linux-gnu`, Debug; Intel Core i5-8365U
+  (4 cores / 8 threads), 15 GiB RAM, Ubuntu 24.04.4 / Linux 7.0.0-38-generic.
+- `zig build watch [-- serve <port>]` runs `src/watch.zig`. It polls `src/`,
+  `build.zig`, and `build.zig.zon`, runs `zig build`, and restarts
+  `zig-out/bin/zoda serve`. A failed build prints its diagnostics and keeps
+  the last working process. A successful build stops the previous process
+  (SIGTERM, then SIGKILL after 5 s) and reaps it before starting the new one.
+  The watcher is Linux-only because it uses `waitid` to detect exit without
+  reaping.
+- `zig build test` now also runs the 6 watcher tests: 95/95 passed in 3
+  consecutive runs. Measured edit-to-response latency was 1.5–1.8 s, against
+  a 2 s target, and a broken build recovered on the next valid edit. Details
+  are in `zoda_plan.md` §4.2.6.
+- CI: hosted run pending the first push of this change.
+
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the real-socket shutdown acceptance test via `zig build test` and the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
 request. See `.github/workflows/ci.yml`.

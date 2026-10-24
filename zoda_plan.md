@@ -906,12 +906,90 @@ zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
 
 ### Phase 2d — Development loop
 
-- [ ] Add a watcher that rebuilds and restarts the demo; do not assume a
-      `zig build watch` step exists.
-- [ ] Keep the last working process on compilation failure; display diagnostics
+- [x] Add a watcher that rebuilds and restarts the demo; do not assume a
+      `zig build watch` step exists. (issue #20, §4.2.6)
+- [x] Keep the last working process on compilation failure; display diagnostics
       and terminate the previous process cleanly after successful builds.
+      (issue #20, §4.2.6)
 - **Exit:** measure edit-to-response latency on a documented machine, targeting
       two seconds, and verify failed builds recover on the next valid edit.
+
+### §4.2.6 Phase 2d development-loop evidence — issue #20
+
+`zig build watch [-- <demo args>]` runs `src/watch.zig` (`zoda-watch`). The
+step is defined in this repository's `build.zig`. It does not use
+`zig build --watch` or any upstream `watch` step. The watcher polls `src/`,
+`build.zig`, and `build.zig.zon` every 200 ms and hashes file contents. It
+rebuilds after a change has stayed the same for one further poll. Hidden files
+and names ending in `~` are ignored. The demo gains `zoda serve [port]`, which
+serves the §5.3 routes on `127.0.0.1` (default 8080). Plain `zoda` still runs
+the in-memory demo, so the CI smoke-run is unchanged.
+
+Contract as implemented:
+
+- The watcher runs `<zig> build` with the compiler that ran `zig build watch`,
+  captures its output, and prints it. On failure the previous process keeps
+  running and serving. The next change triggers another build attempt.
+- On success the previous process gets SIGTERM and 5 s to exit, then SIGKILL.
+  It is always reaped before the new binary starts, so two generations never
+  share the port.
+- A process that exits on its own is reaped and reported. The next successful
+  build starts a new one.
+- SIGINT or SIGTERM to the watcher stops the running process the same way
+  before the watcher exits.
+- Pinned-std findings: `std.process.Child.kill` in Zig 0.16.0 sends SIGTERM,
+  not SIGKILL, and then blocks in `wait4`. It never returns for a process that
+  ignores SIGTERM, so the watcher sends SIGKILL itself first. Exit is detected
+  with `waitid(WEXITED|WNOHANG|WNOWAIT)`, which does not consume the status.
+  The default `Io.File.Writer.init` writes stdout positionally. When the
+  output is redirected to a file, the watcher and the demo share the
+  descriptor and overwrite each other's lines, so both now use
+  `initStreaming`.
+
+Tests in `src/watch.zig` drive the watcher with `sh` build and run scripts
+in a temporary directory, and `zig build test` runs them, which puts them in CI:
+
+| Test | Shows |
+|---|---|
+| repeated edits rebuild and restart | Three edits produce three restarts. Each previous generation handles SIGTERM and has been reaped (`kill(pid, 0)` → `ESRCH`) before its replacement runs. |
+| failed build keeps the last working process | Diagnostics are displayed. The same PID stays alive, a repeat poll does nothing, and the next valid edit replaces the process. |
+| initial build failure starts nothing | No process starts until a valid edit arrives. |
+| deinit stops the process | A process that ignores SIGTERM is killed after the grace period and reaped, and a second stop does nothing. |
+| a process that exits on its own | The exit is reaped and reported, and the next build starts a new process. |
+| ignored names | Swap and backup files do not change the fingerprint. Creating a missing watched path does change it. |
+
+End-to-end measurement with `zig build watch -- serve 18080` on a scratch copy
+of the repository. Each edit changed the `GET /` body in `src/main.zig`, and
+latency was timed from the `sed -i` write until `curl` first returned the new
+body (polled every 10 ms). Machine: Intel Core i5-8365U (4 cores / 8 threads),
+15 GiB RAM, Ubuntu 24.04.4 LTS, Linux 7.0.0-38-generic, Zig 0.16.0, Debug
+build:
+
+| Step | Result |
+|---|---|
+| Cold start (first build + start) | 5,282 ms |
+| Edit v1 / v2 / v3 → new response | 1,519 / 1,752 / 1,710 ms |
+| Syntax error edit | Diagnostics printed. The old PID kept serving the v3 body. |
+| Fixing edit → new response | 1,824 ms |
+| Ctrl-C (SIGINT to the process group) | Watcher and demo gone, no leftover processes |
+| SIGTERM to the watcher alone | Demo stopped and reaped, no leftover processes |
+
+Every edit-to-response time is under the 2 s target. The time includes the
+400 ms poll-and-settle window, and the `zig build` step took 1.1–1.4 s.
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test --summary all                         # 95/95 (86 library + 3 exe + 6 watcher), 3 consecutive runs
+zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+./zig-out/bin/zoda
+zig build watch                                      # manual end-to-end check above
+```
+
+Hosted CI: pending the first push of this change.
 
 ### Phase 2e — Middleware
 

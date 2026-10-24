@@ -170,6 +170,31 @@ pub fn build(b: *std.Build) void {
     const load_step = b.step("test-load", "Measure 60-second load and above-cap overload on loopback");
     load_step.dependOn(&b.addRunArtifact(load_tests).step);
 
+    // Phase 2d development loop. The watcher is not installed: it runs from
+    // the cache and invokes `zig build` itself, using this same compiler, to
+    // rebuild and restart `zig-out/bin/zoda`. Arguments after `--` go to the
+    // demo, e.g. `zig build watch -- serve 9000`.
+    const watch_exe = b.addExecutable(.{
+        .name = "zoda-watch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/watch.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const watch_cmd = b.addRunArtifact(watch_exe);
+    watch_cmd.setCwd(b.path("."));
+    watch_cmd.addArgs(&.{ "--zig", b.graph.zig_exe });
+    if (b.args) |args| {
+        watch_cmd.addArg("--");
+        watch_cmd.addArgs(args);
+    }
+    const watch_step = b.step("watch", "Rebuild and restart the demo server when sources change");
+    watch_step.dependOn(&watch_cmd.step);
+
+    const watch_tests = b.addTest(.{ .root_module = watch_exe.root_module });
+    test_step.dependOn(&b.addRunArtifact(watch_tests).step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

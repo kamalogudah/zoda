@@ -29,13 +29,22 @@ fn route(ctx: *Demo.Context, req: *router.Request, res: *response.Response) !voi
     }
 }
 
+/// `zoda` dispatches the route matrix in memory and exits.
+/// `zoda serve [port]` serves the same routes on 127.0.0.1 (default 8080);
+/// `zig build watch` uses this mode.
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    var stdout_file_writer: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
+
+    const args = try init.minimal.args.toSlice(arena);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "serve")) {
+        const port = if (args.len > 2) try std.fmt.parseInt(u16, args[2], 10) else 8080;
+        return serve(io, stdout_writer, port);
+    }
 
     const demo_app = Demo{
         .response_allocator = arena,
@@ -65,6 +74,25 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try stdout_writer.flush();
+}
+
+fn serve(io: Io, stdout_writer: *Io.Writer, port: u16) !void {
+    // Connection tasks share this allocator concurrently (PLATFORM.md §5).
+    const gpa = std.heap.smp_allocator;
+    const demo_app = Demo{
+        .response_allocator = gpa,
+        .config = .{ .name = "demo" },
+        .plugins = .{},
+        .route_fn = route,
+    };
+
+    const address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    try stdout_writer.print("listening on http://127.0.0.1:{d}\n", .{port});
+    try stdout_writer.flush();
+    try zoda.server.serve(Demo, gpa, io, &listener, &demo_app, .{});
 }
 
 test "simple test" {
