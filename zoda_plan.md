@@ -1125,7 +1125,8 @@ zig build test-devloop --summary all                 # 1/1, 3 consecutive runs, 
 - [x] Implement §3.6 and test ordering, single-use continuation, short circuits,
       errors, configuration lifetime, and request isolation. (issue #22, §4.2.8;
       verified in issue #23, §4.2.9)
-- [ ] Add response timing using a monotonic clock and a copying header helper.
+- [x] Add response timing using a monotonic clock and a copying header helper.
+      (issue #24, §4.2.10)
 - [ ] Add static-file middleware with a configured document-root handle.
       Reject traversal and symlinks; resolve beneath the root without a
       check-then-open race using supported platform primitives. Fail closed
@@ -1251,6 +1252,78 @@ zig fmt --check build.zig src
 zig build
 zig build test --summary all                         # 116/116 (107 library + 3 exe + 6 watcher), 3 consecutive runs
 zig build test -Doptimize=ReleaseSafe --summary all  # 116/116
+zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+./zig-out/bin/zoda
+```
+
+Hosted CI: pending the first push of this change.
+
+### §4.2.10 Phase 2e response-timing evidence — issue #24
+
+Implements the timing item of Phase 2e and the §5.4 sketch in `src/timing.zig`,
+exported as `zoda.timing`. Static-file middleware is the remaining Phase 2e item.
+
+API as implemented:
+
+- `zoda.timing.Clock` (also `zoda.app.Clock`) is a union of `.io: std.Io` and
+  `.source: Clock.Source { context, now }`. `Clock.monotonic(io)` reads
+  `Io.Clock.awake` (`CLOCK_MONOTONIC` on Linux) on the pinned toolchain.
+  `monotonicNow()` returns an `Io.Timestamp`. `elapsedMilliseconds(start)`
+  returns whole milliseconds, truncated, and clamps a backwards reading to 0.
+- The clock is injected per app as `AppConfig.clock: ?Clock = null`, so
+  middleware reads `ctx.config.clock` as in §5.4. Existing `AppConfig`
+  literals compile unchanged.
+- `zoda.timing.middleware(App)` returns an `App.Middleware` without its own
+  configuration. It reads the clock before `next.call` and, only if that
+  succeeds, adds `X-Response-Time-Ms` with `Response.setHeaderFmt`. That
+  helper formats into transient storage and copies the value into
+  response-owned header storage, so the value does not borrow the request,
+  the frame, or plugin state. With no clock configured, the entry returns
+  `error.ClockNotConfigured` before any downstream code runs.
+- Register it first so it is outermost. Routed responses, short circuits, and
+  the terminal continuation's default 404 all receive the header. When a short
+  circuit writes nothing, dispatch's fallback 404 keeps the header, because
+  `Response.text` replaces only the body, status, and content type.
+- The demo server (`zoda serve`, `zig build watch`) registers the entry with
+  `Clock.monotonic(io)`. README "Response timing" documents the usage.
+
+Tests in `src/timing.zig`, using a `ManualClock` source that only the test
+advances (the route advances it by 42 ms):
+
+| Test | Shows |
+|---|---|
+| elapsedMilliseconds truncates and clamps a backwards reading to zero | 7.999999 ms → `7`. A reading earlier than `start` → `0`. |
+| monotonic clock reads the pinned toolchain clock and never goes backwards | A reading falls between two direct `Io.Clock.awake` reads. 1,000 consecutive reads never decrease. A 5 ms sleep measures ≥ 5. |
+| ordinary response gets the injected clock's elapsed milliseconds | 200 `root` with `X-Response-Time-Ms: 42`. The clock is read twice, once before `next` and once after. |
+| fallback 404 from the terminal continuation is timed | 404 `Not Found` with `42`. |
+| empty short circuit keeps the header through dispatch's fallback 404 | An inner entry that writes nothing → dispatch's 404 with `0`. A 401 short circuit → 401 with `0`. |
+| errors propagate without a timing header and leak nothing | `error.Boom` propagates out of `dispatch`. The clock is read only once, and the testing allocator finds no leak. |
+| an inner recovery is a success and is timed | An inner entry clears the failed response and writes 503. `next.call` succeeded, so the header is `42`. |
+| a header-limit failure after next propagates and releases the response | `error.TooManyHeaders` from the header helper propagates. No leak. |
+| missing clock fails the request before downstream runs | `error.ClockNotConfigured`. The route never ran. |
+| timing value is response-owned and outlives the request and the frame | The request arena is freed before the header is read. The value is `42` and lives in the response's own header storage. |
+| real monotonic clock times requests through the default 404 and a 200 | With `Clock.monotonic(std.testing.io)`, both responses carry a header that parses as an unsigned integer. |
+
+Mutation check (seeded locally and reverted, not committed):
+
+| Defect | Failing tests |
+|---|---|
+| Header also added when `next.call` fails | the error-propagation and header-limit tests |
+| No clamp on a backwards reading | the truncate/clamp test |
+| Header only on status 200 | the fallback 404, empty short circuit, inner recovery, and real-clock tests |
+| `Io.Clock.real` instead of `Io.Clock.awake` | the monotonic-clock test (after the bracketing assertion was added; the first version missed this defect) |
+
+Manual check: `./zig-out/bin/zoda serve 9137`, then `curl -i` on `/` and
+`/nope` returned 200 and 404, both with `X-Response-Time-Ms: 0`.
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test --summary all                         # 127/127 (118 library + 3 exe + 6 watcher), 3 consecutive runs
+zig build test -Doptimize=ReleaseSafe --summary all  # 127/127
 zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
 ./zig-out/bin/zoda
 ```
@@ -1438,19 +1511,21 @@ fn timing(
     res: *Response,
     next: Next,
 ) !void {
-    const start = ctx.config.clock.monotonicNow();
+    const clock = ctx.config.clock orelse return error.ClockNotConfigured;
+    const start = clock.monotonicNow();
     try next.call(ctx, req, res);
     // Copies formatted bytes into response storage; no request allocation escapes.
     try res.setHeaderFmt(
         "X-Response-Time-Ms",
         "{d}",
-        .{ctx.config.clock.elapsedMilliseconds(start)},
+        .{clock.elapsedMilliseconds(start)},
     );
 }
 ```
 
 The clock is an injected application interface implemented against the pinned
-toolchain. Static-file middleware uses its configuration pointer for the
+toolchain (`AppConfig.clock: ?Clock`, `Clock.monotonic(io)` over
+`Io.Clock.awake`; implemented as `zoda.timing.middleware(App)`, §4.2.10). Static-file middleware uses its configuration pointer for the
 document-root handle and calls `next.call` only when it does not serve the path.
 
 ## 6. Verification and remaining decisions

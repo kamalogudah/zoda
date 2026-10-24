@@ -13,6 +13,7 @@ const router = @import("router.zig");
 const response = @import("response.zig");
 const request = @import("request.zig");
 const Json = @import("plugins/json.zig").Json;
+const timing = @import("timing.zig");
 
 /// Re-export the JSON plugin instance type so downstream code can write
 /// `const Plugins = struct { json: zoda.Json = .{} };`.
@@ -22,7 +23,14 @@ pub const json = Json;
 /// long as the values remain valid for the lifetime of the app.
 pub const AppConfig = struct {
     name: []const u8 = "zoda",
+    /// Application clock read by middleware such as `timing.middleware`.
+    /// Use `.monotonic(io)` for the pinned toolchain's monotonic clock, or
+    /// inject a `Clock.Source` in tests.
+    clock: ?Clock = null,
 };
+
+/// Injected application clock (ADR-0001 §5.4); see `timing.zig`.
+pub const Clock = timing.Clock;
 
 /// Generates a struct containing one field per plugin instance that declares a
 /// non-`void` `State` type and an `initRequest` hook. Field names match the
