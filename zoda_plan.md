@@ -121,6 +121,12 @@ context. Compose them in an app factory with a comptime-known base route,
 not by passing a runtime `route_fn` field into a comptime parameter.
 Configured values remain accessible through `Context`.
 
+A plugin type is declared before its app exists, so it cannot name that app's
+`RouteFn`. The hook is therefore generic over a comptime descriptor that the
+app generates for each plugin field (implemented in issue #26, §4.2.12):
+`wrapRoute(comptime H: type, comptime inner: H.RouteFn) H.RouteFn`, where
+`H.Context` and `H.RouteFn` are the app's own types.
+
 The lifecycle is:
 
 1. Transport parses and validates a bounded request.
@@ -1450,9 +1456,79 @@ zig build test-devloop --summary all                 # 1/1, no leftover processe
 
 Hosted CI: pending the first push of this change.
 
+### §4.2.12 Phase 3 route-wrapper composition evidence — issue #26
+
+Implements the composition contract in §3.3 in `src/app.zig`. The custom
+not-found wrapper and full lifecycle tests remain for issue #27.
+
+API as implemented, per `App(Plugins)`:
+
+- A plugin type may declare an optional hook
+  `pub fn wrapRoute(comptime H: type, comptime inner: H.RouteFn) H.RouteFn`.
+  `H` is `App.RouteHook(name)`, a comptime descriptor for the plugin field
+  `name`. It exposes `App`, `Context`, `RouteFn`, `Plugin`, `plugin_name`,
+  `plugin(ctx)` (the configured instance, `*const Plugin`), and `state(ctx)`
+  (that plugin's request state). This deviates from the §3.3 one-argument
+  signature only by the descriptor. A plugin is declared before its app, so
+  it cannot name the app's `RouteFn` directly.
+- `App.composeRoute(comptime base: RouteFn) RouteFn` folds the hooks from the
+  last plugin field to the first at comptime, so the first declared wrapper
+  is outermost. Plugins without the hook add nothing. With no hooks it returns
+  `base` itself. Both the base and the result are comptime-known. No runtime
+  `route_fn` value is passed into a comptime parameter.
+- The caller passes the composed function as `route_fn`. The terminal
+  middleware continuation calls `route_fn` and then applies the default 404,
+  so wrappers run inside middleware and before default response
+  finalization. A wrapper sees an unhandled miss as unhandled and may write
+  a fallback, or skip the inner wrappers and route by returning without
+  calling `inner`. A middleware short circuit runs no wrapper.
+- Wrappers are plain functions over the request's `Context`. Configured values
+  come from `H.plugin(ctx)` and `ctx.config`, and per-request values come from
+  `H.state(ctx)`. One composed route can serve several differently configured
+  apps. Wrappers hold no per-request storage of their own.
+- Caller obligation: a route passed to `route_fn` without `composeRoute` runs
+  no wrappers. Zig cannot detect this, because composition must happen on a
+  comptime-known route.
+
+Tests in `src/app.zig`:
+
+| Test | Shows |
+|---|---|
+| route wrappers fold so the first registered wrapper is outermost | Plugins `a`, `json` (no hook), `b`, `c` log `abcRCBA`: entry order and exit order. The app is a struct literal, so composition needs no `init`. |
+| composing without hooks returns the base route | `composeRoute(base) == base` at comptime for a JSON-only app and for an empty plugin set. |
+| a wrapper can skip inner wrappers and the route | `b` writes 401 without calling `inner` (`abBA`): `c` and the route never run, and `a` still unwinds. When `a` skips without writing (`aA`), the terminal continuation's default 404 applies. |
+| wrappers run inside the terminal continuation before the default 404 | With one middleware entry, a miss logs `mwRWM`. The outer wrapper sees the response unhandled after `inner`, and the middleware then sees 404. A middleware short circuit (403) runs no wrapper. |
+| wrappers read plugin, application, and request configuration through Context | One composed route in two apps produces `X-Stamp: p1:one:x` and `p2:two:y`, from the plugin instance's `prefix`, `ctx.config.name`, and `H.state(ctx)`. The route reads the same state. |
+| route errors propagate through every wrapper and release the response | `error.Boom` from the route leaves `dispatch`. Deferred exits unwind as `abcRCBA`, and the testing allocator reports no leak. |
+| README route-wrapper example compiles and runs | The README `RequireHeader` plugin returns 200 with `X-Checked-By` from `ctx.config.name`. Without the header it skips the route with 400. On a miss its header survives the default 404. |
+
+Mutation check (seeded locally and reverted, not committed):
+
+| Defect | Failing tests |
+|---|---|
+| Fold from first to last (last wrapper outermost) | the ordering, skip, and error-propagation tests |
+| Hooks ignored (`composeRoute` returns `base`) | all five runtime wrapper tests |
+| Default 404 applied around the base route, inside the wrappers | the no-hooks identity assertion at compile time. With that assertion disabled, the terminal-continuation test fails. |
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`, kernel 7.0.0-38-generic):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test --summary all                         # 150/150 (141 library + 3 exe + 6 watcher), 3 consecutive runs
+zig build test -Doptimize=ReleaseSafe --summary all  # 150/150
+zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+zig build test-devloop --summary all                 # 1/1
+./zig-out/bin/zoda
+```
+
+Hosted CI: pending the first push of this change.
+
 ### Phase 3 — Route wrappers
 
-- [ ] Compose wrappers with a comptime base route and typed context.
+- [x] Compose wrappers with a comptime base route and typed context.
+      (issue #26, §4.2.12)
 - [ ] Implement a custom not-found wrapper before the default 404 step.
 - **Exit:** entry/unwind ordering, short-circuiting, and error recovery match §3.3.
 

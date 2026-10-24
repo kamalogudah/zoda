@@ -1,8 +1,10 @@
-//! Application dispatch and typed handler context (ADR-0001 §3.2, §5.2).
+//! Application dispatch and typed handler context (ADR-0001 §3.2, §3.3, §5.2).
 //!
 //! An `App(Plugins)` wires a set of plugin instances into a handler context,
 //! initializes per-request plugin state, invokes the configured route, and
 //! supplies a fallback 404 when the route leaves the response unhandled.
+//! `App.composeRoute` folds the plugins' optional `wrapRoute` hooks around a
+//! comptime-known route.
 //!
 //! `RequestState(Plugins)` is generated from the plugin struct: one field is
 //! emitted for every plugin instance that declares a non-`void` `State` type
@@ -122,7 +124,9 @@ pub const NextError = error{NextAlreadyCalled};
 ///
 /// Middleware (ADR-0001 §3.3, §3.6) is configured per app with `init`. Each
 /// request enters the entries in registration order and unwinds in reverse;
-/// the innermost continuation runs the route and the default 404.
+/// the innermost continuation runs the route and the default 404. Plugin
+/// route wrappers are composed into the route at comptime with
+/// `composeRoute`, so they run inside that continuation.
 pub fn App(comptime Plugins: type) type {
     return struct {
         const Self = @This();
@@ -133,6 +137,57 @@ pub fn App(comptime Plugins: type) type {
             state: *State,
         };
         pub const RouteFn = *const fn (*Context, *router.Request, *response.Response) anyerror!void;
+
+        /// Comptime descriptor handed to the `wrapRoute` hook of the plugin
+        /// instance named `name` (ADR-0001 §3.3). A plugin type is declared
+        /// before the app, so it cannot name this app's `RouteFn`; the hook is
+        /// instead generic over this descriptor:
+        ///
+        ///     pub fn wrapRoute(comptime H: type, comptime inner: H.RouteFn) H.RouteFn
+        ///
+        /// The returned function reaches the configured instance with
+        /// `H.plugin(ctx)`, its request state with `H.state(ctx)`, and the
+        /// application configuration with `ctx.config`.
+        pub fn RouteHook(comptime name: []const u8) type {
+            return struct {
+                pub const App = Self;
+                pub const Context = Self.Context;
+                pub const RouteFn = Self.RouteFn;
+                pub const Plugin = @FieldType(Plugins, name);
+                pub const plugin_name = name;
+
+                pub fn plugin(ctx: *Self.Context) *const Plugin {
+                    return &@field(ctx.plugins, name);
+                }
+
+                pub fn state(ctx: *Self.Context) *@FieldType(State, name) {
+                    return &@field(ctx.state, name);
+                }
+            };
+        }
+
+        /// Composes the plugins' optional `wrapRoute` hooks around the
+        /// comptime-known `base` route. Folds from the last plugin field to
+        /// the first, so the first registered wrapper is outermost. With no
+        /// hooks, returns `base` unchanged.
+        ///
+        /// Pass the result as `route_fn`: the terminal middleware continuation
+        /// runs it before the default 404, so wrappers see an unhandled
+        /// response and may write a fallback or skip the inner route.
+        /// A route passed to `route_fn` without composing runs no wrappers.
+        pub fn composeRoute(comptime base: RouteFn) RouteFn {
+            return comptime blk: {
+                const fields = std.meta.fields(Plugins);
+                var route = base;
+                for (0..fields.len) |rev_offset| {
+                    const f = fields[fields.len - 1 - rev_offset];
+                    if (@hasDecl(f.type, "wrapRoute")) {
+                        route = f.type.wrapRoute(RouteHook(f.name), route);
+                    }
+                }
+                break :blk route;
+            };
+        }
 
         /// Single-use continuation handed to a middleware entry. Copies share
         /// one private invocation frame, so they also share its `called` flag:
@@ -1795,4 +1850,360 @@ test "concurrent requests keep frames, plugin state, and outcomes independent" {
     try std.testing.expectEqual(@as(usize, threads.len * per_thread), counters.inits.load(.monotonic));
     try std.testing.expectEqual(@as(usize, threads.len * per_thread), counters.deinits.load(.monotonic));
     try std.testing.expectEqual(std.heap.Check.ok, debug.deinit());
+}
+
+// ---------------------------------------------------------------------------
+// Route wrappers (ADR-0001 §3.3)
+// ---------------------------------------------------------------------------
+
+/// Test plugin with a route wrapper. Each instance logs its configured
+/// `enter` byte on entry and the uppercase byte on exit, reached through
+/// `H.plugin(ctx)`. `?deny=<enter>` writes 401 and skips the inner route;
+/// `?skip=<enter>` skips it without writing anything.
+const WrapLog = struct {
+    enter: u8,
+    log: *std.ArrayList(u8),
+
+    pub fn wrapRoute(comptime H: type, comptime inner: H.RouteFn) H.RouteFn {
+        return struct {
+            fn run(ctx: *H.Context, req: *router.Request, res: *response.Response) anyerror!void {
+                const self = H.plugin(ctx);
+                try self.log.append(std.testing.allocator, self.enter);
+                defer self.log.append(std.testing.allocator, std.ascii.toUpper(self.enter)) catch unreachable;
+                if (try matchesQuery(req, "deny", self.enter)) return res.text(401, "denied");
+                if (try matchesQuery(req, "skip", self.enter)) return;
+                try inner(ctx, req, res);
+            }
+        }.run;
+    }
+
+    fn matchesQuery(req: *router.Request, key: []const u8, enter: u8) !bool {
+        const value = (try req.getOne(key)) orelse return false;
+        return value.len == 1 and value[0] == enter;
+    }
+};
+
+/// `json` declares no hook, so it contributes no wrapper between `a` and `b`.
+const WrapPlugins = struct { a: WrapLog, json: Json = .{}, b: WrapLog, c: WrapLog };
+const WrapApp = App(WrapPlugins);
+
+const wrap_route = struct {
+    fn run(ctx: *WrapApp.Context, req: *router.Request, res: *response.Response) !void {
+        try ctx.plugins.a.log.append(std.testing.allocator, 'R');
+        if (req.isLiteral("boom")) return error.Boom;
+        if (req.isRoot() and req.isGet()) return res.text(200, "root");
+    }
+}.run;
+
+fn wrapPlugins(log: *std.ArrayList(u8)) WrapPlugins {
+    return .{
+        .a = .{ .enter = 'a', .log = log },
+        .b = .{ .enter = 'b', .log = log },
+        .c = .{ .enter = 'c', .log = log },
+    };
+}
+
+fn dispatchWrapped(app: *const WrapApp, path: []const u8) !response.Response {
+    var arena = try request.parseOriginForm(std.testing.allocator, .default, path);
+    defer arena.deinit();
+    var req = arena.requestView(.get);
+    return app.dispatch(&req);
+}
+
+test "route wrappers fold so the first registered wrapper is outermost" {
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(std.testing.allocator);
+    // A struct-literal app: composition needs no `init`.
+    const app: WrapApp = .{
+        .response_allocator = std.testing.allocator,
+        .config = .{},
+        .plugins = wrapPlugins(&log),
+        .route_fn = WrapApp.composeRoute(wrap_route),
+    };
+
+    var res = try dispatchWrapped(&app, "/");
+    defer res.deinit();
+    try std.testing.expectEqual(@as(u16, 200), res.status_code);
+    try std.testing.expectEqualStrings("root", res.body);
+    try std.testing.expectEqualStrings("abcRCBA", log.items);
+}
+
+test "composing without hooks returns the base route" {
+    comptime std.debug.assert(MwApp.composeRoute(route_log.run) == route_log.run);
+    const Bare = App(struct {});
+    const bare = struct {
+        fn run(_: *Bare.Context, _: *router.Request, _: *response.Response) !void {}
+    }.run;
+    comptime std.debug.assert(Bare.composeRoute(bare) == bare);
+}
+
+test "a wrapper can skip inner wrappers and the route" {
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(std.testing.allocator);
+    const app: WrapApp = .{
+        .response_allocator = std.testing.allocator,
+        .config = .{},
+        .plugins = wrapPlugins(&log),
+        .route_fn = WrapApp.composeRoute(wrap_route),
+    };
+
+    {
+        // `b` writes its own response; `c` and the route never run, and the
+        // outer wrapper still unwinds.
+        var res = try dispatchWrapped(&app, "/?deny=b");
+        defer res.deinit();
+        try std.testing.expectEqual(@as(u16, 401), res.status_code);
+        try std.testing.expectEqualStrings("denied", res.body);
+        try std.testing.expectEqualStrings("abBA", log.items);
+    }
+    log.clearRetainingCapacity();
+    {
+        // The outermost wrapper skips without writing: the terminal
+        // continuation's default 404 applies.
+        var res = try dispatchWrapped(&app, "/?skip=a");
+        defer res.deinit();
+        try std.testing.expectEqual(@as(u16, 404), res.status_code);
+        try std.testing.expectEqualStrings("aA", log.items);
+    }
+}
+
+test "wrappers run inside the terminal continuation before the default 404" {
+    const Probe = struct {
+        /// Whether the response was handled when the inner route returned.
+        handled_after_inner: *?bool,
+
+        pub fn wrapRoute(comptime H: type, comptime inner: H.RouteFn) H.RouteFn {
+            return struct {
+                fn run(ctx: *H.Context, req: *router.Request, res: *response.Response) anyerror!void {
+                    try inner(ctx, req, res);
+                    H.plugin(ctx).handled_after_inner.* = res.handled;
+                }
+            }.run;
+        }
+    };
+    const Plugins = struct { probe: Probe, inner: WrapLog };
+    const ProbeApp = App(Plugins);
+    const route = struct {
+        fn run(ctx: *ProbeApp.Context, req: *router.Request, res: *response.Response) !void {
+            try ctx.plugins.inner.log.append(std.testing.allocator, 'R');
+            if (req.isRoot() and req.isGet()) return res.text(200, "root");
+        }
+    }.run;
+    const Outer = struct {
+        log: *std.ArrayList(u8),
+        seen: *?u16,
+
+        fn invoke(
+            raw: *const anyopaque,
+            ctx: *ProbeApp.Context,
+            req: *router.Request,
+            res: *response.Response,
+            next: ProbeApp.Next,
+        ) anyerror!void {
+            const cfg: *const @This() = @ptrCast(@alignCast(raw));
+            try cfg.log.append(std.testing.allocator, 'm');
+            defer cfg.log.append(std.testing.allocator, 'M') catch unreachable;
+            try next.call(ctx, req, res);
+            cfg.seen.* = if (res.handled) res.status_code else null;
+        }
+
+        fn deny(
+            raw: *const anyopaque,
+            _: *ProbeApp.Context,
+            _: *router.Request,
+            res: *response.Response,
+            _: ProbeApp.Next,
+        ) anyerror!void {
+            const cfg: *const @This() = @ptrCast(@alignCast(raw));
+            try cfg.log.append(std.testing.allocator, 'x');
+            return res.text(403, "forbidden");
+        }
+    };
+
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(std.testing.allocator);
+    var handled: ?bool = null;
+    var seen: ?u16 = null;
+    const outer = Outer{ .log = &log, .seen = &seen };
+    const plugins: Plugins = .{
+        .probe = .{ .handled_after_inner = &handled },
+        .inner = .{ .enter = 'w', .log = &log },
+    };
+
+    var app = try ProbeApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = plugins,
+        .route_fn = ProbeApp.composeRoute(route),
+        .middleware = &.{.{ .config = &outer, .invoke = Outer.invoke }},
+    });
+    defer app.deinit();
+
+    {
+        var arena = try request.parseOriginForm(std.testing.allocator, .default, "/missing");
+        defer arena.deinit();
+        var req = arena.requestView(.get);
+        var res = try app.dispatch(&req);
+        defer res.deinit();
+        // Wrappers run between middleware entry and exit, see the miss as
+        // unhandled, and middleware sees the default 404 written after them.
+        try std.testing.expectEqualStrings("mwRWM", log.items);
+        try std.testing.expectEqual(@as(?bool, false), handled);
+        try std.testing.expectEqual(@as(?u16, 404), seen);
+        try std.testing.expectEqual(@as(u16, 404), res.status_code);
+    }
+
+    // A middleware short circuit skips the terminal continuation, so no
+    // wrapper runs.
+    log.clearRetainingCapacity();
+    handled = null;
+    var denied = try ProbeApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = plugins,
+        .route_fn = ProbeApp.composeRoute(route),
+        .middleware = &.{.{ .config = &outer, .invoke = Outer.deny }},
+    });
+    defer denied.deinit();
+    {
+        var arena = try request.parseOriginForm(std.testing.allocator, .default, "/");
+        defer arena.deinit();
+        var req = arena.requestView(.get);
+        var res = try denied.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqualStrings("x", log.items);
+        try std.testing.expectEqual(@as(?bool, null), handled);
+        try std.testing.expectEqual(@as(u16, 403), res.status_code);
+    }
+}
+
+test "wrappers read plugin, application, and request configuration through Context" {
+    const Stamp = struct {
+        prefix: []const u8,
+
+        pub const State = struct { v: []const u8 };
+
+        pub fn initRequest(_: *const @This(), req: *router.Request) !State {
+            return .{ .v = (try req.getOne("v")) orelse "" };
+        }
+
+        pub fn deinitRequest(_: *const @This(), _: *State) void {}
+
+        pub fn wrapRoute(comptime H: type, comptime inner: H.RouteFn) H.RouteFn {
+            return struct {
+                fn run(ctx: *H.Context, req: *router.Request, res: *response.Response) anyerror!void {
+                    try inner(ctx, req, res);
+                    try res.setHeaderFmt("X-Stamp", "{s}:{s}:{s}", .{
+                        H.plugin(ctx).prefix,
+                        ctx.config.name,
+                        H.state(ctx).v,
+                    });
+                }
+            }.run;
+        }
+    };
+    const Plugins = struct { stamp: Stamp };
+    const StampApp = App(Plugins);
+    const route = struct {
+        fn run(ctx: *StampApp.Context, _: *router.Request, res: *response.Response) !void {
+            // The route sees the same request state the wrapper reads.
+            return res.text(200, ctx.state.stamp.v);
+        }
+    }.run;
+    const composed = StampApp.composeRoute(route);
+
+    // One composed route, two differently configured apps.
+    const one: StampApp = .{
+        .response_allocator = std.testing.allocator,
+        .config = .{ .name = "one" },
+        .plugins = .{ .stamp = .{ .prefix = "p1" } },
+        .route_fn = composed,
+    };
+    const two: StampApp = .{
+        .response_allocator = std.testing.allocator,
+        .config = .{ .name = "two" },
+        .plugins = .{ .stamp = .{ .prefix = "p2" } },
+        .route_fn = composed,
+    };
+
+    for ([_]struct { app: *const StampApp, path: []const u8, body: []const u8, stamp: []const u8 }{
+        .{ .app = &one, .path = "/?v=x", .body = "x", .stamp = "p1:one:x" },
+        .{ .app = &two, .path = "/?v=y", .body = "y", .stamp = "p2:two:y" },
+    }) |case| {
+        var arena = try request.parseOriginForm(std.testing.allocator, .default, case.path);
+        defer arena.deinit();
+        var req = arena.requestView(.get);
+        var res = try case.app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqualStrings(case.body, res.body);
+        try std.testing.expectEqualStrings(case.stamp, (try res.getHeaderOne("x-stamp")).?);
+    }
+}
+
+test "route errors propagate through every wrapper and release the response" {
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(std.testing.allocator);
+    const app: WrapApp = .{
+        .response_allocator = std.testing.allocator,
+        .config = .{},
+        .plugins = wrapPlugins(&log),
+        .route_fn = WrapApp.composeRoute(wrap_route),
+    };
+
+    // Deferred exits still unwind in reverse; the testing allocator checks
+    // that the partial response is released.
+    try std.testing.expectError(error.Boom, dispatchWrapped(&app, "/boom"));
+    try std.testing.expectEqualStrings("abcRCBA", log.items);
+}
+
+// The README route-wrapper example, with test-local type paths.
+const RequireHeader = struct {
+    name: []const u8,
+
+    pub fn wrapRoute(comptime H: type, comptime inner: H.RouteFn) H.RouteFn {
+        return struct {
+            fn run(ctx: *H.Context, req: *router.Request, res: *response.Response) anyerror!void {
+                const self = H.plugin(ctx);
+                // Skip the inner wrappers and the route.
+                if (try req.getHeaderOne(self.name) == null) return res.text(400, "missing header");
+                try inner(ctx, req, res);
+                try res.setHeader("X-Checked-By", ctx.config.name);
+            }
+        }.run;
+    }
+};
+
+test "README route-wrapper example compiles and runs" {
+    const Plugins = struct { require: RequireHeader = .{ .name = "x-client" } };
+    const ReqApp = App(Plugins);
+    const route = struct {
+        fn run(_: *ReqApp.Context, req: *router.Request, res: *response.Response) !void {
+            if (req.isRoot() and req.isGet()) return res.text(200, "ok");
+        }
+    }.run;
+
+    var app = try ReqApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .config = .{ .name = "checker" },
+        .plugins = .{},
+        .route_fn = ReqApp.composeRoute(route),
+    });
+    defer app.deinit();
+
+    for ([_]struct { path: []const u8, header: bool, status: u16, checked: bool }{
+        .{ .path = "/", .header = true, .status = 200, .checked = true },
+        .{ .path = "/", .header = false, .status = 400, .checked = false },
+        // The wrapper runs before the default 404, so its header survives
+        // on the miss.
+        .{ .path = "/missing", .header = true, .status = 404, .checked = true },
+    }) |case| {
+        var arena = try request.parseOriginForm(std.testing.allocator, .default, case.path);
+        defer arena.deinit();
+        if (case.header) try arena.copyHeaders(&.{.{ .name = "X-Client", .value = "cli" }});
+        var req = arena.requestView(.get);
+        var res = try app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqual(case.status, res.status_code);
+        const checked = try res.getHeaderOne("x-checked-by");
+        try std.testing.expectEqual(case.checked, checked != null);
+        if (checked) |v| try std.testing.expectEqualStrings("checker", v);
+    }
 }

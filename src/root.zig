@@ -23,7 +23,8 @@ pub const transport = @import("transport.zig");
 /// Bounded concurrent socket runtime with total operation deadlines.
 pub const server = @import("server.zig");
 
-/// Application dispatch and typed handler context (ADR-0001 §3.2, §5.2).
+/// Application dispatch, typed handler context, and route-wrapper
+/// composition (ADR-0001 §3.2, §3.3, §5.2).
 pub const app = @import("app.zig");
 
 /// Injected application clock and response-timing middleware

@@ -293,6 +293,55 @@ defer app.deinit();
   from another thread. Zig cannot check this for you, and the tests do not
   make an escaped `next` safe: they cover only the supported uses above.
 
+### Route wrappers
+
+A plugin can wrap the route by declaring an optional `wrapRoute` hook. The
+hook runs at comptime and returns a new route function. `H` describes the app
+and this plugin: `H.Context` and `H.RouteFn` are the app's types,
+`H.plugin(ctx)` is the configured plugin instance, and `H.state(ctx)` is its
+request state, if it has one.
+
+```zig
+const RequireHeader = struct {
+    name: []const u8,
+
+    pub fn wrapRoute(comptime H: type, comptime inner: H.RouteFn) H.RouteFn {
+        return struct {
+            fn run(ctx: *H.Context, req: *zoda.router.Request, res: *zoda.response.Response) anyerror!void {
+                const self = H.plugin(ctx);
+                // Skip the inner wrappers and the route.
+                if (try req.getHeaderOne(self.name) == null) return res.text(400, "missing header");
+                try inner(ctx, req, res);
+                try res.setHeader("X-Checked-By", ctx.config.name);
+            }
+        }.run;
+    }
+};
+
+const Plugins = struct { require: RequireHeader = .{ .name = "x-client" } };
+const App = zoda.app.App(Plugins);
+
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{},
+    // Compose at comptime; `route` must be comptime-known.
+    .route_fn = App.composeRoute(route),
+});
+defer app.deinit();
+```
+
+- `App.composeRoute(route)` wraps `route` with every plugin hook. The first
+  plugin field is outermost: wrappers enter in declaration order and exit in
+  reverse. Plugins without a hook are skipped. Without any hooks, you get
+  `route` back.
+- Wrappers run inside the middleware chain, just before the default 404. A
+  wrapper that returns after a route miss still sees an unhandled response,
+  so it can write its own fallback. Otherwise the 404 is applied afterwards,
+  and middleware sees it.
+- To skip the route, return without calling `inner`. Errors from the route
+  propagate through the wrappers to middleware and `dispatch`.
+- A route passed to `route_fn` without `composeRoute` runs no wrappers.
+
 ### Response timing
 
 `zoda.timing.middleware(App)` adds `X-Response-Time-Ms` (whole milliseconds,
