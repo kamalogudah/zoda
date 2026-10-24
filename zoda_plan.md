@@ -17,8 +17,9 @@ and plugins do not exist yet. All phases below remain unchecked. Examples in
 this document specify intended behaviour; they are not compiled implementation.
 
 The project includes transport hardening, a rebuild/restart development loop,
-templating, and stateful plugins in its roadmap. HTTP/2 has a separate
-feasibility gate; it is not a prerequisite for the first HTTP/1.1 release.
+templating, and stateful plugins in its roadmap. HTTP/2 had a separate
+feasibility gate; it is not a prerequisite for the first HTTP/1.1 release, and
+Zoda is HTTP/1.1-only (§4.2.6).
 
 ## 2. Architecture and first deliverable
 
@@ -899,10 +900,68 @@ zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
 
 ### Phase 2c — HTTP/2 feasibility
 
-- [ ] Check HTTP/2 server support for the pinned transport and record primary
-      documentation or an upstream issue.
+- [x] Check HTTP/2 server support for the pinned transport and record primary
+      documentation or an upstream issue. Unsupported upstream; Zoda is
+      HTTP/1.1-only (issue #19, §4.2.6).
 - **Exit:** either a separately scoped integration-tested adapter, or an explicit
       HTTP/1.1-only support statement. Do not build a partial protocol parser.
+
+### §4.2.6 Phase 2c HTTP/2 feasibility — issue #19
+
+**Outcome: HTTP/1.1 only.** Zoda supports HTTP/1.0 and HTTP/1.1 over cleartext
+TCP. It does not support HTTP/2 in any form: not prior-knowledge h2c, not the
+h2c `Upgrade`, and not h2 over TLS. No adapter is chosen or scheduled, and
+HTTP/2 does not block the first HTTP/1.1 release.
+
+The pinned transport has no HTTP/2 server support. The primary documentation
+is the Zig 0.16.0 standard library source (`zig env` → `lib_dir`):
+
+- `std/http.zig`: `pub const Version = enum { @"HTTP/1.0", @"HTTP/1.1" }`.
+  There is no HTTP/2 version, frame, stream, or HPACK type in `std.http`.
+- `std/http/Server.zig` `Request.Head.parse`: any request-line version other
+  than `HTTP/1.0` or `HTTP/1.1` returns `error.HttpHeadersInvalid`. The RFC 9113
+  client preface (`PRI * HTTP/2.0`) is therefore a malformed HTTP/1 request.
+- `std/crypto/tls.zig` exports only `Client`. With no TLS server, there is no
+  ALPN path to negotiate `h2`, which is how browsers reach HTTP/2.
+
+No upstream issue for HTTP/2 server support in `std.http` was found as of
+2026-10-24. Third-party Zig HTTP/2 libraries exist but are outside the pinned
+transport.
+
+Supporting HTTP/2 would mean writing framing, HPACK, stream multiplexing, and
+flow control ourselves, or depending on an external library. The first is the
+partial protocol parser this phase forbids. Both would replace, not extend, the
+pinned transport, and the buffered-only response contract (§4.2.5) does not
+map onto per-stream flow control. Deployments that need HTTP/2 or TLS should
+terminate them at a reverse proxy that speaks HTTP/1.1 to Zoda.
+
+Current behavior, pinned by `src/transport.zig` test "HTTP/2 prior knowledge
+and h2c upgrade stay HTTP/1.1 only":
+
+- The HTTP/2 client preface is answered with `HTTP/1.1 400`, the connection is
+  closed, and the application is never dispatched.
+- A request with `Upgrade: h2c` and `HTTP2-Settings` is served as plain
+  HTTP/1.1. There is no `101 Switching Protocols` and no `Upgrade` header in
+  the response.
+
+Reopening conditions. Revisit only if one of these is accepted on the roadmap:
+
+1. The pinned Zig version ships an HTTP/2 server in `std.http`.
+2. A maintained HTTP/2 library is proposed as a dependency in its own ADR.
+3. Native TLS termination is added, making ALPN `h2` negotiation possible.
+
+Reopening requires a separately scoped adapter implementation issue and an
+integration-test issue, linked from the roadmap (#38) and here, delivered
+before any HTTP/2 support is claimed.
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build test --summary all                         # 90/90 (87 library + 3 exe)
+zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+```
 
 ### Phase 2d — Development loop
 
@@ -1210,7 +1269,9 @@ Remaining decisions have explicit gates:
 - ~~Response streaming API~~ — resolved in Phase 2b as buffered-only for the
   first HTTP/1.1 release (issue #18, §4.2.5). Streaming stays unsupported
   until a reopening condition there is met and a separate ADR is approved.
-- HTTP/2 support: Phase 2c feasibility result.
+- ~~HTTP/2 support~~ — resolved in Phase 2c as HTTP/1.1-only: the pinned
+  `std.http` has no HTTP/2 server (issue #19, §4.2.6). HTTP/2 stays
+  unsupported until a reopening condition there is met.
 - Named capture convenience: Phase 4, based on demonstrated need.
 
 Plugin state access, ownership, branch termination, middleware ordering, and
