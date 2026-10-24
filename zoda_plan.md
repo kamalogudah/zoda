@@ -1042,13 +1042,17 @@ Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
 zig version                                          # 0.16.0
 zig fmt --check build.zig src
 zig build
-zig build test --summary all                         # 95/95 (86 library + 3 exe + 6 watcher), 3 consecutive runs
+zig build test --summary all                         # 96/96 (87 library + 3 exe + 6 watcher), 3 consecutive runs
 zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
 ./zig-out/bin/zoda
 zig build watch                                      # manual end-to-end check above
 ```
 
-Hosted CI: pending the first push of this change.
+Hosted CI passed on Zig 0.16.0 for the watcher commit `2c70385` in
+[run 40121173731](https://github.com/kamalogudah/zoda/actions/runs/40121173731)
+and for the `main` merge head `3938940` in
+[run 40121239653](https://github.com/kamalogudah/zoda/actions/runs/40121239653).
+The watcher tests run inside CI's `zig build test` step.
 
 ### Phase 2e — Middleware
 

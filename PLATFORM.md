@@ -291,11 +291,13 @@ Recorded locally for the Phase 2d development loop (issue #20):
   (SIGTERM, then SIGKILL after 5 s) and reaps it before starting the new one.
   The watcher is Linux-only because it uses `waitid` to detect exit without
   reaping.
-- `zig build test` now also runs the 6 watcher tests: 95/95 passed in 3
+- `zig build test` now also runs the 6 watcher tests: 96/96 passed in 3
   consecutive runs. Measured edit-to-response latency was 1.5–1.8 s, against
   a 2 s target, and a broken build recovered on the next valid edit. Details
   are in `zoda_plan.md` §4.2.6.
-- CI: hosted run pending the first push of this change.
+- Hosted CI passed on Zig 0.16.0 in
+  [run 40121239653](https://github.com/kamalogudah/zoda/actions/runs/40121239653)
+  (`main` at `3938940`, which includes the watcher commit `2c70385`).
 
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the real-socket shutdown acceptance test via `zig build test` and the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
