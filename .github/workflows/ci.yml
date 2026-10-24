@@ -39,5 +39,7 @@ jobs:
         run: zig build test-hardening -Doptimize=ReleaseSafe --summary all
       - name: 60-second load and overload measurements (ReleaseSafe)
         run: zig build test-load -Doptimize=ReleaseSafe --summary all
+      - name: Development-loop recovery and edit-to-response latency
+        run: zig build test-devloop --summary all
       - name: Smoke-run executable
         run: ./zig-out/bin/zoda

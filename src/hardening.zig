@@ -235,7 +235,7 @@ pub const Client = struct {
     start: usize = 0,
     end: usize = 0,
 
-    fn connect(io: Io, address: *const net.IpAddress) !Client {
+    pub fn connect(io: Io, address: *const net.IpAddress) !Client {
         const stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
         errdefer stream.close(io);
         const timeout = std.posix.timeval{
@@ -305,7 +305,7 @@ pub const Client = struct {
         }
     }
 
-    fn readResponse(self: *Client, head_request: bool) !Reply {
+    pub fn readResponse(self: *Client, head_request: bool) !Reply {
         const status_line = try self.readLine();
         const http10 = std.mem.startsWith(u8, status_line, "HTTP/1.0 ");
         if (!(http10 or std.mem.startsWith(u8, status_line, "HTTP/1.1 ")) or status_line.len < 12) return error.BadStatusLine;

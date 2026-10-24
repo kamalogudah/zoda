@@ -195,6 +195,29 @@ pub fn build(b: *std.Build) void {
     const watch_tests = b.addTest(.{ .root_module = watch_exe.root_module });
     test_step.dependOn(&b.addRunArtifact(watch_tests).step);
 
+    // End-to-end development-loop checks: runs the watcher with this same
+    // compiler against a temporary copy of the demo, so it builds the demo
+    // several times and is kept out of the quick `test` step.
+    const devloop_options = b.addOptions();
+    devloop_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    devloop_options.addOption([]const u8, "repo_root", b.pathFromRoot("."));
+    const devloop_module = b.createModule(.{
+        .root_source_file = b.path("src/devloop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    devloop_module.addOptions("devloop_options", devloop_options);
+    const devloop_tests = b.addTest(.{
+        .root_module = devloop_module,
+        .filters = &.{"devloop"},
+    });
+    const devloop_run = b.addRunArtifact(devloop_tests);
+    // Always rerun: the result depends on the sources and the machine, not
+    // only on the test binary.
+    devloop_run.has_side_effects = true;
+    const devloop_step = b.step("test-devloop", "Check demo rebuild/restart and compile-failure recovery; measure edit-to-response latency");
+    devloop_step.dependOn(&devloop_run.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
