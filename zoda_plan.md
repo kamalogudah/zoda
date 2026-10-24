@@ -222,8 +222,9 @@ pub const Middleware = struct {
 };
 ```
 
-The app copies the ordered entry list at initialization; configuration objects
-remain caller-owned, immutable, and valid until app shutdown. A private frame
+The app copies the ordered entry list at initialization (`App.init`);
+configuration objects remain caller-owned, immutable, and valid until app
+shutdown (`app.deinit()`). A private frame
 per invocation carries the next index, app, and a shared `called` flag.
 Copies of `Next` reference that same flag. Zero calls short-circuit; one call
 continues; a second call returns `error.NextAlreadyCalled` before downstream
@@ -1121,8 +1122,8 @@ zig build test-devloop --summary all                 # 1/1, 3 consecutive runs, 
 
 ### Phase 2e — Middleware
 
-- [ ] Implement §3.6 and test ordering, single-use continuation, short circuits,
-      errors, configuration lifetime, and request isolation.
+- [x] Implement §3.6 and test ordering, single-use continuation, short circuits,
+      errors, configuration lifetime, and request isolation. (issue #22, §4.2.8)
 - [ ] Add response timing using a monotonic clock and a copying header helper.
 - [ ] Add static-file middleware with a configured document-root handle.
       Reject traversal and symlinks; resolve beneath the root without a
@@ -1130,6 +1131,71 @@ zig build test-devloop --summary all                 # 1/1, 3 consecutive runs, 
       where confinement cannot be guaranteed. No directory listing by default.
 - **Exit:** static requests skip routing, other responses receive timing headers,
       and tests cover encoded traversal, symlinks, and paths outside the root.
+
+### §4.2.8 Phase 2e middleware and single-use continuation evidence — issue #22
+
+Implements the contract in §3.3, §3.5, and §3.6 in `src/app.zig`. Route
+wrappers remain Phase 3. Response timing and static files are the remaining
+Phase 2e items.
+
+API as implemented, per `App(Plugins)`:
+
+- `App.Next { frame, invoke }` with `call(ctx, req, res)` and
+  `App.Middleware { config: *const anyopaque, invoke }`, both over the app's
+  typed `Context`, exactly as in §3.6. `zoda.app.NextError` declares
+  `error.NextAlreadyCalled`.
+- `App.init(allocator, .{ .response_allocator, .config, .plugins, .route_fn,
+  .middleware })` copies the ordered entry slice into `allocator`-owned
+  storage. The caller may reuse its array afterwards. Configuration objects are
+  **not** copied: they stay caller-owned and immutable, and must stay valid
+  until `app.deinit()`, which frees the copied list. Apps built as struct
+  literals still work and have no middleware.
+- Each middleware invocation gets a private stack `Frame { app, next_index,
+  called }`. `Next.frame` points at it, so every copy of a `Next` shares the
+  same `called` flag. The first call sets the flag before running downstream
+  code. Any later call returns `error.NextAlreadyCalled` and does not run
+  downstream middleware or the route again. Zero calls short-circuit.
+- Entries run in registration order and unwind in reverse. The terminal
+  continuation runs the route and then the default 404, so middleware sees and
+  can decorate the 404 while unwinding. `dispatch` applies the 404 again after
+  the chain returns, which covers short circuits that write nothing.
+- Errors propagate unchanged through the chain to `dispatch`, which releases
+  the partial response. Middleware runs success post-processing after
+  `try next.call(...)` and puts cleanup in `defer`. A middleware that recovers
+  an error clears the response before it writes a replacement (§3.5).
+- Caller obligations, documented on `Next` but not enforced by Zig: a `Next` is
+  valid only while the invocation that received it runs. It must not escape
+  (be stored, returned, or called later) and must not run concurrently. No test
+  claims to make an escaped continuation safe.
+
+Tests in `src/app.zig`:
+
+| Test | Shows |
+|---|---|
+| middleware enters in registration order and unwinds in reverse | Three entries and the route log `abcRCBA`. |
+| app copies the entry list but borrows caller-owned configuration | Overwriting the caller's array after `init` does not change the order. The stored `config` pointer is the caller's object. |
+| app without middleware dispatches straight to the route | 200 and default 404 with an empty chain. |
+| short circuit skips downstream middleware and the route | A 401 short circuit runs no inner entry or route (`axA`). A short circuit that writes nothing gets dispatch's fallback 404. |
+| a second next call is rejected before downstream runs again | Calling the same `Next` or a copy a second time returns `error.NextAlreadyCalled`, and downstream ran only once (`cRC`). Left unhandled, the error propagates out of `dispatch`. |
+| errors propagate and skip success post-processing but run deferred cleanup | On success the header and post-processing run (`aRpdA`). When the route fails, `error.Boom` propagates, post-processing is skipped, `defer` cleanup runs in reverse (`aRdA`), and the testing allocator finds no leaks. |
+| middleware recovering an error replaces the partial response | The partial body and header are cleared and replaced with a 503. |
+| terminal continuation applies the default 404 before middleware unwinds | Middleware observes the 404 after `next.call` and adds a header to it. |
+| middleware shares the per-request context and plugin state | Middleware reads `ctx.config` and `ctx.state` for the same request as the route. |
+| concurrent requests use independent continuation frames | 4 threads × 500 dispatches through one app with two guard entries. Each first call succeeds and each second call is rejected, with no cross-request rejection, and every response echoes its own query value. |
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test --summary all                         # 106/106 (97 library + 3 exe + 6 watcher), 3 consecutive runs
+zig build test -Doptimize=ReleaseSafe --summary all  # 106/106
+zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+./zig-out/bin/zoda
+```
+
+Hosted CI: pending the first push of this change.
 
 ### Phase 3 — Route wrappers
 
@@ -1242,6 +1308,7 @@ pub fn App(comptime Plugins: type) type {
         config: AppConfig,
         plugins: Plugins,
         route_fn: RouteFn,
+        middleware: []const Middleware = &.{}, // app-owned copy made by `init` (§3.6)
 
         pub fn dispatch(self: *const Self, req: *Request) !Response {
             // init cleans up successfully initialized fields if a later hook fails.
@@ -1254,8 +1321,10 @@ pub fn App(comptime Plugins: type) type {
             };
             var res = Response.init(self.response_allocator);
             errdefer res.deinit();
-            // Phase 1 direct call; later phases use the §3.3 middleware lifecycle.
-            try self.route_fn(&ctx, req, &res);
+            // Middleware chain (§3.6); the terminal continuation runs the
+            // route and the default 404.
+            try self.runFrom(0, &ctx, req, &res);
+            // Covers middleware short circuits that left the response unhandled.
             if (!res.handled) try res.text(404, "Not Found");
             return res; // Caller owns response; request is still caller-owned.
         }
