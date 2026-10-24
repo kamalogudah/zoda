@@ -58,6 +58,9 @@ pub const BodyError = error{
     BodyTooLarge,
 };
 
+/// Errors from `replaceOwnedBody`.
+pub const OwnedBodyError = BodyError || error{InvalidContentType};
+
 /// Errors from header insertion. The bounds map to 431 at the transport (§3.4).
 pub const HeaderError = error{
     OutOfMemory,
@@ -163,6 +166,24 @@ pub const Response = struct {
         const content_type = try self.allocator.dupe(u8, json_content_type);
         self.commit(json, status_code, content_type);
         committed = true;
+    }
+
+    /// Replaces the body, status, and content type with `body`, which must have
+    /// been allocated from this response's allocator, and marks handled. On
+    /// success the response owns `body`; on any error the response is
+    /// unchanged and the caller still owns it. `content_type` is copied and
+    /// must not contain CR, LF, or NUL. Used to serve a buffer without a
+    /// second copy (static files).
+    pub fn replaceOwnedBody(
+        self: *Response,
+        status_code: u16,
+        content_type: []const u8,
+        body: []u8,
+    ) OwnedBodyError!void {
+        if (body.len > self.limits.max_body_bytes) return error.BodyTooLarge;
+        if (content_type.len == 0 or hasForbiddenValueByte(content_type)) return error.InvalidContentType;
+        const owned_type = try self.allocator.dupe(u8, content_type);
+        self.commit(body, status_code, owned_type);
     }
 
     /// Takes ownership of already-allocated `body`/`content_type` and replaces
@@ -462,6 +483,28 @@ test "body limit accepts at-limit length and rejects one byte over" {
     try std.testing.expectEqualStrings("12345", res.body);
     try std.testing.expectError(error.BodyTooLarge, res.text(200, "123456"));
     try std.testing.expectEqualStrings("12345", res.body);
+}
+
+test "replaceOwnedBody takes ownership only on success" {
+    var res = Response.initWithLimits(std.testing.allocator, .{ .max_body_bytes = 5 });
+    defer res.deinit();
+    try res.text(200, "first");
+
+    const too_large = try std.testing.allocator.dupe(u8, "123456");
+    defer std.testing.allocator.free(too_large);
+    try std.testing.expectError(error.BodyTooLarge, res.replaceOwnedBody(200, "text/css", too_large));
+    const bad_type = try std.testing.allocator.dupe(u8, "body");
+    defer std.testing.allocator.free(bad_type);
+    try std.testing.expectError(error.InvalidContentType, res.replaceOwnedBody(200, "text/css\r\nX: y", bad_type));
+    try std.testing.expectEqualStrings("first", res.body);
+    try std.testing.expectEqualStrings(text_content_type, res.content_type);
+
+    const owned = try std.testing.allocator.dupe(u8, "a{}");
+    try res.replaceOwnedBody(201, "text/css", owned);
+    try std.testing.expectEqual(owned.ptr, res.body.ptr);
+    try std.testing.expectEqual(@as(u16, 201), res.status_code);
+    try std.testing.expectEqualStrings("text/css", res.content_type);
+    try std.testing.expect(res.handled);
 }
 
 test "allocation failure during response replacement leaves prior response intact" {

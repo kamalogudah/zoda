@@ -30,8 +30,9 @@ fn route(ctx: *Demo.Context, req: *router.Request, res: *response.Response) !voi
 }
 
 /// `zoda` dispatches the route matrix in memory and exits.
-/// `zoda serve [port]` serves the same routes on 127.0.0.1 (default 8080);
-/// `zig build watch` uses this mode.
+/// `zoda serve [port] [docroot]` serves the same routes on 127.0.0.1 (default
+/// 8080), and static files from `docroot` when given; `zig build watch` uses
+/// this mode.
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -43,7 +44,8 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     if (args.len > 1 and std.mem.eql(u8, args[1], "serve")) {
         const port = if (args.len > 2) try std.fmt.parseInt(u16, args[2], 10) else 8080;
-        return serve(io, stdout_writer, port);
+        const docroot: ?[]const u8 = if (args.len > 3) args[3] else null;
+        return serve(io, stdout_writer, port, docroot);
     }
 
     const demo_app = Demo{
@@ -76,16 +78,33 @@ pub fn main(init: std.process.Init) !void {
     try stdout_writer.flush();
 }
 
-fn serve(io: Io, stdout_writer: *Io.Writer, port: u16) !void {
+fn serve(io: Io, stdout_writer: *Io.Writer, port: u16, docroot: ?[]const u8) !void {
     // Connection tasks share this allocator concurrently (PLATFORM.md §5).
     const gpa = std.heap.smp_allocator;
-    // Timing is registered first so it is outermost and times the whole chain.
+
+    // Static files, when configured, come first: hits skip timing and the
+    // route, and every other response is timed. The handle outlives the app.
+    var static_config: zoda.static.Config = undefined;
+    var entries: [2]Demo.Middleware = undefined;
+    var count: usize = 0;
+    if (docroot) |path| {
+        const root = try Io.Dir.cwd().openDir(io, path, .{});
+        static_config = .{ .root = root };
+        // Fail at startup, not on the first request, where openat2 is missing.
+        try zoda.static.checkSupport(root);
+        entries[count] = zoda.static.middleware(Demo, &static_config);
+        count += 1;
+    }
+    defer if (docroot != null) static_config.root.close(io);
+    entries[count] = zoda.timing.middleware(Demo);
+    count += 1;
+
     var demo_app = try Demo.init(gpa, .{
         .response_allocator = gpa,
         .config = .{ .name = "demo", .clock = .monotonic(io) },
         .plugins = .{},
         .route_fn = route,
-        .middleware = &.{zoda.timing.middleware(Demo)},
+        .middleware = entries[0..count],
     });
     defer demo_app.deinit();
 

@@ -39,6 +39,15 @@ Other targets are best-effort only and are not CI-covered: no guarantees are
 made for macOS, Windows, other architectures, or musl builds until a later
 ADR extends the support matrix.
 
+**Static-file confinement** (`zoda.static`, ADR-0001 §4.2.11) requires Linux
+5.6 or later for `openat2(2)` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS`. CI's `ubuntu-latest` kernels qualify. On every other
+target, and on Linux where `openat2` returns `ENOSYS`, `EPERM` (seccomp), or
+`EINVAL`/`E2BIG` (unsupported resolve flags), static requests fail closed
+with `error.ConfinementUnavailable`; there is no unconfined fallback. The
+pinned std's `Io.Dir.OpenOptions.resolve_beneath` is not a substitute: on
+Linux it is silently ignored.
+
 ## 3. Installing the pinned compiler
 
 Download tarballs are published at
