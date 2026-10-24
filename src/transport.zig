@@ -5,6 +5,8 @@
 //! request is copied into a fresh `RequestArena`, dispatched only after the
 //! complete body has been decoded, and released after its buffered response is
 //! sent. Protocol rejections and application failures close the connection.
+//! HTTP/2 is unsupported: the pinned `std.http` parses only HTTP/1.0 and
+//! HTTP/1.1, and h2c upgrades are ignored (ADR-0001 §4.2.6).
 //!
 //! Zig 0.16.0 APIs used here are `std.http.Server.init/receiveHead`,
 //! `Request.iterateHeaders`, `std.http.Reader.bodyReader`, and
@@ -684,4 +686,26 @@ test "signed lengths, colonless fields, and rejected expectations" {
     try std.testing.expect(std.mem.startsWith(u8, expect, "HTTP/1.1 400"));
     try std.testing.expect(std.mem.indexOf(u8, expect, "100 Continue") == null);
     try std.testing.expectEqual(@as(usize, 0), calls);
+}
+
+test "HTTP/2 prior knowledge and h2c upgrade stay HTTP/1.1 only" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    // The RFC 9113 client preface has an unsupported version and is refused.
+    const preface = try runTest("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", &app, .{});
+    defer std.testing.allocator.free(preface);
+    try std.testing.expect(std.mem.startsWith(u8, preface, "HTTP/1.1 400"));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+
+    // An h2c upgrade request is served over HTTP/1.1 without switching.
+    const upgrade = try runTest(
+        "GET / HTTP/1.1\r\nHost: example\r\nConnection: Upgrade, HTTP2-Settings\r\n" ++
+            "Upgrade: h2c\r\nHTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\n\r\n",
+        &app,
+        .{},
+    );
+    defer std.testing.allocator.free(upgrade);
+    try std.testing.expect(std.mem.startsWith(u8, upgrade, "HTTP/1.1 200"));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(upgrade, "upgrade") == null);
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }
