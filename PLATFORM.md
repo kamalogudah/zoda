@@ -299,6 +299,20 @@ Recorded locally for the Phase 2d development loop (issue #20):
   [run 40121239653](https://github.com/kamalogudah/zoda/actions/runs/40121239653)
   (`main` at `3938940`, which includes the watcher commit `2c70385`).
 
+Recorded locally for Phase 2d recovery and latency (issue #21):
+
+- Zig `0.16.0`, native `x86_64-linux-gnu`, demo built in Debug; same machine
+  as issue #20 (Intel Core i5-8365U, 15 GiB RAM, Ubuntu 24.04.4 / Linux
+  7.0.0-38-generic).
+- `zig build test-devloop --summary all` runs the watcher against a temporary
+  copy of the demo with the real `zig build`. It asserts rebuild and restart
+  on 5 edits, and it checks that a compile failure leaves the last good
+  server answering. The next valid edit must recover, and stopping the
+  watcher must release the demo and its port. CI runs this step too.
+- Three consecutive runs: edit-to-response latency of 1,390–1,890 ms over 18
+  timed edits (median valid edit 1,534 ms), against a 2 s target that is
+  reported, not asserted. Details are in `zoda_plan.md` §4.2.7.
+
 CI (`zig fmt --check`, `zig build`, `zig build test`, plus the real-socket shutdown acceptance test via `zig build test` and the `zoda` demo
 smoke-run and an exact-version assertion) enforces this on every push and pull
 request. See `.github/workflows/ci.yml`.

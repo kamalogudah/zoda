@@ -970,8 +970,9 @@ zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
 - [x] Keep the last working process on compilation failure; display diagnostics
       and terminate the previous process cleanly after successful builds.
       (issue #20, §4.2.6)
-- **Exit:** measure edit-to-response latency on a documented machine, targeting
-      two seconds, and verify failed builds recover on the next valid edit.
+- [x] **Exit:** measure edit-to-response latency on a documented machine,
+      targeting two seconds, and verify failed builds recover on the next valid
+      edit. (issue #21, §4.2.7)
 
 ### §4.2.6 Phase 2d development-loop evidence — issue #20
 
@@ -1053,6 +1054,70 @@ Hosted CI passed on Zig 0.16.0 for the watcher commit `2c70385` in
 and for the `main` merge head `3938940` in
 [run 40121239653](https://github.com/kamalogudah/zoda/actions/runs/40121239653).
 The watcher tests run inside CI's `zig build test` step.
+
+### §4.2.7 Phase 2d recovery and latency evidence — issue #21
+
+`zig build test-devloop` runs `src/devloop.zig`. It copies `src/`,
+`build.zig`, and `build.zig.zon` into a temporary directory and runs the
+`watch.Watcher` from §4.2.6 there, with the real build command (`<zig> build`,
+the compiler that ran `zig build test-devloop`) and the real demo
+(`zig-out/bin/zoda serve <free port>`). Each edit rewrites the `GET /` body in
+the copied `src/main.zig`, so the repository itself is never changed. The
+watcher runs in its own task with its default 200 ms poll, as under
+`zig build watch`. CI runs the step on every push and pull request.
+
+Checks, in order, all asserted:
+
+| Step | Asserted |
+|---|---|
+| Cold start | `GET /` returns `hello from zoda` from the first build. |
+| 5 valid edits | Each new body is served. 6 starts and 5 stops are logged, so every previous process was stopped and reaped before its replacement. |
+| Compile-failure edit | An undeclared identifier is added. The watcher logs `build failed; keeping previous process`, and the compiler diagnostics (`error:` and the identifier) appear in its output. Three later `GET /` requests still return the last good body, and no new process starts. |
+| Next valid edit | The new body is served. Starts reach 7 and stops reach 6. |
+| Watcher stop | The last demo PID is gone (`kill(pid, 0)` → `ESRCH`), and the port refuses connections. |
+
+The test's only Watcher change is a new `Config.run_stdout` field. The test
+sets it to `.ignore` because the test runner's stdout carries the build-system
+protocol. `zig build watch` keeps the default `.inherit`.
+
+Methodology. Latency runs from the moment the edited file is written until
+`GET /` first returns the new body. The test sends a new
+`Connection: close` request every 10 ms, and refused or incomplete
+connections during a restart count as "not yet". The time includes the
+watcher's poll-and-settle window (one poll to detect the change and one to
+confirm it, 200–400 ms), `zig build`, stopping the old process, and starting
+the new one. The watcher's own `started pid … after N ms` lines give the
+build-and-start part separately. The demo builds in Debug, which is the
+`zig build` default the watcher uses. The 2 s target is printed with each
+result. It is not asserted, because hosted runner speed is not measured here.
+
+Machine: Intel Core i5-8365U (4 cores / 8 threads), 15 GiB RAM, Ubuntu 24.04.4
+LTS, Linux 7.0.0-38-generic, Zig 0.16.0 (`x86_64-linux-gnu`). Three
+consecutive local runs, with a warm global cache and a fresh local cache in
+each copy:
+
+| Run | Cold start | Edits 1–5 → new response | Failure reported | Recovery → new response |
+|---|---|---|---|---|
+| 1 | 4,511 ms | 1,603 / 1,573 / 1,529 / 1,390 / 1,655 ms | 1,393 ms | 1,643 ms |
+| 2 | 3,926 ms | 1,433 / 1,501 / 1,518 / 1,580 / 1,648 ms | 1,400 ms | 1,510 ms |
+| 3 | 4,229 ms | 1,647 / 1,534 / 1,500 / 1,429 / 1,890 ms | 1,515 ms | 1,669 ms |
+
+Across the 18 timed edits (15 valid edits and 3 recoveries), latency ranged
+from 1,390 to 1,890 ms. The median valid edit took 1,534 ms. All 18 met the
+2 s target on this machine. Build and start after an edit took 992–1,466 ms.
+These numbers cover only this machine. The value printed by a CI run reflects
+that runner and is not a claim for other hardware.
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test --summary all                         # 96/96
+zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+zig build test-devloop --summary all                 # 1/1, 3 consecutive runs, no leftover processes
+```
 
 ### Phase 2e — Middleware
 

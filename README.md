@@ -54,8 +54,9 @@ several times a second, then runs `zig build`.
 - **Build succeeds:** it stops the old server (SIGTERM, then SIGKILL after
   5 s) and starts the new one.
 
-Press Ctrl-C to stop both. Edit-to-response time is about 1.5–2 s on a 4-core
-laptop. The watcher supports Linux only. You can also run the demo server
+Press Ctrl-C to stop both. Edit-to-response time measured 1.4–1.9 s on a
+4-core laptop (`zig build test-devloop` repeats the measurement on your
+machine and checks failed-build recovery). The watcher supports Linux only. You can also run the demo server
 directly with `./zig-out/bin/zoda serve [port]`.
 
 ## Using Zoda in your project

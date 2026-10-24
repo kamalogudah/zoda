@@ -36,6 +36,9 @@ pub const Config = struct {
     watch_paths: []const []const u8,
     build_argv: []const []const u8,
     run_argv: []const []const u8,
+    /// Where the process writes its stdout. Callers whose own stdout is not a
+    /// terminal, such as a test runner, redirect it.
+    run_stdout: process.SpawnOptions.StdIo = .inherit,
     poll_interval: Io.Duration = .fromMilliseconds(200),
     /// Time the previous process is given to exit after SIGTERM.
     stop_grace: Io.Duration = .fromSeconds(5),
@@ -152,6 +155,7 @@ pub const Watcher = struct {
             .argv = self.config.run_argv,
             .cwd = .{ .dir = self.config.root },
             .stdin = .ignore,
+            .stdout = self.config.run_stdout,
         });
         self.generation += 1;
         try self.out.print("[watch] started pid {d} after {d} ms\n", .{
