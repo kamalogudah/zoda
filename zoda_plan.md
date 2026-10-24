@@ -1123,7 +1123,8 @@ zig build test-devloop --summary all                 # 1/1, 3 consecutive runs, 
 ### Phase 2e — Middleware
 
 - [x] Implement §3.6 and test ordering, single-use continuation, short circuits,
-      errors, configuration lifetime, and request isolation. (issue #22, §4.2.8)
+      errors, configuration lifetime, and request isolation. (issue #22, §4.2.8;
+      verified in issue #23, §4.2.9)
 - [ ] Add response timing using a monotonic clock and a copying header helper.
 - [ ] Add static-file middleware with a configured document-root handle.
       Reject traversal and symlinks; resolve beneath the root without a
@@ -1191,6 +1192,65 @@ zig fmt --check build.zig src
 zig build
 zig build test --summary all                         # 106/106 (97 library + 3 exe + 6 watcher), 3 consecutive runs
 zig build test -Doptimize=ReleaseSafe --summary all  # 106/106
+zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+./zig-out/bin/zoda
+```
+
+Hosted CI: pending the first push of this change.
+
+### §4.2.9 Phase 2e middleware verification evidence — issue #23
+
+Verification-only pass for the contract in §3.3, §3.5, and §3.6 against the
+issue #22 implementation in `src/app.zig`. No public API changed. Ten tests
+were added beside the §4.2.8 tests. Each acceptance criterion maps to tests
+as follows (tests from §4.2.8 are marked †):
+
+| Criterion | Tests in `src/app.zig` | Asserted |
+|---|---|---|
+| Enter/unwind order, nested chains | enters in registration order †; nested short circuits unwind every outer entry and leave the 404 to dispatch | `abcRCBA`; in a five-entry chain the third entry short-circuits, the fourth entry and the route never run, and the outer entries unwind (`abxBA`). |
+| Handled and unhandled short circuits | short circuit skips downstream †; nested short circuits … | A 401 short circuit is what outer entries see. When a short circuit writes nothing, outer entries see an *unhandled* response (the terminal continuation never ran) and `dispatch` applies the 404 afterwards. |
+| Copied-`Next` rejection, one downstream invocation | a second next call is rejected † ; repeated next in a nested entry runs downstream once and leaves outer frames intact | A copy taken *after* the first call, the original, and the copy again all return `error.NextAlreadyCalled`. Downstream entries and the route run once whether the repeating entry is in the middle (`acdRDC!A`) or innermost (`aR!A`), and the outer entry's own continuation is unaffected. |
+| Errors | errors propagate … deferred cleanup †; middleware errors before or after next propagate and release the response | An error raised before `next` skips the route (`adA`). An error raised after the route wrote a body propagates (`aRdA`). The testing allocator finds no leak of either partial response. |
+| Recovery after clearing | recovering an error replaces the partial response †; outer recovery clears an inner failure before replacing or falling back to 404 | An outer entry recovers an inner *middleware* failure: the inner header and route body are cleared, and post-processing continues. With a replacement the result is 503. Cleared without one, dispatch's 404 applies. |
+| Default 404 visibility | terminal continuation applies the default 404 †; default 404 is visible to every nested entry while unwinding | Both the innermost and outermost entries observe 404 after a route miss. |
+| Configured middleware | configured middleware reads its own entry configuration | The README `requireKey` example compiles and runs. The same function in two apps with different keys accepts and rejects independently, and decorates an authenticated 404. |
+| Configuration lifetimes | app copies the entry list but borrows configuration †; supported configuration lifetimes; init failure copies nothing and leaks nothing | Static configuration; heap configuration freed after `app.deinit()`; one configuration object shared by two apps; a caller entry array poisoned right after `init`. `init` on an allocator that fails returns `error.OutOfMemory` with zero bytes allocated. |
+| Independent frames (deterministic) | a request dispatched from inside middleware gets its own frames | While the outer request holds an unused `next`, a second request runs the full chain through the same app (`[aRA]aRA`). The outer continuation still runs once and rejects a second call. |
+| Concurrent frames and state | concurrent requests use independent continuation frames †; concurrent requests keep frames, plugin state, and outcomes independent | 4 threads × 400 requests through a four-entry chain with a stateful plugin and one shared configuration object. Each entry checks before and after `next` that `ctx.state` belongs to its own request. Outcomes are mixed (200 echo, 403 short circuit, 503 recovered error, 404 miss) and each matches its request. Plugin state inits and deinits both equal 1,600, and a thread-safe `DebugAllocator` reports no leaks. |
+
+Mutation check (seeded locally and reverted, not committed). Each test suite
+was rerun with a deliberate defect:
+
+| Defect | Failing tests |
+|---|---|
+| `invokeNext` ignores `called` | both repeated-call tests and both concurrent tests |
+| Terminal continuation skips the default 404 | both 404-visibility tests |
+| Frames stored in static storage shared across requests | the re-entrant frame test (3/3 runs) and the † concurrent frame test |
+
+The new concurrent test did not detect shared frames: its allocator mutex
+serializes most of each request, so thread interleaving is probabilistic. The
+deterministic re-entrant test was added for that reason. The new concurrent
+test's value is plugin-state and outcome isolation under real threads.
+
+Caller obligations, as documented on `Next`, `Middleware`, and in the README:
+
+- Configuration objects are caller-owned, immutable, and valid until
+  `app.deinit()`. The entry array is copied by `init`.
+- A `Next` is valid only during the invocation that received it. It must not
+  be stored, returned, called after that invocation returns, or called from
+  another thread.
+- Zig does not enforce the second obligation. None of these tests make an
+  escaped continuation safe, and none claim to. They exercise supported use
+  only.
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test --summary all                         # 116/116 (107 library + 3 exe + 6 watcher), 3 consecutive runs
+zig build test -Doptimize=ReleaseSafe --summary all  # 116/116
 zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
 ./zig-out/bin/zoda
 ```

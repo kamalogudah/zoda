@@ -271,17 +271,25 @@ defer app.deinit();
 ```
 
 - Entries run in registration order and unwind in reverse. After the route,
-  an unhandled response becomes 404 before middleware unwinds. A short circuit
-  that writes nothing also gets a 404.
-- `App.init` copies the entry list. The configuration objects are borrowed:
-  keep them immutable and alive until `app.deinit()`.
+  an unhandled response becomes 404 before middleware unwinds, so every entry
+  sees the 404. A short circuit that writes nothing skips the route, so outer
+  entries see an unhandled response; `dispatch` applies the 404 after the
+  chain returns.
+- `App.init` copies the entry list, so the caller's array can be reused or go
+  out of scope. The configuration objects are borrowed: keep them immutable
+  and alive until `app.deinit()`. Static, stack, and heap configuration all
+  work under that rule, and one configuration object can serve several entries,
+  apps, and threads, because nothing writes to it.
 - `next` runs the rest of the chain once. A second call, including a call
   through a copy, returns `error.NextAlreadyCalled` without running anything
   again.
 - Errors propagate through middleware to `dispatch`. Put cleanup in `defer`.
   To recover from an error, call `res.clear()` before writing a replacement.
+- Each request gets its own continuation frames, including a request
+  dispatched from inside middleware. Concurrent requests do not share them.
 - Do not store `next`, return it, or call it after your function returns or
-  from another thread. Zig cannot check this for you.
+  from another thread. Zig cannot check this for you, and the tests do not
+  make an escaped `next` safe: they cover only the supported uses above.
 
 ### Dispatching without sockets
 
