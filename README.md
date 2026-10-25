@@ -233,6 +233,64 @@ const Plugins = struct {
 - Plugin instances are immutable during dispatch. Any shared mutable resource
   they reference must do its own synchronization.
 
+### Middleware
+
+Middleware wraps the whole route, including the default 404. Each entry pairs a
+configuration pointer with a function that receives a single-use `next`
+continuation:
+
+```zig
+const ApiKey = struct { expected: []const u8 };
+
+fn requireKey(
+    raw: *const anyopaque,
+    ctx: *App.Context,
+    req: *zoda.router.Request,
+    res: *zoda.response.Response,
+    next: App.Next,
+) anyerror!void {
+    const cfg: *const ApiKey = @ptrCast(@alignCast(raw));
+    const key = (try req.getHeaderOne("x-api-key")) orelse "";
+    // Short circuit: return without calling `next`.
+    if (!std.mem.eql(u8, key, cfg.expected)) return res.text(401, "unauthorized");
+
+    try next.call(ctx, req, res);
+    // Success post-processing runs only if `next.call` succeeded.
+    try res.setHeader("X-Authenticated", "1");
+}
+
+const api_key: ApiKey = .{ .expected = "secret" }; // must outlive the app
+
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{},
+    .route_fn = route,
+    .middleware = &.{.{ .config = &api_key, .invoke = requireKey }},
+});
+defer app.deinit();
+```
+
+- Entries run in registration order and unwind in reverse. After the route,
+  an unhandled response becomes 404 before middleware unwinds, so every entry
+  sees the 404. A short circuit that writes nothing skips the route, so outer
+  entries see an unhandled response; `dispatch` applies the 404 after the
+  chain returns.
+- `App.init` copies the entry list, so the caller's array can be reused or go
+  out of scope. The configuration objects are borrowed: keep them immutable
+  and alive until `app.deinit()`. Static, stack, and heap configuration all
+  work under that rule, and one configuration object can serve several entries,
+  apps, and threads, because nothing writes to it.
+- `next` runs the rest of the chain once. A second call, including a call
+  through a copy, returns `error.NextAlreadyCalled` without running anything
+  again.
+- Errors propagate through middleware to `dispatch`. Put cleanup in `defer`.
+  To recover from an error, call `res.clear()` before writing a replacement.
+- Each request gets its own continuation frames, including a request
+  dispatched from inside middleware. Concurrent requests do not share them.
+- Do not store `next`, return it, or call it after your function returns or
+  from another thread. Zig cannot check this for you, and the tests do not
+  make an escaped `next` safe: they cover only the supported uses above.
+
 ### Dispatching without sockets
 
 Tests can build a request and dispatch it directly, without the network:
