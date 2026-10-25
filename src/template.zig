@@ -184,6 +184,27 @@ test "embedded page escapes hostile text and permits explicit trusted markup" {
     try std.testing.expectEqual(@as(u16, 200), res.status_code);
 }
 
+test "HTML text escapes all five special characters" {
+    var res = response.Response.init(std.testing.allocator);
+    defer res.deinit();
+    try render(&res, 200, "<p>{{value}}</p>", .{ .value = "&<>\"'" });
+    try std.testing.expectEqualStrings("<p>&amp;&lt;&gt;&quot;&#39;</p>", res.body);
+}
+
+test "hostile HTML remains text while trusted markup is explicit" {
+    var res = response.Response.init(std.testing.allocator);
+    defer res.deinit();
+    const hostile = "<img src=x onerror=alert(1)><script>alert(2)</script>";
+    try render(&res, 200, "<main>{{input}}</main>", .{ .input = hostile });
+    try std.testing.expectEqualStrings("<main>&lt;img src=x onerror=alert(1)&gt;&lt;script&gt;alert(2)&lt;/script&gt;</main>", res.body);
+    try std.testing.expectError(error.UntrustedRawHtml, render(&res, 200, "{{{input}}}", .{ .input = hostile }));
+    try std.testing.expectEqualStrings("<main>&lt;img src=x onerror=alert(1)&gt;&lt;script&gt;alert(2)&lt;/script&gt;</main>", res.body);
+    try render(&res, 200, "<main>{{{content}}}</main>", .{
+        .content = TrustedHtml.fromTrusted("<strong>reviewed</strong>"),
+    });
+    try std.testing.expectEqualStrings("<main><strong>reviewed</strong></main>", res.body);
+}
+
 test "template errors preserve previous response" {
     var res = response.Response.init(std.testing.allocator);
     defer res.deinit();
@@ -200,12 +221,16 @@ test "interpolation is rejected outside text nodes" {
     defer res.deinit();
     const data = .{ .x = "evil" };
     try std.testing.expectError(error.UnsupportedContext, render(&res, 200, "<a href='{{x}}'>a</a>", data));
+    try std.testing.expectError(error.UnsupportedContext, render(&res, 200, "<a href='https://example.test/{{x}}'>a</a>", data));
+    try std.testing.expectError(error.UnsupportedContext, render(&res, 200, "<img src={{x}}>", data));
     try std.testing.expectError(error.UnsupportedContext, render(&res, 200, "<p data-x={{x}}>a</p>", data));
     try std.testing.expectError(error.UnsupportedContext, render(&res, 200, "<script>{{x}}</script>", data));
     try std.testing.expectError(error.UnsupportedContext, render(&res, 200, "<SCRIPT/x>{{x}}</SCRIPT>", data));
     try std.testing.expectError(error.UnsupportedContext, render(&res, 200, "<style>{{x}}</style>", data));
     try std.testing.expectError(error.UnsupportedContext, render(&res, 200, "<!-- {{x}} -->", data));
     try std.testing.expectError(error.InvalidTemplate, render(&res, 200, "<a href='broken>", data));
+    try std.testing.expectError(error.InvalidTemplate, render(&res, 200, "{{bad-name}}", data));
+    try std.testing.expectError(error.InvalidTemplate, render(&res, 200, "<script>unterminated", data));
 }
 
 test "render stays within response body limit" {

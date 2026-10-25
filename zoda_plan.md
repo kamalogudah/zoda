@@ -1589,8 +1589,16 @@ Issue #28 implementation: [`src/template.zig`](src/template.zig) exposes
 [`README`](README.md#embedded-html-templates) documents the API. Tests cover
 escaping, hostile input, unsupported contexts, missing fields, malformed
 templates, response limits, and failed-render preservation. The development
-loop test edits the template file and observes the rebuilt page. Runtime
-loading and multiple engines remain conditional follow-up scope for issue #29.
+loop test edits the template file and observes the rebuilt page.
+
+Issue [#29](https://github.com/kamalogudah/zoda/issues/29) verifies all five
+HTML escapes, hostile input, rejected attribute/URL/script/style/comment
+contexts, explicit trusted markup, missing fields, and invalid templates. The
+Phase 2d development-loop test now removes the embedded file in a temporary
+project, checks Zig's build diagnostic and the still-running previous page,
+then restores a valid edited template and checks escaped output after rebuild.
+Runtime loading or multiple engines remain conditional extensions; open a
+separately scoped issue if either becomes necessary.
 
 Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
 
@@ -1598,15 +1606,14 @@ Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
 zig version                                           # 0.16.0
 zig fmt --check build.zig src
 zig build
-zig build test --summary all                          # 156/156
-zig build test -Doptimize=ReleaseSafe --summary all   # 156/156
+zig build test --summary all                          # 158/158
+zig build test -Doptimize=ReleaseSafe --summary all   # 158/158
 zig build test-hardening -Doptimize=ReleaseSafe --summary all # 10/10
 zig build test-load -Doptimize=ReleaseSafe --summary all # 2/2
 zig build test-devloop --summary all                  # 1/1
 ```
 
-Hosted CI: pending a push of this change; link the passing run before closing
-issue #28.
+Hosted CI for issue #29: link the passing run before closing the issue.
 
 ### Phase 4 — Optional ergonomics
 

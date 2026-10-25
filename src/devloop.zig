@@ -5,6 +5,8 @@
 //! (`<zig> build`, the compiler that ran `zig build test-devloop`) and the real
 //! demo (`zig-out/bin/zoda serve <port>`). Edits rewrite the `GET /` body in
 //! the copied `src/main.zig` and later edit the embedded `src/page.html`;
+//! removing that template must report a build error and restoring it must
+//! recover the page. The test also checks escaping after a template rebuild;
 //! the repository itself is never modified.
 //!
 //! Edit-to-response latency is measured from the moment the edited file has
@@ -269,6 +271,37 @@ test "devloop: demo rebuilds, restarts, and recovers from a compile failure" {
     }
     try testing.expectEqual(@as(usize, edits + 3), log.count("[watch] started pid "));
 
+    // An invalid embedded-template edit (the file is absent) must produce
+    // compiler diagnostics without replacing the last working server.
+    try tmp.dir.deleteFile(io, "src/page.html");
+    const missing_template = Io.Clock.Timestamp.now(io, .awake);
+    while (log.count("[watch] build failed; keeping previous process") < 2) {
+        if (elapsedMs(io, missing_template) > step_timeout_ms) return error.TemplateFailureNotReported;
+        try Io.sleep(io, .fromMilliseconds(response_poll_ms), .awake);
+    }
+    try testing.expect(log.count("page.html") > 0);
+    try testing.expect(log.count("error:") >= 2);
+    const served_during_failure = (try getPath(io, &address, "/page?name=%3Czig%3E")) orelse return error.ServerDownAfterTemplateFailure;
+    defer testing.allocator.free(served_during_failure);
+    try testing.expect(std.mem.indexOf(u8, served_during_failure, "Greetings, &lt;zig&gt;") != null);
+    try testing.expectEqual(@as(usize, edits + 3), log.count("[watch] started pid "));
+
+    // A valid template edit after the failed build must rebuild and serve
+    // the new page, with the same HTML escaping.
+    const recovered_page = try std.mem.replaceOwned(u8, testing.allocator, page, "Hello, {{name}}", "Welcome, {{name}}");
+    defer testing.allocator.free(recovered_page);
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/page.html", .data = recovered_page });
+    const template_recovery = Io.Clock.Timestamp.now(io, .awake);
+    while (true) {
+        if (try getPath(io, &address, "/page?name=%3Czig%3E")) |got| {
+            defer testing.allocator.free(got);
+            if (std.mem.indexOf(u8, got, "Welcome, &lt;zig&gt;") != null) break;
+        }
+        if (elapsedMs(io, template_recovery) > step_timeout_ms) return error.TemplateRecoveryTimedOut;
+        try Io.sleep(io, .fromMilliseconds(response_poll_ms), .awake);
+    }
+    try testing.expectEqual(@as(usize, edits + 4), log.count("[watch] started pid "));
+
     // Stopping the watcher stops and reaps the demo; the port is released.
     stop.store(true, .release);
     task.await(io);
@@ -280,7 +313,7 @@ test "devloop: demo rebuilds, restarts, and recovers from a compile failure" {
     try testing.expectError(error.ProcessNotFound, std.posix.kill(last_pid, @enumFromInt(0)));
     try testing.expectEqual(@as(?[]u8, null), try get(io, &address));
 
-    var builds: [edits + 3]i64 = undefined;
+    var builds: [edits + 4]i64 = undefined;
     try testing.expectEqual(builds.len, try log.startDurations(&builds));
     var sorted = samples;
     std.mem.sort(i64, &sorted, {}, lessThan);

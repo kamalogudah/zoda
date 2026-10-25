@@ -50,6 +50,9 @@ zig build watch -- serve 9000   # arguments after -- go to the demo
 The watcher checks `src/`, `build.zig`, and `build.zig.zon` for changes
 several times a second, then runs `zig build`.
 Embedded template edits under `src/` follow the same rebuild loop.
+If an embedded template file is missing, Zig reports the build error and the
+watcher keeps serving the last working page. Restoring the file starts a new
+build and serves the updated page.
 
 - **Build fails:** it prints the compiler diagnostics and keeps the last
   working server running.
