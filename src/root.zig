@@ -39,10 +39,15 @@ pub const static = @import("static.zig");
 pub const plugins = struct {
     /// Stateless JSON response plugin (ADR-0001 §5.3).
     pub const json = @import("plugins/json.zig");
+    /// Configured route-miss fallback (ADR-0001 §3.3).
+    pub const not_found = @import("plugins/not_found.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
 pub const Json = plugins.json.Json;
+
+/// Re-export the not-found wrapper instance type for convenience.
+pub const NotFound = plugins.not_found.NotFound;
 
 comptime {
     // Collect the imported modules' test declarations into the library test
@@ -57,11 +62,13 @@ comptime {
     std.testing.refAllDecls(timing);
     std.testing.refAllDecls(static);
     std.testing.refAllDecls(plugins.json);
+    std.testing.refAllDecls(plugins.not_found);
 }
 
 test {
     // Adversarial real-socket suite (Phase 2b); not part of the public API.
     _ = @import("hardening.zig");
+    _ = @import("lifecycle.zig");
 }
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.

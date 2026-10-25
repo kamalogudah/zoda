@@ -342,6 +342,22 @@ defer app.deinit();
   propagate through the wrappers to middleware and `dispatch`.
 - A route passed to `route_fn` without `composeRoute` runs no wrappers.
 
+For a configured text fallback, add the built-in `NotFound` plugin. It writes
+only when the inner route leaves the response unhandled; a middleware short
+circuit that never reaches the route still receives dispatch's default 404.
+
+```zig
+const Plugins = struct { not_found: zoda.NotFound };
+const App = zoda.app.App(Plugins);
+
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{ .not_found = .{ .body = "No route matched" } },
+    .route_fn = App.composeRoute(route),
+});
+defer app.deinit();
+```
+
 ### Response timing
 
 `zoda.timing.middleware(App)` adds `X-Response-Time-Ms` (whole milliseconds,
