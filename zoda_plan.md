@@ -1525,11 +1525,49 @@ zig build test-devloop --summary all                 # 1/1
 
 Hosted CI: pending the first push of this change.
 
+### §4.2.13 Phase 3 custom not-found wrapper and lifecycle evidence — issue #27
+
+`src/plugins/not_found.zig` supplies `NotFound`, a configured plugin with a
+`wrapRoute` hook. Its `body` is copied into a 404 response only after the inner
+route and wrappers return unhandled. `src/root.zig` exports it as
+`zoda.NotFound` and `zoda.plugins.not_found.NotFound`; the README shows the
+public setup. Dispatch's default 404 still covers middleware short circuits
+that never call the terminal continuation.
+
+The acceptance tests in `src/lifecycle.zig` combine request parsing, request
+state initialization and teardown, two middleware entries, route wrappers,
+the route, fallback finalization, errors, recovery, and response lifetime.
+They assert the complete entry/exit trace `sabwRWBAS` on handled routes,
+custom misses, and recovery. Wrapper short circuits trace `sabwWBAS` and
+either return a 401 or reach the default 404 without running the inner wrapper
+or route. An unhandled middleware short circuit traces `sabBAS` and gets the
+default 404 without running any wrapper; middleware sees the custom 404 before
+unwinding. Tests also check configured app and plugin values, per-request
+state, error propagation, clearing of a partial response before replacement
+or default 404, and that a returned response survives request state, request
+arena, and app teardown.
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test --summary all                         # 152/152
+zig build test -Doptimize=ReleaseSafe --summary all
+zig build test-hardening -Doptimize=ReleaseSafe --summary all
+zig build test-devloop --summary all
+```
+
+Hosted CI: pending a push of this change; link the passing run before closing
+issue #27.
+
 ### Phase 3 — Route wrappers
 
 - [x] Compose wrappers with a comptime base route and typed context.
       (issue #26, §4.2.12)
-- [ ] Implement a custom not-found wrapper before the default 404 step.
+- [x] Implement a custom not-found wrapper before the default 404 step.
+      (issue #27, §4.2.13; hosted CI evidence pending)
 - **Exit:** entry/unwind ordering, short-circuiting, and error recovery match §3.3.
 
 ### Phase 3.5 — Templates
