@@ -1572,16 +1572,48 @@ issue #27.
 
 ### Phase 3.5 — Templates
 
-- [ ] Start with embedded templates and interpolation over typed data.
+- [x] Start with embedded templates and interpolation over typed data.
       Template edits use the Phase 2d rebuild loop.
-- [ ] Escape HTML text by default. Initially allow interpolation only in text
+- [x] Escape HTML text by default. Initially allow interpolation only in text
       nodes; reject attribute, script, style, and URL contexts. Raw trusted HTML
       requires a distinct explicit type/API; untrusted strings cannot opt in
       implicitly.
-- [ ] Return clear errors for missing fields or invalid templates.
+- [x] Return clear errors for missing fields or invalid templates.
 - **Exit:** render an HTML page and test escaping of special characters,
       hostile input, unsupported interpolation contexts, and rebuild behaviour.
       Runtime loading or multiple engines require a later scoped extension.
+
+Issue #28 implementation: [`src/template.zig`](src/template.zig) exposes
+`render` and the explicit `TrustedHtml` type. The demo embeds
+[`src/page.html`](src/page.html) and serves `/page?name=...`; the
+[`README`](README.md#embedded-html-templates) documents the API. Tests cover
+escaping, hostile input, unsupported contexts, missing fields, malformed
+templates, response limits, and failed-render preservation. The development
+loop test edits the template file and observes the rebuilt page.
+
+Issue [#29](https://github.com/kamalogudah/zoda/issues/29) verifies all five
+HTML escapes, hostile input, rejected attribute/URL/script/style/comment
+contexts, explicit trusted markup, missing fields, and invalid templates. The
+Phase 2d development-loop test now removes the embedded file in a temporary
+project, checks Zig's build diagnostic and the still-running previous page,
+then restores a valid edited template and checks escaped output after rebuild.
+Runtime loading or multiple engines remain conditional extensions; open a
+separately scoped issue if either becomes necessary.
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`):
+
+```sh
+zig version                                           # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test --summary all                          # 158/158
+zig build test -Doptimize=ReleaseSafe --summary all   # 158/158
+zig build test-hardening -Doptimize=ReleaseSafe --summary all # 10/10
+zig build test-load -Doptimize=ReleaseSafe --summary all # 2/2
+zig build test-devloop --summary all                  # 1/1
+```
+
+Hosted CI for issue #29: link the passing run before closing the issue.
 
 ### Phase 4 — Optional ergonomics
 

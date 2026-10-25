@@ -19,6 +19,10 @@ const Demo = app.App(Plugins);
 
 fn route(ctx: *Demo.Context, req: *router.Request, res: *response.Response) !void {
     if (req.isRoot() and req.isGet()) return res.text(200, "hello from zoda");
+    if (req.isLiteral("page") and req.isGet()) {
+        const name = (try req.getOne("name")) orelse "world";
+        return zoda.template.render(res, 200, @embedFile("page.html"), .{ .name = name });
+    }
     if (req.onLiteral("users")) {
         if (req.onSegment()) |id| {
             if (req.isRoot() and req.isGet()) {
@@ -58,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     const cases = .{
         .{ .method = router.Method.get, .path = "/" },
         .{ .method = router.Method.get, .path = "/users/42" },
+        .{ .method = router.Method.get, .path = "/page" },
         .{ .method = router.Method.get, .path = "/users" },
         .{ .method = router.Method.get, .path = "/users/42/extra" },
         .{ .method = router.Method.get, .path = "/users/42/" },
@@ -142,6 +147,17 @@ test "route demo outcomes" {
         try std.testing.expectEqual(@as(u16, 200), res.status_code);
         try std.testing.expectEqualStrings("text/plain", res.content_type);
         try std.testing.expectEqualStrings("hello from zoda", res.body);
+    }
+
+    {
+        var req_arena = try request.parseOriginForm(std.testing.allocator, .default, "/page?name=%3Cscript%3E%26%27");
+        defer req_arena.deinit();
+        var req = req_arena.requestView(.get);
+        var res = try demo_app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqual(@as(u16, 200), res.status_code);
+        try std.testing.expectEqualStrings("text/html; charset=utf-8", res.content_type);
+        try std.testing.expect(std.mem.indexOf(u8, res.body, "Hello, &lt;script&gt;&amp;&#39;") != null);
     }
 
     {
