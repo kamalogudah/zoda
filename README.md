@@ -193,6 +193,11 @@ consume path segments, and they never allocate.
 | `req.isGet()` / `req.method == .post` | Method checks. |
 | `req.mark()` / `req.restore(saved)` | Saves and rewinds the cursor to try another alternative. |
 
+For a dynamic segment, bind the returned slice locally, as the `/users/:id`
+route above does. It borrows request storage and is valid only while that
+request is alive. Named capture lookup is deferred pending a demonstrated
+routing need; see the [Phase 4 decision](zoda_plan.md#named-captures-decision-issue-30).
+
 Rules to follow:
 
 - A failed matcher leaves the cursor unchanged.

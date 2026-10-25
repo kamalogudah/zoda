@@ -1617,10 +1617,46 @@ Hosted CI for issue #29: link the passing run before closing the issue.
 
 ### Phase 4 — Optional ergonomics
 
-- [ ] Consider named captures if returned segment values prove insufficient.
+- [x] Evaluate named captures against demonstrated routes (issue
+      [#30](https://github.com/kamalogudah/zoda/issues/30)); defer the
+      addition. See the decision and evidence below.
 - [ ] Evaluate conveniences supported by the pinned compiler while keeping
       explicit registered-plugin access available.
 - **Exit:** additions preserve routing semantics and request lifetimes.
+
+#### Named captures decision (issue #30)
+
+**Outcome: no API change.** The implemented `GET /users/:id` route binds
+`id` directly from `req.onSegment()` in [`src/main.zig`](src/main.zig#L26) and
+[`src/server.zig`](src/server.zig#L28). The same pattern serves the JSON response
+in [`src/app.zig`](src/app.zig#L418), and [`README.md`](README.md#routing) shows it
+to callers. [`src/request.zig`](src/request.zig#L590) tests a parsed request's
+borrowed `id`; [`src/router.zig`](src/router.zig#L259) tests slice identity with
+segment storage, cursor movement, and checkpoint restoration. These are the
+current routing needs, and a local binding supplies the only requested name.
+No route needs to look up a capture after leaving its lexical scope.
+
+A named-capture store would add state to synchronize with `mark`/`restore`,
+including failed and nested alternatives, while offering no demonstrated
+benefit to these routes. `onSegment()` stays allocation-free and returns a
+slice borrowed from the request arena. The route must use that slice before
+the request is destroyed; copying it into a longer-lived value is the
+caller's explicit responsibility. The existing cursor and lifetime contracts
+in §3.1 and §3.4 remain in force.
+
+Reopen this decision when a concrete route cannot conveniently pass returned
+segments through local bindings or function arguments. Before implementing,
+open a separate scoped issue linked to [#30](https://github.com/kamalogudah/zoda/issues/30)
+and the [roadmap #38](https://github.com/kamalogudah/zoda/issues/38).
+That issue must define lookup and duplicate-name behavior, how captures are
+restored across failed and nested alternatives, allocation ownership and
+failure behavior, and request-lifetime rules. Tests must cover those cases
+and existing cursor semantics before the implementation issue closes.
+
+Decision-only validation on pinned Zig `0.16.0`:
+`zig version` → `0.16.0`; `zig build test --summary all` → 158/158 passed;
+`git diff --check` → clean. No implementation or test changed, so this
+decision does not require a new hosted CI run.
 
 ### Phase 5 — More plugins
 
@@ -1812,7 +1848,11 @@ Remaining decisions have explicit gates:
 - ~~HTTP/2 support~~ — resolved in Phase 2c as HTTP/1.1-only: the pinned
   `std.http` has no HTTP/2 server (issue #19, §4.2.6). HTTP/2 stays
   unsupported until a reopening condition there is met.
-- Named capture convenience: Phase 4, based on demonstrated need.
+- ~~Named capture convenience~~ — Phase 4 decision: deferred for lack of a
+  demonstrated need (issue [#30](https://github.com/kamalogudah/zoda/issues/30),
+  §4 Phase 4). Open a scoped implementation issue linked to roadmap
+  [#38](https://github.com/kamalogudah/zoda/issues/38) if a concrete route
+  needs it.
 
 Plugin state access, ownership, branch termination, middleware ordering, and
 buffering are decisions above, not questions deferred until sessions.
