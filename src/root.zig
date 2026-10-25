@@ -26,6 +26,10 @@ pub const server = @import("server.zig");
 /// Application dispatch and typed handler context (ADR-0001 §3.2, §5.2).
 pub const app = @import("app.zig");
 
+/// Injected application clock and response-timing middleware
+/// (ADR-0001 §5.4).
+pub const timing = @import("timing.zig");
+
 /// Built-in plugins.
 pub const plugins = struct {
     /// Stateless JSON response plugin (ADR-0001 §5.3).
@@ -45,6 +49,7 @@ comptime {
     std.testing.refAllDecls(transport);
     std.testing.refAllDecls(server);
     std.testing.refAllDecls(app);
+    std.testing.refAllDecls(timing);
     std.testing.refAllDecls(plugins.json);
 }
 

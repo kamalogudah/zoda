@@ -79,12 +79,15 @@ pub fn main(init: std.process.Init) !void {
 fn serve(io: Io, stdout_writer: *Io.Writer, port: u16) !void {
     // Connection tasks share this allocator concurrently (PLATFORM.md §5).
     const gpa = std.heap.smp_allocator;
-    const demo_app = Demo{
+    // Timing is registered first so it is outermost and times the whole chain.
+    var demo_app = try Demo.init(gpa, .{
         .response_allocator = gpa,
-        .config = .{ .name = "demo" },
+        .config = .{ .name = "demo", .clock = .monotonic(io) },
         .plugins = .{},
         .route_fn = route,
-    };
+        .middleware = &.{zoda.timing.middleware(Demo)},
+    });
+    defer demo_app.deinit();
 
     const address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
     var listener = try address.listen(io, .{ .reuse_address = true });

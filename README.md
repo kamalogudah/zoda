@@ -54,7 +54,8 @@ several times a second, then runs `zig build`.
 - **Build succeeds:** it stops the old server (SIGTERM, then SIGKILL after
   5 s) and starts the new one.
 
-Press Ctrl-C to stop both. Edit-to-response time measured 1.4–1.9 s on a
+The demo server adds an `X-Response-Time-Ms` header to each response
+(see [Response timing](#response-timing)). Press Ctrl-C to stop both. Edit-to-response time measured 1.4–1.9 s on a
 4-core laptop (`zig build test-devloop` repeats the measurement on your
 machine and checks failed-build recovery). The watcher supports Linux only. You can also run the demo server
 directly with `./zig-out/bin/zoda serve [port]`.
@@ -290,6 +291,37 @@ defer app.deinit();
 - Do not store `next`, return it, or call it after your function returns or
   from another thread. Zig cannot check this for you, and the tests do not
   make an escaped `next` safe: they cover only the supported uses above.
+
+### Response timing
+
+`zoda.timing.middleware(App)` adds `X-Response-Time-Ms` (whole milliseconds,
+truncated) to every response that completes without an error. It reads the
+application clock from `config.clock`:
+
+```zig
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    // CLOCK_MONOTONIC on Linux, read through the app's `std.Io`.
+    .config = .{ .clock = .monotonic(io) },
+    .plugins = .{},
+    .route_fn = route,
+    // Register timing first so it also times the other middleware.
+    .middleware = &.{ zoda.timing.middleware(App), .{ .config = &api_key, .invoke = requireKey } },
+});
+defer app.deinit();
+```
+
+- Routed responses, short circuits, and the default 404 are all timed. If
+  `next.call` returns an error, the header is not added and the error
+  propagates.
+- The value is copied into the response, so it stays valid after the request
+  is released.
+- If `config.clock` is `null`, every request fails with
+  `error.ClockNotConfigured` before downstream code runs.
+- For deterministic tests, inject a clock with
+  `.{ .source = .{ .context = &fake, .now = readFake } }`, where `readFake`
+  returns a `std.Io.Timestamp`. A clock read by concurrent requests must be
+  thread-safe; `.monotonic(io)` is.
 
 ### Dispatching without sockets
 
