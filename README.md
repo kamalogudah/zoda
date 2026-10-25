@@ -58,7 +58,8 @@ The demo server adds an `X-Response-Time-Ms` header to each response
 (see [Response timing](#response-timing)). Press Ctrl-C to stop both. Edit-to-response time measured 1.4–1.9 s on a
 4-core laptop (`zig build test-devloop` repeats the measurement on your
 machine and checks failed-build recovery). The watcher supports Linux only. You can also run the demo server
-directly with `./zig-out/bin/zoda serve [port]`.
+directly with `./zig-out/bin/zoda serve [port] [docroot]`; with a
+`docroot`, it also serves [static files](#static-files) from that directory.
 
 ## Using Zoda in your project
 
@@ -322,6 +323,57 @@ defer app.deinit();
   `.{ .source = .{ .context = &fake, .now = readFake } }`, where `readFake`
   returns a `std.Io.Timestamp`. A clock read by concurrent requests must be
   thread-safe; `.monotonic(io)` is.
+
+### Static files
+
+`zoda.static.middleware(App, &config)` serves `GET` and `HEAD` requests for
+regular files beneath a document-root directory handle that you open and own:
+
+```zig
+const public = try std.Io.Dir.cwd().openDir(io, "public", .{});
+defer public.close(io); // after app.deinit()
+// Fails with error.ConfinementUnavailable where requests would fail closed.
+try zoda.static.checkSupport(public);
+
+const static_config: zoda.static.Config = .{
+    .root = public,
+    .prefix = &.{"assets"}, // GET /assets/app.css -> public/app.css
+};
+
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .config = .{ .clock = .monotonic(io) },
+    .plugins = .{},
+    .route_fn = route,
+    // Static first: hits skip timing and the route; everything else is timed.
+    // Put timing first instead to time static hits too.
+    .middleware = &.{ zoda.static.middleware(App, &static_config), zoda.timing.middleware(App) },
+});
+defer app.deinit();
+```
+
+- A hit writes a 200 with a content type chosen by extension and
+  `X-Content-Type-Options: nosniff`, and does not call `next`, so the route
+  never runs. Everything else calls `next` with the request unchanged: other
+  methods, paths outside the prefix, missing files, directories, symlinks,
+  dotfiles, and special files such as FIFOs.
+- Files are opened with Linux `openat2` and
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, so the kernel refuses `..` escapes,
+  absolute paths, and symlinks in any path component in the same call that
+  opens the file. There is no check-then-open race. Encoded traversal such as
+  `%2e%2e` or `..%2F` is rejected earlier, by the request parser, with 400.
+- Directory listing is not implemented, and directories are never served.
+  There is no index-file lookup.
+- Dotfiles (`.env`, `.git/…`) are hidden unless `allow_dotfiles = true`.
+- Files are buffered. A file larger than `max_file_bytes` or the 1 MiB
+  response limit fails with `error.BodyTooLarge`, which the transport answers
+  with a generic 500. Treat that as a configuration error.
+- **Platform support:** Linux 5.6 or later. On other systems, or where
+  `openat2` is missing or blocked (for example by a seccomp filter), requests
+  fail with `error.ConfinementUnavailable` instead of opening files without
+  confinement. Run `checkSupport` at startup to find out early.
+- A hard link inside the root to a file outside it is served like any other
+  file. Keep the document root read-only to the server process.
 
 ### Dispatching without sockets
 

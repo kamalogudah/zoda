@@ -1127,10 +1127,11 @@ zig build test-devloop --summary all                 # 1/1, 3 consecutive runs, 
       verified in issue #23, §4.2.9)
 - [x] Add response timing using a monotonic clock and a copying header helper.
       (issue #24, §4.2.10)
-- [ ] Add static-file middleware with a configured document-root handle.
+- [x] Add static-file middleware with a configured document-root handle.
       Reject traversal and symlinks; resolve beneath the root without a
       check-then-open race using supported platform primitives. Fail closed
       where confinement cannot be guaranteed. No directory listing by default.
+      (issue #25, §4.2.11)
 - **Exit:** static requests skip routing, other responses receive timing headers,
       and tests cover encoded traversal, symlinks, and paths outside the root.
 
@@ -1325,6 +1326,125 @@ zig build
 zig build test --summary all                         # 127/127 (118 library + 3 exe + 6 watcher), 3 consecutive runs
 zig build test -Doptimize=ReleaseSafe --summary all  # 127/127
 zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+./zig-out/bin/zoda
+```
+
+Hosted CI: pending the first push of this change.
+
+### §4.2.11 Phase 2e static-file evidence — issue #25
+
+Implements the static-file item of Phase 2e and the §5.4 note in
+`src/static.zig`, exported as `zoda.static`. With it, every Phase 2e item and
+the exit criterion are met.
+
+API as implemented:
+
+- `zoda.static.Config { root: Io.Dir, prefix, allow_dotfiles = false,
+  max_file_bytes }`. The root is a caller-owned directory handle. Like every
+  middleware configuration, the struct is borrowed, immutable, and must stay
+  valid until `app.deinit()`. The middleware never closes the handle.
+- `zoda.static.middleware(App, &config)` returns an `App.Middleware`. For
+  `GET` and `HEAD`, when the remaining segments start with `prefix` and name a
+  regular file, it writes a 200 and returns without calling `next`, so the
+  route never runs. Every other request calls `next.call` with the request and
+  cursor unchanged.
+- A hit reads the file into one response-owned buffer and hands it to the new
+  `Response.replaceOwnedBody` (no second copy). The content type comes from a
+  fixed extension table, defaulting to `application/octet-stream`, and
+  `X-Content-Type-Options: nosniff` is added.
+- `openBeneath(root, path)` is the confinement primitive. `checkSupport(root)`
+  runs the same probe at startup. The demo server takes an optional third
+  argument, `zoda serve [port] [docroot]`, and calls `checkSupport` before
+  listening.
+
+Confinement:
+
+- Files are opened with Linux `openat2(2)` (raw syscall; the pinned std has no
+  wrapper) relative to the root handle, with `RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` and `O_RDONLY | O_CLOEXEC |
+  O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`. The kernel resolves the whole path in
+  the call that opens it: `..` escapes and absolute paths fail with `EXDEV`,
+  and a symlink in any component, including the last, fails with `ELOOP`. No
+  path is checked before the open, so nothing can change between a check and
+  the open. The file type and size come from `statx` on the opened descriptor.
+- Before the kernel sees a path, the middleware rejects empty segments, `.`,
+  `..`, segments containing `/`, `\`, or NUL, and (by default) segments
+  starting with `.`. The request parser already rejects most of these
+  (§3.4); the middleware repeats the check so it does not rely on the parser.
+  Confinement does not rely on either check; the kernel enforces it.
+- Fail closed: `ENOSYS`, `EPERM`, `EINVAL`, `E2BIG`, and `EOPNOTSUPP` from
+  `openat2` become `error.ConfinementUnavailable`, and every non-Linux target
+  returns that error without opening anything. There is no unconfined
+  fallback. The pinned std's `Io.Dir.OpenOptions.resolve_beneath` was
+  considered and rejected: on Linux it only sets `posix.O.RESOLVE_BENEATH`
+  when that field exists, which it does not, so it is silently ignored.
+- Directory listing is not implemented. Directories, FIFOs, devices, and
+  sockets are misses. `O_NONBLOCK` keeps a FIFO from blocking the open.
+- Buffered limits: a file larger than `min(max_file_bytes,
+  res.limits.max_body_bytes)` fails with `error.BodyTooLarge` before any body
+  is allocated. At most the `statx` size is read, so a file that grows during
+  the read cannot raise memory use. A file that shrinks is served at its
+  shorter length.
+- Not covered: a hard link inside the root to a file outside it is an
+  ordinary file and is served. Creating one needs write access to the root;
+  deployments should keep the root read-only to the server.
+
+Platform support is recorded in [PLATFORM.md](PLATFORM.md) §2: Linux 5.6+
+(`x86_64-linux-gnu` primary, CI on `ubuntu-latest`). Other targets fail closed.
+
+Tests in `src/static.zig` (a temporary tree with files inside and outside the
+root, symlinks, dotfiles, and a FIFO):
+
+| Test | Shows |
+|---|---|
+| confinement is available on the CI platform | `checkSupport` passes on the root and returns `error.NotDir` for a file handle. |
+| ordinary hits are served with content types and skip routing | `.txt`, `.html`, `.css`, `.bin`, empty, nested `.json`, and a percent-encoded name are served with the right content type and `nosniff`. The route never runs. `HEAD` gets the representation. |
+| misses call next with the request unchanged | Missing files, a file used as a directory, paths outside the prefix, the bare prefix, empty and trailing segments, and `POST`/`PUT`/`DELETE`/`OPTIONS` reach the route with the cursor at 0 and end in 404. The route still answers its own path. |
+| directories are never listed or served | `/`, `/sub`, `/sub/` reach the route and 404. |
+| symlinks are rejected in every component, inside or outside the root | Final-component links to a file inside, outside, and an absolute target, and directory-component links outside and inside, are all misses. `openBeneath` reports `.symlink` for each, so the kernel refused them. |
+| encoded traversal never reaches the file system | `..`, `%2e%2e`, `%2E%2E`, `.%2e`, nested `%2e%2e`, `..%2F`, `%2e%2e%2f`, `..%5C`, raw `\`, `%00`, and `%2F` are rejected by the parser (`DotSegment` / `ForbiddenPathCharacter`). `%252e%252e` decodes once to a literal name and misses. Hand-built segments that bypass the parser (`..`, `../x`, `sub/../../x`, `/etc/passwd`, `\`, NUL, `.`, empty) are rejected by the middleware. |
+| paths outside the root are refused by the kernel | Raw paths given straight to `openBeneath` (`../secret.txt`, `sub/../../secret.txt`, `/etc/passwd`, …) return `.escape`. `sub/../hello.txt`, which stays beneath the root, opens. |
+| dotfiles are hidden by default and opt-in | `.env` and `.hidden/a.txt` miss by default; with `allow_dotfiles` the latter is served. |
+| special files are not opened or served | A FIFO with no writer is a miss and does not block. |
+| buffered limits: at-limit files are served and larger files fail | With `max_file_bytes = 5`, a 5-byte file is served and a 9-byte file fails with `error.BodyTooLarge`. With no configuration, a file of exactly 1 MiB is served and 1 MiB + 1 fails. |
+| descriptors and buffers are released on hits, misses, and errors | 200 rounds of hits, misses, directories, symlinks, a FIFO, and `BodyTooLarge` leave the lowest free descriptor unchanged. The testing allocator finds no leaked buffers. |
+| a concurrent symlink swap never redirects an open outside the root | A thread atomically exchanges (`renameat2(RENAME_EXCHANGE)`) a real directory and a symlink to an outside directory holding a same-named secret file, while at least 2,000 requests alternate between both names. The secret is never served, the real directory is served in between, and swaps did happen. |
+| unavailable or unenforceable confinement fails closed | The errno mapping turns `ENOSYS`, `EPERM`, `EINVAL`, `E2BIG`, and `EOPNOTSUPP` into `error.ConfinementUnavailable`. |
+| content types fall back to octet-stream | Extension matching ignores case; unknown and missing extensions get `application/octet-stream`. |
+| configured ordering decides which responses are timed | With `[static, timing]`, a static hit has no `X-Response-Time-Ms` and skips the route, while a routed 200 and the default 404 both get it. With `[timing, static]`, the static hit is timed too. |
+
+`src/response.zig` adds "replaceOwnedBody takes ownership only on success":
+an oversized body or a content type with CR/LF is rejected and leaves the
+previous response and the caller's ownership unchanged; on success the
+response owns the exact buffer.
+
+Mutation check (seeded locally and reverted, not committed):
+
+| Defect | Failing tests |
+|---|---|
+| `RESOLVE_NO_SYMLINKS` dropped | the symlink test |
+| `RESOLVE_BENEATH` dropped | the kernel-refusal test |
+| A check-then-open implementation: `statx(AT_SYMLINK_NOFOLLOW)` on each component, refusing `..` and symlinks, then a plain `openat` | the concurrent-swap test (3/3 runs) and the kernel-refusal test. Every static symlink test still passed, which is why the race test exists. |
+| Descriptor never closed | the cleanup test |
+| Segment validation skipped | the dotfile and encoded-traversal tests. The kernel still refused every escape. |
+
+Manual check: `./zig-out/bin/zoda serve 9139 <dir>` with `site.css` and a
+`leak.txt -> ../secret.txt` symlink. `curl -i` returned `/site.css` as 200
+`text/css; charset=utf-8` with `nosniff` and no timing header. `/`, `/users/42`,
+and `/nope` returned 200, 200, and 404 with `X-Response-Time-Ms`. `/leak.txt`
+returned 404. With `curl --path-as-is`, `/../secret.txt`, `/%2e%2e/secret.txt`,
+and `/%2E%2E%2Fsecret.txt` returned 400.
+
+Validation on pinned Zig `0.16.0` (`x86_64-linux-gnu`, kernel 7.0.0-38-generic):
+
+```sh
+zig version                                          # 0.16.0
+zig fmt --check build.zig src
+zig build
+zig build test --summary all                         # 143/143 (134 library + 3 exe + 6 watcher), 3 consecutive runs
+zig build test -Doptimize=ReleaseSafe --summary all  # 143/143
+zig build test-hardening -Doptimize=ReleaseSafe --summary all   # 10/10
+zig build test-devloop --summary all                 # 1/1, no leftover processes
 ./zig-out/bin/zoda
 ```
 
@@ -1526,7 +1646,8 @@ fn timing(
 The clock is an injected application interface implemented against the pinned
 toolchain (`AppConfig.clock: ?Clock`, `Clock.monotonic(io)` over
 `Io.Clock.awake`; implemented as `zoda.timing.middleware(App)`, §4.2.10). Static-file middleware uses its configuration pointer for the
-document-root handle and calls `next.call` only when it does not serve the path.
+document-root handle and calls `next.call` only when it does not serve the path
+(implemented as `zoda.static.middleware(App, &config)`, §4.2.11).
 
 ## 6. Verification and remaining decisions
 

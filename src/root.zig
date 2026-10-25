@@ -30,6 +30,10 @@ pub const app = @import("app.zig");
 /// (ADR-0001 §5.4).
 pub const timing = @import("timing.zig");
 
+/// Static-file middleware with kernel-enforced document-root confinement
+/// (ADR-0001 §5.4).
+pub const static = @import("static.zig");
+
 /// Built-in plugins.
 pub const plugins = struct {
     /// Stateless JSON response plugin (ADR-0001 §5.3).
@@ -50,6 +54,7 @@ comptime {
     std.testing.refAllDecls(server);
     std.testing.refAllDecls(app);
     std.testing.refAllDecls(timing);
+    std.testing.refAllDecls(static);
     std.testing.refAllDecls(plugins.json);
 }
 
