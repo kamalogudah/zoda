@@ -4,7 +4,8 @@
 //! directory and runs `watch.Watcher` there with the real build command
 //! (`<zig> build`, the compiler that ran `zig build test-devloop`) and the real
 //! demo (`zig-out/bin/zoda serve <port>`). Edits rewrite the `GET /` body in
-//! the copied `src/main.zig`; the repository itself is never modified.
+//! the copied `src/main.zig` and later edit the embedded `src/page.html`;
+//! the repository itself is never modified.
 //!
 //! Edit-to-response latency is measured from the moment the edited file has
 //! been written until `GET /` first returns the new body, polling every 10 ms.
@@ -125,12 +126,18 @@ fn writeRoute(io: Io, dir: Io.Dir, original: []const u8, body: []const u8, broke
 
 /// One `GET /`; null while the server is down or restarting.
 fn get(io: Io, address: *const net.IpAddress) !?[]u8 {
+    return getPath(io, address, "/");
+}
+
+fn getPath(io: Io, address: *const net.IpAddress, path: []const u8) !?[]u8 {
     var client = hardening.Client.connect(io, address) catch |err| switch (err) {
         error.ConnectionRefused => return null,
         else => return err,
     };
     defer client.close();
-    client.send("GET / HTTP/1.1\r\nHost: devloop\r\nConnection: close\r\n\r\n") catch return null;
+    const request_line = try std.fmt.allocPrint(testing.allocator, "GET {s} HTTP/1.1\r\nHost: devloop\r\nConnection: close\r\n\r\n", .{path});
+    defer testing.allocator.free(request_line);
+    client.send(request_line) catch return null;
     const reply = client.readResponse(false) catch return null;
     if (reply.status != 200) {
         reply.deinit();
@@ -244,6 +251,24 @@ test "devloop: demo rebuilds, restarts, and recovers from a compile failure" {
     try testing.expectEqual(@as(usize, edits + 2), log.count("[watch] started pid "));
     try testing.expectEqual(@as(usize, edits + 1), log.count("[watch] stopped pid "));
 
+    // Editing an embedded template under src/ rebuilds the served page.
+    const page = try tmp.dir.readFileAlloc(io, "src/page.html", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(page);
+    const edited_page = try std.mem.replaceOwned(u8, testing.allocator, page, "Hello, {{name}}", "Greetings, {{name}}");
+    defer testing.allocator.free(edited_page);
+    try testing.expect(!std.mem.eql(u8, page, edited_page));
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/page.html", .data = edited_page });
+    const template_edit = Io.Clock.Timestamp.now(io, .awake);
+    while (true) {
+        if (try getPath(io, &address, "/page?name=%3Czig%3E")) |got| {
+            defer testing.allocator.free(got);
+            if (std.mem.indexOf(u8, got, "Greetings, &lt;zig&gt;") != null) break;
+        }
+        if (elapsedMs(io, template_edit) > step_timeout_ms) return error.TemplateEditTimedOut;
+        try Io.sleep(io, .fromMilliseconds(response_poll_ms), .awake);
+    }
+    try testing.expectEqual(@as(usize, edits + 3), log.count("[watch] started pid "));
+
     // Stopping the watcher stops and reaps the demo; the port is released.
     stop.store(true, .release);
     task.await(io);
@@ -255,7 +280,7 @@ test "devloop: demo rebuilds, restarts, and recovers from a compile failure" {
     try testing.expectError(error.ProcessNotFound, std.posix.kill(last_pid, @enumFromInt(0)));
     try testing.expectEqual(@as(?[]u8, null), try get(io, &address));
 
-    var builds: [edits + 2]i64 = undefined;
+    var builds: [edits + 3]i64 = undefined;
     try testing.expectEqual(builds.len, try log.startDurations(&builds));
     var sorted = samples;
     std.mem.sort(i64, &sorted, {}, lessThan);

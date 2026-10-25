@@ -6,7 +6,7 @@ imperative code, and you extend a small core with plugins that you register
 explicitly. It targets JSON APIs and server-rendered sites.
 
 > **Status:** early development. The router, app dispatch, buffered
-> responses, JSON plugin, and a hardened HTTP/1.1 socket server are
+> responses, JSON plugin, embedded HTML templates, and a hardened HTTP/1.1 socket server are
 > implemented and tested. The roadmap is in [`zoda_plan.md`](zoda_plan.md).
 
 ## Requirements
@@ -33,6 +33,7 @@ The demo dispatches a few requests in memory and prints the outcomes:
 ```text
 get / -> 200 text/plain
 get /users/42 -> 200 application/json
+get /page -> 200 text/html; charset=utf-8
 get /users -> 404 text/plain
 get /users/42/extra -> 404 text/plain
 get /users/42/ -> 404 text/plain
@@ -48,6 +49,7 @@ zig build watch -- serve 9000   # arguments after -- go to the demo
 
 The watcher checks `src/`, `build.zig`, and `build.zig.zon` for changes
 several times a second, then runs `zig build`.
+Embedded template edits under `src/` follow the same rebuild loop.
 
 - **Build fails:** it prints the compiler diagnostics and keeps the last
   working server running.
@@ -145,6 +147,34 @@ HTTP/1.1 404 Not Found
 $ curl 'localhost:8080/search?q=zig+lang'
 zig lang
 ```
+
+### Embedded HTML templates
+
+Use `@embedFile` to include a template at build time. Field names refer to
+fields of a Zig struct. Ordinary `{{field}}` interpolation escapes `&`, `<`,
+`>`, double quotes, and apostrophes as HTML text. Rendering uses the response
+allocator and respects its body size limit.
+
+```zig
+if (req.isLiteral("page") and req.isGet()) {
+    const name = (try req.getOne("name")) orelse "world";
+    return zoda.template.render(res, 200, @embedFile("page.html"), .{ .name = name });
+}
+```
+
+For reviewed markup, `{{{field}}}` accepts only
+`zoda.template.TrustedHtml.fromTrusted(html)`. Passing an ordinary string to
+triple braces returns `error.UntrustedRawHtml`. Use this explicit API only for
+static or sanitized HTML.
+
+Interpolation is limited to HTML text nodes. Placeholders in tags and
+attributes (including URLs), comments, `<script>`, or `<style>` return
+`error.UnsupportedContext`. Missing fields return `error.MissingField`;
+malformed placeholders or HTML tags return `error.InvalidTemplate`. Runtime
+file loading and other template engines are later extensions.
+
+The demo serves [`src/page.html`](src/page.html) at `/page?name=...`. The
+development watcher rebuilds when that file changes.
 
 ### Routing
 

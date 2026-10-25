@@ -14,6 +14,9 @@ pub const request = @import("request.zig");
 /// (ADR-0001 §3.4, §3.5).
 pub const response = @import("response.zig");
 
+/// Embedded HTML templates with typed text interpolation (ADR-0001 Phase 3.5).
+pub const template = @import("template.zig");
+
 /// Bounded buffering and protocol error mappings (ADR-0001 §3.4).
 pub const buffering = @import("buffering.zig");
 
@@ -55,6 +58,7 @@ comptime {
     std.testing.refAllDecls(router);
     std.testing.refAllDecls(request);
     std.testing.refAllDecls(response);
+    std.testing.refAllDecls(template);
     std.testing.refAllDecls(buffering);
     std.testing.refAllDecls(transport);
     std.testing.refAllDecls(server);
