@@ -197,6 +197,8 @@ For a dynamic segment, bind the returned slice locally, as the `/users/:id`
 route above does. It borrows request storage and is valid only while that
 request is alive. Named capture lookup is deferred pending a demonstrated
 routing need; see the [Phase 4 decision](zoda_plan.md#named-captures-decision-issue-30).
+An additional route DSL is deferred; see the
+[compiler-supported conveniences decision](zoda_plan.md#compiler-supported-conveniences-decision-issue-31).
 
 Rules to follow:
 
@@ -272,6 +274,8 @@ const Plugins = struct {
 - `deinitRequest` cannot fail and must not write a response.
 - Plugin instances are immutable during dispatch. Any shared mutable resource
   they reference must do its own synchronization.
+- Call plugin methods through `ctx.plugins.<name>` so the registered instance
+  stays explicit. See the [Phase 4 decision](zoda_plan.md#compiler-supported-conveniences-decision-issue-31).
 
 ### Middleware
 

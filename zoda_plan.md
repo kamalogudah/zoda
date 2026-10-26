@@ -1620,8 +1620,10 @@ Hosted CI for issue #29: link the passing run before closing the issue.
 - [x] Evaluate named captures against demonstrated routes (issue
       [#30](https://github.com/kamalogudah/zoda/issues/30)); defer the
       addition. See the decision and evidence below.
-- [ ] Evaluate conveniences supported by the pinned compiler while keeping
-      explicit registered-plugin access available.
+- [x] Evaluate conveniences supported by the pinned compiler while keeping
+      explicit registered-plugin access available (issue
+      [#31](https://github.com/kamalogudah/zoda/issues/31)); retain the
+      current API. See the decision below.
 - **Exit:** additions preserve routing semantics and request lifetimes.
 
 #### Named captures decision (issue #30)
@@ -1657,6 +1659,49 @@ Decision-only validation on pinned Zig `0.16.0`:
 `zig version` → `0.16.0`; `zig build test --summary all` → 158/158 passed;
 `git diff --check` → clean. No implementation or test changed, so this
 decision does not require a new hosted CI run.
+
+#### Compiler-supported conveniences decision (issue #31)
+
+**Outcome: no new API or implementation issue.** On pinned Zig `0.16.0`,
+[`App(Plugins)`](src/app.zig) already uses comptime reflection to generate
+per-request state and dispatch hooks by registered field name. Its typed
+`Context` exposes `ctx.plugins.<name>` and `ctx.state.<name>`. The
+[`JSON route`](src/main.zig) and [`server route`](src/server.zig) compile and
+call the registered JSON instance directly; the [README server example](README.md#a-complete-server)
+shows the same public API. The optional `App.composeRoute` hook is the
+compiler-supported convenience already accepted in issue
+[#26](https://github.com/kamalogudah/zoda/issues/26), with composition,
+ordering, short-circuit, and error tests in [`src/app.zig`](src/app.zig).
+It retains access to each configured instance through `H.plugin(ctx)`.
+
+| Candidate | Decision and evidence |
+|---|---|
+| Inject plugin methods into the handler namespace or generate unqualified forwarding methods | Reject. Zig `0.16.0` rejects `pub usingnamespace Mix;` in a struct (probe below). Generated forwarding methods could still be written, but the registered instance and its configuration would be less visible at the call site, and method names from two plugins could collide. `ctx.plugins.json.render(...)` is short and already used by working routes. Keep explicit instance access as the contract in §3.2. |
+| Implicitly compose every registered route wrapper | Reject. `App.composeRoute(route)` is a compile-time, opt-in operation; [`src/app.zig`](src/app.zig) tests composition, while `route_fn` also accepts the base route directly. Making registration silently change `route_fn` would change existing dispatch behavior. |
+| Automatic branch termination | Reject. A successful prefix consumes routing state, and the handler explicitly returns from the branch, including on a miss. Inserting generated control flow would change this contract; [`src/router.zig`](src/router.zig) tests why the explicit return is needed to prevent fallthrough after `/users`. |
+| Route DSL or generated capture store | Defer pending a concrete route that needs either. The [`/users/:id` route](src/main.zig) needs only a local borrowed slice. [`src/router.zig`](src/router.zig) tests failed matches and `mark`/`restore`; either addition would need to preserve cursor, committed-branch, and request-lifetime behavior. The named-capture decision is [#30](https://github.com/kamalogudah/zoda/issues/30). |
+
+No new addition was accepted, so there is no implementation or regression-test
+issue to open for #31. If a concrete application later needs one of these
+conveniences, open a scoped implementation and test issue linked to
+[#31](https://github.com/kamalogudah/zoda/issues/31) and the
+[roadmap #38](https://github.com/kamalogudah/zoda/issues/38) before changing
+the API. Specify the compiler feature, collision rules, compatibility with
+explicit instance access, routing cursor behavior, and borrowed lifetimes.
+Phase 5's required typed segment matchers and plugins remain separately scoped
+in [#32](https://github.com/kamalogudah/zoda/issues/32),
+[#33](https://github.com/kamalogudah/zoda/issues/33), and
+[#34](https://github.com/kamalogudah/zoda/issues/34); this optional decision
+does not gate them.
+
+Decision-only validation on pinned Zig `0.16.0`:
+`zig version` → `0.16.0`; `zig build test --summary all` → 158/158 passed;
+`zig build && ./zig-out/bin/zoda` → the seven documented route outcomes;
+`git diff --check` → clean.
+For a temporary struct containing `pub usingnamespace Mix;`, `zig test`
+reports `expected function or variable declaration after pub` at that line.
+The cited tests and examples exercise the existing compiler-supported API;
+no implementation or test changed for #31, so no new hosted CI run is required.
 
 ### Phase 5 — More plugins
 
@@ -1853,6 +1898,12 @@ Remaining decisions have explicit gates:
   §4 Phase 4). Open a scoped implementation issue linked to roadmap
   [#38](https://github.com/kamalogudah/zoda/issues/38) if a concrete route
   needs it.
+- ~~Additional compiler-supported conveniences~~ — Phase 4 decision: retain
+  explicit plugin calls and current routing syntax (issue
+  [#31](https://github.com/kamalogudah/zoda/issues/31), §4 Phase 4). If a
+  concrete application needs an addition, open a scoped implementation and
+  regression-test issue linked to [#31](https://github.com/kamalogudah/zoda/issues/31)
+  and roadmap [#38](https://github.com/kamalogudah/zoda/issues/38).
 
 Plugin state access, ownership, branch termination, middleware ordering, and
 buffering are decisions above, not questions deferred until sessions.
