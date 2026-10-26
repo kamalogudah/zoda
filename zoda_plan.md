@@ -1745,12 +1745,15 @@ cookies, unsuitable configuration, key rotation, response header failure, and
 app dispatch with isolated state and a middleware short circuit.
 [`README.md`](README.md#cookie-sessions) documents setup, cookie policy, and
 the lack of confidentiality. CSRF remains separately tracked in
-[#34](https://github.com/kamalogudah/zoda/issues/34).
+[#34](https://github.com/kamalogudah/zoda/issues/34). Implementation and review:
+[PR #53](https://github.com/kamalogudah/zoda/pull/53).
 
 Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
 `zig build`; `zig build test --summary all` (165/165 tests); and
-`git diff --check`. All passed locally. Hosted CI evidence will be linked
-after the implementation is pushed.
+`git diff --check`. All passed locally. [CI run 40382969466](https://github.com/kamalogudah/zoda/actions/runs/40382969466)
+passed both format and build/test jobs for implementation commit `f7434a2`;
+the build/test job also ran the ReleaseSafe hardening and load suites, the
+development-loop test, and the demo smoke run.
 
 ### Phase 6 — Write-up
 
