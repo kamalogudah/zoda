@@ -188,7 +188,9 @@ consume path segments, and they never allocate.
 |---|---|
 | `req.onLiteral("users")` | Consumes the next segment if it equals `"users"`. |
 | `req.onSegment()` | Consumes and returns the next segment (`?[]const u8`). |
+| `req.onInt(u64)` | Parses the next segment as a base-10 integer, then consumes it (`?u64`). |
 | `req.isLiteral("echo")` | Matches when `"echo"` is the final remaining segment. |
+| `req.isInt(u64)` | Parses and consumes an integer only when it is the final remaining segment (`?u64`). |
 | `req.isRoot()` | True when no segments remain. |
 | `req.isGet()` / `req.method == .post` | Method checks. |
 | `req.mark()` / `req.restore(saved)` | Saves and rewinds the cursor to try another alternative. |
@@ -197,6 +199,11 @@ For a dynamic segment, bind the returned slice locally, as the `/users/:id`
 route above does. It borrows request storage and is valid only while that
 request is alive. Named capture lookup is deferred pending a demonstrated
 routing need; see the [Phase 4 decision](zoda_plan.md#named-captures-decision-issue-30).
+For numeric IDs, `if (req.onInt(u64)) |id| { ... }` yields a parsed value.
+The integer type sets the range; malformed or overflowing values return `null`.
+Both integer matchers leave the cursor unchanged on failure, so a later
+alternative can still read the original segment. `onSegment()` continues to
+return a borrowed slice when the original text is needed.
 An additional route DSL is deferred; see the
 [compiler-supported conveniences decision](zoda_plan.md#compiler-supported-conveniences-decision-issue-31).
 
@@ -276,6 +283,47 @@ const Plugins = struct {
   they reference must do its own synchronization.
 - Call plugin methods through `ctx.plugins.<name>` so the registered instance
   stays explicit. See the [Phase 4 decision](zoda_plan.md#compiler-supported-conveniences-decision-issue-31).
+
+#### Cookie sessions
+
+Register `zoda.Sessions` as a plugin instance. Supply a trusted UTC Unix-second
+clock, a lifetime from 1 second to 30 days, and one or more application-owned
+keys of at least 32 cryptographically random bytes. The first key signs new cookies; older keys remain
+available for verification during rotation. Key IDs must be unique.
+
+```zig
+const Plugins = struct { sessions: zoda.Sessions };
+
+// `unixSeconds` is the application's trusted wall-clock function. Keep the
+// secret bytes alive for the app lifetime; load them from secure configuration.
+const plugins = Plugins{ .sessions = .{
+    .keys = &.{.{ .id = 1, .secret = app_secret }},
+    .lifetime_seconds = 3600,
+    .now_seconds = unixSeconds,
+} };
+
+// Inside a route or middleware:
+try ctx.state.sessions.set("user=42");
+try ctx.plugins.sessions.save(&ctx.state.sessions, res); // before returning
+// Read with ctx.state.sessions.value(); call clear() and save() to delete.
+```
+
+The cookie is `__Host-zoda_session=v1.<key-id>.<expiry>.<base64url-payload>.<base64url-HMAC-SHA256>`.
+The MAC covers the version, key ID, expiry, and payload. Invalid, expired,
+oversized, or duplicate session cookies load as an empty session. Payloads are
+limited to 2,048 bytes and cookie values to 4,096 bytes. Signing authenticates
+contents but **does not make them confidential**; do not put secrets in the
+payload. A copied cookie can be replayed until its expiry. Removing a key stops
+accepting cookies signed by that key.
+
+`save` appends a separate `Set-Cookie` field with `Path=/; Secure; HttpOnly;
+SameSite=Lax` and `Max-Age` set to the configured lifetime. The `__Host-`
+prefix requires HTTPS and prevents a Domain attribute. `clear` followed by
+`save` appends a deletion cookie. Unsaved changes are discarded when the request
+ends; cleanup is infallible and never writes a response. The route or
+middleware decides when to persist, including on short circuits. Configure
+CSRF protection separately before using cookie sessions for state-changing
+requests; see [issue #34](https://github.com/kamalogudah/zoda/issues/34).
 
 ### Middleware
 

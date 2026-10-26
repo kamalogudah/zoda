@@ -1705,14 +1705,55 @@ no implementation or test changed for #31, so no new hosted CI run is required.
 
 ### Phase 5 — More plugins
 
-- [ ] Typed segment matchers with overflow/invalid-value tests and no consumption
-      on failure.
-- [ ] Sessions using §3.2 state: application-supplied secret, authenticated cookie
+- [x] Typed base-10 integer segment matchers (`onInt(T)` and terminal
+      `isInt(T)`) with overflow/invalid-value tests and no consumption on
+      failure ([#32](https://github.com/kamalogudah/zoda/issues/32)).
+- [x] Sessions using §3.2 state: application-supplied secret, authenticated cookie
       format, size limits, expiry, key rotation, secure cookie defaults, and
       tampering tests. Signing does not make cookie contents confidential.
 - [ ] CSRF helpers after sessions/cookie policy, with positive and negative tests.
 - **Exit:** demonstrate state isolation and cookie finalization on success,
       failure, and middleware short circuits.
+
+#### Typed segment matcher evidence (issue #32)
+
+[`src/router.zig`](src/router.zig) implements `onInt(T)` and `isInt(T)` by
+parsing before incrementing the cursor. Its tests cover signed and unsigned
+range boundaries, overflow, invalid values, path exhaustion, terminal-only
+matching, same-request `mark`/`restore`, and borrowed `onSegment()` slices
+after a failed parse. [`README.md`](README.md#routing) documents the public API.
+Implementation and review: [PR #52](https://github.com/kamalogudah/zoda/pull/52).
+Sessions and CSRF remain separately tracked in [#33](https://github.com/kamalogudah/zoda/issues/33)
+and [#34](https://github.com/kamalogudah/zoda/issues/34).
+
+Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
+`zig build`; `zig build test --summary all` (160/160 tests);
+`zig build test-hardening -Doptimize=ReleaseSafe --summary all` (10/10);
+`zig build test-load -Doptimize=ReleaseSafe --summary all` (2/2);
+`zig build test-devloop --summary all` (1/1); `./zig-out/bin/zoda`
+(seven documented route outcomes); and `git diff --check`. All passed locally.
+[CI run 40326884371](https://github.com/kamalogudah/zoda/actions/runs/40326884371)
+passed both format and build/test jobs for implementation commit `e678bf9`.
+
+#### Cookie session evidence (issue #33)
+
+[`src/plugins/sessions.zig`](src/plugins/sessions.zig) implements a generated
+per-request `State`, HMAC-SHA256 authenticated cookie payloads, expiry, bounded
+payloads and cookie values, key rotation, and explicit `save`/`clear` operations.
+Its tests cover round trips, tampering, invalid/expired/oversized and duplicate
+cookies, unsuitable configuration, key rotation, response header failure, and
+app dispatch with isolated state and a middleware short circuit.
+[`README.md`](README.md#cookie-sessions) documents setup, cookie policy, and
+the lack of confidentiality. CSRF remains separately tracked in
+[#34](https://github.com/kamalogudah/zoda/issues/34). Implementation and review:
+[PR #53](https://github.com/kamalogudah/zoda/pull/53).
+
+Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
+`zig build`; `zig build test --summary all` (165/165 tests); and
+`git diff --check`. All passed locally. [CI run 40382969466](https://github.com/kamalogudah/zoda/actions/runs/40382969466)
+passed both format and build/test jobs for implementation commit `f7434a2`;
+the build/test job also ran the ReleaseSafe hardening and load suites, the
+development-loop test, and the demo smoke run.
 
 ### Phase 6 — Write-up
 

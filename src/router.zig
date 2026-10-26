@@ -136,6 +136,25 @@ pub const Request = struct {
         return value;
     }
 
+    /// Parses the next segment as a base-10 integer of type `T`, then consumes
+    /// it. Invalid text, overflow, or the end of the path returns `null` and
+    /// leaves the cursor unchanged. `T` must be an integer type.
+    pub fn onInt(self: *Request, comptime T: type) ?T {
+        comptime if (@typeInfo(T) != .int) @compileError("onInt requires an integer type");
+        if (self.isRoot()) return null;
+        const value = std.fmt.parseInt(T, self.segments[self.cursor], 10) catch return null;
+        self.cursor += 1;
+        return value;
+    }
+
+    /// Terminal integer matcher: parses and consumes only when exactly one
+    /// segment remains. Every failure leaves the cursor unchanged.
+    pub fn isInt(self: *Request, comptime T: type) ?T {
+        comptime if (@typeInfo(T) != .int) @compileError("isInt requires an integer type");
+        if (self.segments.len - self.cursor != 1) return null;
+        return self.onInt(T);
+    }
+
     /// Terminal matcher: succeeds and consumes only when exactly one remaining
     /// segment equals `literal`. With two or more segments remaining it fails
     /// without consuming, and the caller must keep the branch open.
@@ -273,6 +292,60 @@ test "onSegment borrows segments without a capture array" {
 test "onSegment returns null at the root" {
     var r = req(.get, &.{});
     try std.testing.expect(r.onSegment() == null);
+}
+
+test "typed integer prefix parses before consuming" {
+    var r = req(.get, &.{ "users", "255", "-128", "0" });
+    try std.testing.expect(r.onLiteral("users"));
+    try std.testing.expectEqual(@as(?u8, 255), r.onInt(u8));
+    try std.testing.expectEqual(@as(?i8, -128), r.onInt(i8));
+    try std.testing.expectEqual(@as(?u8, 0), r.onInt(u8));
+    const end = r.mark();
+    try std.testing.expect(r.onInt(u8) == null);
+    try std.testing.expectEqual(end, r.cursor);
+
+    const failures = .{ "256", "-129", "-1", "abc", "12x", "", " 1" };
+    inline for (failures) |value| {
+        var bad = req(.get, &.{ "users", value });
+        try std.testing.expect(bad.onLiteral("users"));
+        const saved = bad.mark();
+        try std.testing.expect(bad.onInt(if (std.mem.eql(u8, value, "-129")) i8 else u8) == null);
+        try std.testing.expectEqual(saved, bad.cursor);
+        const raw = bad.onSegment().?;
+        try std.testing.expect(raw.ptr == bad.segments[1].ptr);
+        try std.testing.expectEqualStrings(value, raw);
+    }
+}
+
+test "terminal integer matcher and checkpoints preserve borrowed captures" {
+    var r = req(.get, &.{ "users", "42", "extra" });
+    const outer = r.mark();
+    try std.testing.expect(r.onLiteral("users"));
+    const inner = r.mark();
+    try std.testing.expect(r.isInt(u16) == null); // More than one remains.
+    try std.testing.expectEqual(inner, r.cursor);
+    try std.testing.expectEqual(@as(?u16, 42), r.onInt(u16));
+    const after_number = r.mark();
+    try std.testing.expect(r.isInt(u16) == null); // Invalid final value.
+    try std.testing.expectEqual(after_number, r.cursor);
+    r.restore(inner);
+    const borrowed = r.onSegment().?;
+    try std.testing.expect(borrowed.ptr == r.segments[1].ptr);
+    try std.testing.expectEqualStrings("42", borrowed);
+    r.restore(outer);
+    try std.testing.expect(r.onLiteral("users"));
+    try std.testing.expectEqual(@as(?u16, 42), r.onInt(u16));
+
+    var terminal = req(.get, &.{"65535"});
+    try std.testing.expectEqual(@as(?u16, 65535), terminal.isInt(u16));
+    try std.testing.expect(terminal.isRoot());
+    const end = terminal.mark();
+    try std.testing.expect(terminal.isInt(u16) == null);
+    try std.testing.expectEqual(end, terminal.cursor);
+
+    var overflow = req(.get, &.{"65536"});
+    try std.testing.expect(overflow.isInt(u16) == null);
+    try std.testing.expectEqual(@as(usize, 0), overflow.cursor);
 }
 
 test "checkpoints apply per request and restore routing state only" {

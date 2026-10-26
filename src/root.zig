@@ -44,6 +44,8 @@ pub const plugins = struct {
     pub const json = @import("plugins/json.zig");
     /// Configured route-miss fallback (ADR-0001 §3.3).
     pub const not_found = @import("plugins/not_found.zig");
+    /// Authenticated cookie sessions with explicit persistence.
+    pub const sessions = @import("plugins/sessions.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
@@ -51,6 +53,7 @@ pub const Json = plugins.json.Json;
 
 /// Re-export the not-found wrapper instance type for convenience.
 pub const NotFound = plugins.not_found.NotFound;
+pub const Sessions = plugins.sessions.Sessions;
 
 comptime {
     // Collect the imported modules' test declarations into the library test
@@ -67,6 +70,7 @@ comptime {
     std.testing.refAllDecls(static);
     std.testing.refAllDecls(plugins.json);
     std.testing.refAllDecls(plugins.not_found);
+    std.testing.refAllDecls(plugins.sessions);
 }
 
 test {
