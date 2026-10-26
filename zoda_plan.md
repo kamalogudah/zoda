@@ -1713,8 +1713,9 @@ no implementation or test changed for #31, so no new hosted CI run is required.
       tampering tests. Signing does not make cookie contents confidential.
 - [x] CSRF helpers bound to authenticated cookie sessions, with positive and
       negative submission tests ([#34](https://github.com/kamalogudah/zoda/issues/34)).
-- **Exit:** demonstrate state isolation and cookie finalization on success,
-      failure, and middleware short circuits.
+- [x] **Exit:** demonstrate state isolation and cookie finalization on success,
+      failure, recovery, and middleware short circuits
+      ([#35](https://github.com/kamalogudah/zoda/issues/35)).
 
 #### Typed segment matcher evidence (issue #32)
 
@@ -1780,6 +1781,20 @@ Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
 (seven documented route outcomes); and `git diff --check`. All passed locally.
 [CI run 40402524121](https://github.com/kamalogudah/zoda/actions/runs/40402524121)
 passed both format and build/test jobs for implementation commit `4f48115`.
+
+#### Stateful plugin verification (issue #35)
+
+[`src/plugins/sessions.zig`](src/plugins/sessions.zig) verifies explicit cookie
+finalization through successful routes, propagated errors, recovery, and
+middleware short circuits. An unsaved mutation produces no cookie, including
+after failed routes and denied requests. Returned cookie headers survive later
+dispatches, and two independently configured apps reject each other's cookies
+while serving concurrent requests. Allocation-failure injection covers partial
+response construction. The existing [`src/app.zig`](src/app.zig) state lifecycle
+tests verify reverse cleanup after normal dispatch, handler failure, and
+partial plugin initialization; the [`src/plugins/csrf.zig`](src/plugins/csrf.zig)
+integration test verifies session-backed token persistence and rejection of
+invalid submissions. These tests run in the pinned CI `zig build test` job.
 
 ### Phase 6 — Write-up
 

@@ -392,3 +392,182 @@ test "app generated session state is isolated and short circuits persist explici
     try std.testing.expectEqualStrings("short", short_res.body);
     try std.testing.expectEqual(@as(usize, 1), short_res.header_count);
 }
+
+test "session cookie policy follows success, recovery, failure, and short circuits" {
+    const app_mod = @import("../app.zig");
+    const A = app_mod.App(struct { sessions: Sessions });
+    const Handler = struct {
+        fn route(ctx: *A.Context, req: *router.Request, res: *response.Response) !void {
+            if (req.isLiteral("saved")) {
+                try ctx.state.sessions.set("saved");
+                try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+                return res.text(200, "ok");
+            }
+            if (req.isLiteral("fail") or req.isLiteral("recover")) {
+                try ctx.state.sessions.set("discarded");
+                return error.RouteFailed;
+            }
+            if (req.isLiteral("read")) return res.text(200, ctx.state.sessions.value());
+        }
+
+        fn middleware(_: *const anyopaque, ctx: *A.Context, req: *router.Request, res: *response.Response, next: A.Next) !void {
+            if (req.isLiteral("short")) {
+                try ctx.state.sessions.set("short");
+                try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+                return res.text(200, "short");
+            }
+            if (req.isLiteral("short-unsaved")) {
+                try ctx.state.sessions.set("discarded");
+                return res.text(403, "denied");
+            }
+            const recovering = req.segments.len == 1 and std.mem.eql(u8, req.segments[0], "recover");
+            next.call(ctx, req, res) catch |err| {
+                if (!recovering) return err;
+                res.clear();
+                // Recovery chooses a fresh cookie policy after clearing the
+                // partial response. A dirty session alone writes nothing.
+                try ctx.state.sessions.set("recovered");
+                try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+                return res.text(503, "recovered");
+            };
+        }
+    };
+    const mw = A.Middleware{ .config = &.{}, .invoke = Handler.middleware };
+    var app = try A.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{ .sessions = testPlugin() },
+        .route_fn = Handler.route,
+        .middleware = &.{mw},
+    });
+    defer app.deinit();
+
+    var saved_req: router.Request = .{ .method = .get, .segments = &.{"saved"} };
+    var saved = try app.dispatch(&saved_req);
+    defer saved.deinit();
+    try std.testing.expectEqual(@as(usize, 1), saved.header_count);
+    const saved_cookie = cookieValue(saved.headers[0].value);
+
+    var fail_req: router.Request = .{ .method = .get, .segments = &.{"fail"} };
+    try std.testing.expectError(error.RouteFailed, app.dispatch(&fail_req));
+    var read_req: router.Request = .{ .method = .get, .segments = &.{"read"} };
+    var read = try app.dispatch(&read_req);
+    defer read.deinit();
+    try std.testing.expectEqual(@as(usize, 0), read.header_count);
+    try std.testing.expectEqual(@as(usize, 0), read.body.len);
+
+    var recover_req: router.Request = .{ .method = .get, .segments = &.{"recover"} };
+    var recovered = try app.dispatch(&recover_req);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u16, 503), recovered.status_code);
+    try std.testing.expectEqual(@as(usize, 1), recovered.header_count);
+    const recovered_cookie = cookieValue(recovered.headers[0].value);
+
+    var short_req: router.Request = .{ .method = .get, .segments = &.{"short"} };
+    var short = try app.dispatch(&short_req);
+    defer short.deinit();
+    try std.testing.expectEqual(@as(usize, 1), short.header_count);
+    var short_unsaved_req: router.Request = .{ .method = .get, .segments = &.{"short-unsaved"} };
+    var short_unsaved = try app.dispatch(&short_unsaved_req);
+    defer short_unsaved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), short_unsaved.header_count);
+
+    // Returned cookie bytes remain valid through later dispatches and after
+    // their request state has been destroyed.
+    const saved_headers = [_]router.Header{.{ .name = "Cookie", .value = saved_cookie }};
+    read_req.headers = &saved_headers;
+    read_req.cursor = 0;
+    var saved_read = try app.dispatch(&read_req);
+    defer saved_read.deinit();
+    try std.testing.expectEqualStrings("saved", saved_read.body);
+    const recovered_headers = [_]router.Header{.{ .name = "Cookie", .value = recovered_cookie }};
+    read_req.headers = &recovered_headers;
+    read_req.cursor = 0;
+    var recovered_read = try app.dispatch(&read_req);
+    defer recovered_read.deinit();
+    try std.testing.expectEqualStrings("recovered", recovered_read.body);
+}
+
+test "session app instances use independent keys, clocks, and request state concurrently" {
+    const app_mod = @import("../app.zig");
+    const A = app_mod.App(struct { sessions: Sessions });
+    const Handler = struct {
+        fn route(ctx: *A.Context, req: *router.Request, res: *response.Response) !void {
+            if (req.isLiteral("set")) {
+                try ctx.state.sessions.set("thread");
+                try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+                return res.text(200, "ok");
+            }
+            return res.text(200, ctx.state.sessions.value());
+        }
+    };
+    const alloc = std.heap.smp_allocator;
+    var first = try A.init(alloc, .{ .response_allocator = alloc, .plugins = .{ .sessions = testPlugin() }, .route_fn = Handler.route });
+    defer first.deinit();
+    var second = try A.init(alloc, .{ .response_allocator = alloc, .plugins = .{ .sessions = .{
+        .keys = &.{.{ .id = 2, .secret = test_key_b }},
+        .lifetime_seconds = 600,
+        .now_seconds = time1200,
+    } }, .route_fn = Handler.route });
+    defer second.deinit();
+
+    const Worker = struct {
+        fn run(a: *const A, other: *const A, failures: *std.atomic.Value(usize)) void {
+            for (0..100) |_| {
+                check(a, other) catch {
+                    _ = failures.fetchAdd(1, .monotonic);
+                };
+            }
+        }
+
+        fn check(a: *const A, other: *const A) !void {
+            var set_req: router.Request = .{ .method = .get, .segments = &.{"set"} };
+            var res = try a.dispatch(&set_req);
+            defer res.deinit();
+            const cookie = cookieValue(res.headers[0].value);
+            const headers = [_]router.Header{.{ .name = "Cookie", .value = cookie }};
+            var read_req: router.Request = .{ .method = .get, .segments = &.{"read"}, .headers = &headers };
+            var own = try a.dispatch(&read_req);
+            defer own.deinit();
+            try std.testing.expectEqualStrings("thread", own.body);
+            var foreign = try other.dispatch(&read_req);
+            defer foreign.deinit();
+            try std.testing.expectEqual(@as(usize, 0), foreign.body.len);
+            var fresh_req: router.Request = .{ .method = .get, .segments = &.{"read"} };
+            var fresh = try a.dispatch(&fresh_req);
+            defer fresh.deinit();
+            try std.testing.expectEqual(@as(usize, 0), fresh.body.len);
+        }
+    };
+    var failures = std.atomic.Value(usize).init(0);
+    const t1 = try std.Thread.spawn(.{}, Worker.run, .{ &first, &second, &failures });
+    const t2 = try std.Thread.spawn(.{}, Worker.run, .{ &second, &first, &failures });
+    t1.join();
+    t2.join();
+    try std.testing.expectEqual(@as(usize, 0), failures.load(.monotonic));
+}
+
+test "session cookie save and dispatch release partial allocations" {
+    const app_mod = @import("../app.zig");
+    const A = app_mod.App(struct { sessions: Sessions });
+    const Harness = struct {
+        fn route(ctx: *A.Context, _: *router.Request, res: *response.Response) !void {
+            try ctx.state.sessions.set("allocated");
+            try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+            return res.text(200, "ok");
+        }
+
+        fn check(allocator: std.mem.Allocator) !void {
+            var app = try A.init(std.testing.allocator, .{
+                .response_allocator = allocator,
+                .plugins = .{ .sessions = testPlugin() },
+                .route_fn = route,
+            });
+            defer app.deinit();
+            var req: router.Request = .{ .method = .get, .segments = &.{} };
+            var res = try app.dispatch(&req);
+            defer res.deinit();
+            try std.testing.expectEqual(@as(usize, 1), res.header_count);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.check, .{});
+}
