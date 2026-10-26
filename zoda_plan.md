@@ -1711,7 +1711,8 @@ no implementation or test changed for #31, so no new hosted CI run is required.
 - [x] Sessions using §3.2 state: application-supplied secret, authenticated cookie
       format, size limits, expiry, key rotation, secure cookie defaults, and
       tampering tests. Signing does not make cookie contents confidential.
-- [ ] CSRF helpers after sessions/cookie policy, with positive and negative tests.
+- [x] CSRF helpers bound to authenticated cookie sessions, with positive and
+      negative submission tests ([#34](https://github.com/kamalogudah/zoda/issues/34)).
 - **Exit:** demonstrate state isolation and cookie finalization on success,
       failure, and middleware short circuits.
 
@@ -1754,6 +1755,31 @@ Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
 passed both format and build/test jobs for implementation commit `f7434a2`;
 the build/test job also ran the ReleaseSafe hardening and load suites, the
 development-loop test, and the demo smoke run.
+
+#### CSRF helper evidence (issue #34)
+
+[`src/plugins/csrf.zig`](src/plugins/csrf.zig) issues a 32-byte random
+synchronizer token using secure entropy and validates a single request header
+or an application-extracted form token with a constant-time comparison.
+[`src/plugins/sessions.zig`](src/plugins/sessions.zig) persists the secret in
+an authenticated v2 cookie while still reading existing v1 cookies. Token
+issue dirties the session; the route explicitly calls `save`. Tests cover
+missing, invalid, duplicate, and cross-session tokens, a v1 upgrade, and an
+app dispatch integration example with explicit registered plugin/state access
+that proves rejected POSTs do not execute the protected action.
+[`README.md`](README.md#csrf-helpers) documents usage and the cookie policy.
+No conditional follow-up is required for the current buffered request API;
+applications parse their own form bodies and reject duplicate fields.
+Implementation and review: [PR #55](https://github.com/kamalogudah/zoda/pull/55).
+
+Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
+`zig build`; `zig build test --summary all` (168/168 tests);
+`zig build test-hardening -Doptimize=ReleaseSafe --summary all` (10/10);
+`zig build test-load -Doptimize=ReleaseSafe --summary all` (2/2);
+`zig build test-devloop --summary all` (1/1); `./zig-out/bin/zoda`
+(seven documented route outcomes); and `git diff --check`. All passed locally.
+[CI run 40402524121](https://github.com/kamalogudah/zoda/actions/runs/40402524121)
+passed both format and build/test jobs for implementation commit `4f48115`.
 
 ### Phase 6 — Write-up
 

@@ -31,6 +31,9 @@ pub const Sessions = struct {
         len: usize = 0,
         dirty: bool = false,
         clearing: bool = false,
+        csrf_secret: [32]u8 = undefined,
+        csrf_present: bool = false,
+        csrf_token: [base64.Encoder.calcSize(32)]u8 = undefined,
 
         pub fn value(self: *const State) []const u8 {
             return self.bytes[0..self.len];
@@ -50,6 +53,7 @@ pub const Sessions = struct {
             self.len = 0;
             self.dirty = true;
             self.clearing = true;
+            self.csrf_present = false;
         }
     };
 
@@ -77,7 +81,11 @@ pub const Sessions = struct {
             var encoded: [base64.Encoder.calcSize(max_payload_bytes)]u8 = undefined;
             const payload = base64.Encoder.encode(&encoded, state.value());
             var header: [max_cookie_bytes]u8 = undefined;
-            const prefix = std.fmt.bufPrint(&header, "{s}=v1.{d}.{d}.{s}", .{ cookie_name, self.keys[0].id, expiry, payload }) catch unreachable;
+            const prefix = if (state.csrf_present) blk: {
+                var encoded_csrf: [base64.Encoder.calcSize(32)]u8 = undefined;
+                const csrf = base64.Encoder.encode(&encoded_csrf, &state.csrf_secret);
+                break :blk std.fmt.bufPrint(&header, "{s}=v2.{d}.{d}.{s}.{s}", .{ cookie_name, self.keys[0].id, expiry, payload, csrf }) catch unreachable;
+            } else std.fmt.bufPrint(&header, "{s}=v1.{d}.{d}.{s}", .{ cookie_name, self.keys[0].id, expiry, payload }) catch unreachable;
             const signed = prefix[cookie_name.len + 1 ..];
             var mac: [Hmac.mac_length]u8 = undefined;
             Hmac.create(&mac, signed, self.keys[0].secret);
@@ -105,10 +113,13 @@ pub const Sessions = struct {
     fn verify(self: *const Sessions, value_bytes: []const u8, state: *State) void {
         if (value_bytes.len > max_cookie_bytes) return;
         var parts = std.mem.splitScalar(u8, value_bytes, '.');
-        if (!std.mem.eql(u8, parts.next() orelse return, "v1")) return;
+        const version = parts.next() orelse return;
+        const has_csrf = std.mem.eql(u8, version, "v2");
+        if (!has_csrf and !std.mem.eql(u8, version, "v1")) return;
         const id_text = parts.next() orelse return;
         const expiry_text = parts.next() orelse return;
         const payload_text = parts.next() orelse return;
+        const csrf_text = if (has_csrf) parts.next() orelse return else "";
         const mac_text = parts.next() orelse return;
         if (parts.next() != null) return;
         const id = std.fmt.parseInt(u8, id_text, 10) catch return;
@@ -128,6 +139,11 @@ pub const Sessions = struct {
         const payload_size = base64.Decoder.calcSizeForSlice(payload_text) catch return;
         if (payload_size > max_payload_bytes) return;
         base64.Decoder.decode(state.bytes[0..payload_size], payload_text) catch return;
+        if (has_csrf) {
+            if (csrf_text.len != base64.Encoder.calcSize(32)) return;
+            base64.Decoder.decode(&state.csrf_secret, csrf_text) catch return;
+            state.csrf_present = true;
+        }
         state.len = payload_size;
     }
 };
