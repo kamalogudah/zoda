@@ -1770,6 +1770,7 @@ that proves rejected POSTs do not execute the protected action.
 [`README.md`](README.md#csrf-helpers) documents usage and the cookie policy.
 No conditional follow-up is required for the current buffered request API;
 applications parse their own form bodies and reject duplicate fields.
+Implementation and review: [PR #55](https://github.com/kamalogudah/zoda/pull/55).
 
 Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
 `zig build`; `zig build test --summary all` (168/168 tests);
@@ -1777,6 +1778,8 @@ Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
 `zig build test-load -Doptimize=ReleaseSafe --summary all` (2/2);
 `zig build test-devloop --summary all` (1/1); `./zig-out/bin/zoda`
 (seven documented route outcomes); and `git diff --check`. All passed locally.
+[CI run 40402524121](https://github.com/kamalogudah/zoda/actions/runs/40402524121)
+passed both format and build/test jobs for implementation commit `4f48115`.
 
 ### Phase 6 — Write-up
 
