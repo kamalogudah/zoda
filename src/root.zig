@@ -46,6 +46,8 @@ pub const plugins = struct {
     pub const not_found = @import("plugins/not_found.zig");
     /// Authenticated cookie sessions with explicit persistence.
     pub const sessions = @import("plugins/sessions.zig");
+    /// Session-bound synchronizer token helpers.
+    pub const csrf = @import("plugins/csrf.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
@@ -71,6 +73,7 @@ comptime {
     std.testing.refAllDecls(plugins.json);
     std.testing.refAllDecls(plugins.not_found);
     std.testing.refAllDecls(plugins.sessions);
+    std.testing.refAllDecls(plugins.csrf);
 }
 
 test {

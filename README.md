@@ -308,8 +308,10 @@ try ctx.plugins.sessions.save(&ctx.state.sessions, res); // before returning
 // Read with ctx.state.sessions.value(); call clear() and save() to delete.
 ```
 
-The cookie is `__Host-zoda_session=v1.<key-id>.<expiry>.<base64url-payload>.<base64url-HMAC-SHA256>`.
-The MAC covers the version, key ID, expiry, and payload. Invalid, expired,
+The cookie is `__Host-zoda_session=v1.<key-id>.<expiry>.<base64url-payload>.<base64url-HMAC-SHA256>`
+until a CSRF token is issued. It then uses
+`v2.<key-id>.<expiry>.<base64url-payload>.<base64url-CSRF-secret>.<base64url-HMAC-SHA256>`.
+The MAC covers every field before it. Invalid, expired,
 oversized, or duplicate session cookies load as an empty session. Payloads are
 limited to 2,048 bytes and cookie values to 4,096 bytes. Signing authenticates
 contents but **does not make them confidential**; do not put secrets in the
@@ -322,8 +324,42 @@ prefix requires HTTPS and prevents a Domain attribute. `clear` followed by
 `save` appends a deletion cookie. Unsaved changes are discarded when the request
 ends; cleanup is infallible and never writes a response. The route or
 middleware decides when to persist, including on short circuits. Configure
-CSRF protection separately before using cookie sessions for state-changing
-requests; see [issue #34](https://github.com/kamalogudah/zoda/issues/34).
+CSRF protection before using cookie sessions for state-changing requests.
+
+#### CSRF helpers
+
+Use `zoda.plugins.csrf` with a registered `zoda.Sessions` instance. On a GET
+that renders a form, issue a token from `ctx.state.sessions`, put it in the
+form, and explicitly save the session before returning the response. The first
+issue upgrades an existing v1 session to a v2 cookie containing a random
+32-byte CSRF secret. The opaque application payload stays separate. A cleared
+session invalidates its token. Existing v1 cookies still load normally.
+
+```zig
+const csrf = zoda.plugins.csrf;
+
+// GET /form, inside a route with registered `sessions` plugin:
+const issued = try csrf.token(io, &ctx.state.sessions);
+try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+try res.text(200, issued); // render as a hidden form field or pass to client code
+
+// POST /submit, before any protected action:
+if (!csrf.valid(req, &ctx.state.sessions)) return res.text(403, "forbidden");
+try performProtectedAction();
+```
+
+`io` is the application's `std.Io`; token creation uses
+`std.Io.randomSecure` and can fail if secure entropy is unavailable. For
+JavaScript submissions, send the token in one `X-CSRF-Token` header. For HTML
+forms, extract exactly one token field and call `csrf.validToken`; reject
+duplicate fields. Missing, malformed, duplicate-header, and cross-session
+tokens fail validation. The token is stable until the session is cleared; do
+not put it in a URL or log. Protect every state-changing route, including
+unsafe GET routes if the application has any. Keep the secure cookie and HTTPS
+policy above, and do not allow untrusted cross-origin requests to send the
+custom header through permissive CORS. The [compiling app dispatch example](src/plugins/csrf.zig)
+exercises explicit plugin access, session persistence, and rejection before
+the protected action.
 
 ### Middleware
 
