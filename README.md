@@ -188,7 +188,9 @@ consume path segments, and they never allocate.
 |---|---|
 | `req.onLiteral("users")` | Consumes the next segment if it equals `"users"`. |
 | `req.onSegment()` | Consumes and returns the next segment (`?[]const u8`). |
+| `req.onInt(u64)` | Parses the next segment as a base-10 integer, then consumes it (`?u64`). |
 | `req.isLiteral("echo")` | Matches when `"echo"` is the final remaining segment. |
+| `req.isInt(u64)` | Parses and consumes an integer only when it is the final remaining segment (`?u64`). |
 | `req.isRoot()` | True when no segments remain. |
 | `req.isGet()` / `req.method == .post` | Method checks. |
 | `req.mark()` / `req.restore(saved)` | Saves and rewinds the cursor to try another alternative. |
@@ -197,6 +199,11 @@ For a dynamic segment, bind the returned slice locally, as the `/users/:id`
 route above does. It borrows request storage and is valid only while that
 request is alive. Named capture lookup is deferred pending a demonstrated
 routing need; see the [Phase 4 decision](zoda_plan.md#named-captures-decision-issue-30).
+For numeric IDs, `if (req.onInt(u64)) |id| { ... }` yields a parsed value.
+The integer type sets the range; malformed or overflowing values return `null`.
+Both integer matchers leave the cursor unchanged on failure, so a later
+alternative can still read the original segment. `onSegment()` continues to
+return a borrowed slice when the original text is needed.
 An additional route DSL is deferred; see the
 [compiler-supported conveniences decision](zoda_plan.md#compiler-supported-conveniences-decision-issue-31).
 
