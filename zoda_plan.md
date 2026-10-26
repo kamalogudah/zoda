@@ -1708,7 +1708,7 @@ no implementation or test changed for #31, so no new hosted CI run is required.
 - [x] Typed base-10 integer segment matchers (`onInt(T)` and terminal
       `isInt(T)`) with overflow/invalid-value tests and no consumption on
       failure ([#32](https://github.com/kamalogudah/zoda/issues/32)).
-- [ ] Sessions using §3.2 state: application-supplied secret, authenticated cookie
+- [x] Sessions using §3.2 state: application-supplied secret, authenticated cookie
       format, size limits, expiry, key rotation, secure cookie defaults, and
       tampering tests. Signing does not make cookie contents confidential.
 - [ ] CSRF helpers after sessions/cookie policy, with positive and negative tests.
@@ -1734,6 +1734,23 @@ Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
 (seven documented route outcomes); and `git diff --check`. All passed locally.
 [CI run 40326884371](https://github.com/kamalogudah/zoda/actions/runs/40326884371)
 passed both format and build/test jobs for implementation commit `e678bf9`.
+
+#### Cookie session evidence (issue #33)
+
+[`src/plugins/sessions.zig`](src/plugins/sessions.zig) implements a generated
+per-request `State`, HMAC-SHA256 authenticated cookie payloads, expiry, bounded
+payloads and cookie values, key rotation, and explicit `save`/`clear` operations.
+Its tests cover round trips, tampering, invalid/expired/oversized and duplicate
+cookies, unsuitable configuration, key rotation, response header failure, and
+app dispatch with isolated state and a middleware short circuit.
+[`README.md`](README.md#cookie-sessions) documents setup, cookie policy, and
+the lack of confidentiality. CSRF remains separately tracked in
+[#34](https://github.com/kamalogudah/zoda/issues/34).
+
+Validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
+`zig build`; `zig build test --summary all` (165/165 tests); and
+`git diff --check`. All passed locally. Hosted CI evidence will be linked
+after the implementation is pushed.
 
 ### Phase 6 — Write-up
 

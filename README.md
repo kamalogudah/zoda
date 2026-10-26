@@ -284,6 +284,47 @@ const Plugins = struct {
 - Call plugin methods through `ctx.plugins.<name>` so the registered instance
   stays explicit. See the [Phase 4 decision](zoda_plan.md#compiler-supported-conveniences-decision-issue-31).
 
+#### Cookie sessions
+
+Register `zoda.Sessions` as a plugin instance. Supply a trusted UTC Unix-second
+clock, a lifetime from 1 second to 30 days, and one or more application-owned
+keys of at least 32 cryptographically random bytes. The first key signs new cookies; older keys remain
+available for verification during rotation. Key IDs must be unique.
+
+```zig
+const Plugins = struct { sessions: zoda.Sessions };
+
+// `unixSeconds` is the application's trusted wall-clock function. Keep the
+// secret bytes alive for the app lifetime; load them from secure configuration.
+const plugins = Plugins{ .sessions = .{
+    .keys = &.{.{ .id = 1, .secret = app_secret }},
+    .lifetime_seconds = 3600,
+    .now_seconds = unixSeconds,
+} };
+
+// Inside a route or middleware:
+try ctx.state.sessions.set("user=42");
+try ctx.plugins.sessions.save(&ctx.state.sessions, res); // before returning
+// Read with ctx.state.sessions.value(); call clear() and save() to delete.
+```
+
+The cookie is `__Host-zoda_session=v1.<key-id>.<expiry>.<base64url-payload>.<base64url-HMAC-SHA256>`.
+The MAC covers the version, key ID, expiry, and payload. Invalid, expired,
+oversized, or duplicate session cookies load as an empty session. Payloads are
+limited to 2,048 bytes and cookie values to 4,096 bytes. Signing authenticates
+contents but **does not make them confidential**; do not put secrets in the
+payload. A copied cookie can be replayed until its expiry. Removing a key stops
+accepting cookies signed by that key.
+
+`save` appends a separate `Set-Cookie` field with `Path=/; Secure; HttpOnly;
+SameSite=Lax` and `Max-Age` set to the configured lifetime. The `__Host-`
+prefix requires HTTPS and prevents a Domain attribute. `clear` followed by
+`save` appends a deletion cookie. Unsaved changes are discarded when the request
+ends; cleanup is infallible and never writes a response. The route or
+middleware decides when to persist, including on short circuits. Configure
+CSRF protection separately before using cookie sessions for state-changing
+requests; see [issue #34](https://github.com/kamalogudah/zoda/issues/34).
+
 ### Middleware
 
 Middleware wraps the whole route, including the default 404. Each entry pairs a
