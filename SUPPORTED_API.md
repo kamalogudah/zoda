@@ -44,7 +44,7 @@ runs inside `zig build test`.
   state lifecycle, `composeRoute` wrappers, ordered middleware, default 404,
   and owned `Response` return from `dispatch`.
 - Buffered text, JSON, and embedded HTML template responses; JSON and
-  configured not-found plugins; default-header, timing, and static-file
+  configured not-found plugins; host-authorization, default-header, timing, and static-file
   middleware; signed cookie sessions and session-bound CSRF helpers; bounded
   cleartext HTTP/1.0 and HTTP/1.1 socket service.
 - `zoda.BearerToken` is an opt-in registered plugin. `token(req)` returns a
@@ -100,6 +100,21 @@ cover their short circuits. Existing response fields win by case-insensitive
 name; configured defaults are appended only after downstream success. Response
 header count and byte limits still apply. See the [README](README.md#default-response-headers)
 and [compiling example](examples/contract.zig).
+
+`zoda.host_authorization.middleware(App, &hosts)` validates an exact allowlist
+at entry creation. Register it before static serving and any middleware that
+can answer a request. It requires exactly one `Host` header on HTTP/1.0 and
+HTTP/1.1 requests; missing, duplicate, malformed, or unlisted authorities get
+403 before downstream dispatch. Hosts are ASCII DNS-style names, compared
+without case, optionally followed by a canonical decimal port (1–65535, no
+leading zeroes). Port presence and value must match exactly. No suffix matching
+is performed. Empty labels, trailing dots, internal whitespace, userinfo, and
+bracketed IP literals are unsupported. Surrounding spaces and tabs on a Host
+field are ignored; allowlist entries must contain no whitespace. The transport preserves ordered headers and
+does not expose a normalized authority; direct dispatch follows the same
+Host-header rule. `Forwarded` and `X-Forwarded-Host` are ignored because no
+trusted-proxy boundary is configured. Configuration slices must remain
+immutable and alive through app shutdown. See the [README](README.md#host-authorization).
 
 ## Safe content and sessions
 

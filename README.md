@@ -572,6 +572,45 @@ var app = try App.init(gpa, .{
 defer app.deinit();
 ```
 
+### Host authorization
+
+`zoda.host_authorization.middleware(App, &hosts)` rejects requests before
+routing or static serving unless exactly one `Host` field matches an allowed
+authority. Put it before `zoda.static.middleware` and every other middleware
+that can answer a request:
+
+```zig
+const hosts: zoda.host_authorization.Config = .{
+    .allowed_hosts = &.{ "example.com", "example.com:8080" },
+};
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{},
+    .route_fn = route,
+    .middleware = &.{
+        try zoda.host_authorization.middleware(App, &hosts),
+        zoda.static.middleware(App, &static_config),
+    },
+});
+defer app.deinit();
+```
+
+The allowlist is validated when the middleware entry is created. A Host is an
+ASCII DNS-style name (including IPv4-style names) with optional `:port`.
+Names are compared case-insensitively, with no suffix matching. Ports must be
+decimal from 1 through 65535, with no leading zeroes; a configured port only
+matches that port, and an entry without a port only matches an unported Host.
+Empty labels, trailing dots, internal whitespace, userinfo, bracketed IP literals,
+and other malformed authorities are rejected. Surrounding spaces and tabs on a
+request's Host field are ignored, as with the socket parser; allowlist entries
+must contain no surrounding whitespace. Missing or duplicate Host fields
+receive 403, including on HTTP/1.0 requests. An unauthorized request receives
+`403 Forbidden` with a fixed body and never reaches downstream middleware or
+the route. `X-Forwarded-Host` and `Forwarded` are ignored; no trusted-proxy
+boundary is configured. The transport retains the ordered Host fields and does
+not expose a normalized authority, so direct dispatch uses the same rule.
+Keep the configuration and its strings immutable and alive until `app.deinit()`.
+
 ### Default response headers
 
 `zoda.default_headers.middleware(App, &config)` adds configured headers after
