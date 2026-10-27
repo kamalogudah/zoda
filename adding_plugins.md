@@ -59,6 +59,7 @@ corresponding ideas in the [Roda catalog](https://roda.jeremyevans.net/rdoc/clas
 | 3 | Status and error handlers (`status_handler`, `error_handler`) | Middleware or route wrapper | Map selected errors/statuses to responses with clear precedence. Recovery must clear a partial response before replacement. |
 | 3 | Security response policies (`content_security_policy`, `hsts`, `permissions_policy`) | Middleware | Validate configured policy values and emit headers on the selected response classes. HSTS requires a trustworthy HTTPS signal. |
 | 3 | Files and assets (`public`, `send_file`, `assets`) | Middleware/helpers | Extend the existing confined static-file code instead of duplicating path security. Asset pipelines need a separate build-time design. |
+| 3 | Inertia.js responses (`inertia`) | Registered helper with an explicit HTML shell | Render a component and typed props as an escaped initial HTML page or an Inertia JSON page response. Handle asset-version conflicts and Inertia redirects without changing normal route dispatch. |
 
 Start with a small public catalog rather than all of Roda's modules. Several
 Roda entries are Ruby-specific (`erb_h`, `sinatra_helpers`, class/module
@@ -66,6 +67,37 @@ matchers) or overlap Zoda's existing router and template design. Automatic
 405/`Allow` (`not_allowed`), HEAD-to-GET fallback (`head`), streaming, and
 runtime template loading need core or transport decisions recorded in
 `SUPPORTED_API.md`; do not promise them as simple plugins.
+
+### Inertia.js adapter ([#68](https://github.com/kamalogudah/zoda/issues/68))
+
+Inspired by [inertia-roda](https://github.com/holamendi/inertia-roda), add an
+opt-in `Inertia` instance with route methods such as
+`ctx.plugins.inertia.render(req, res, component, props)` and
+`ctx.plugins.inertia.redirect(req, res, location)`. Keep the route in charge of
+selecting the component and supplying typed props. Allow a configured shared
+props value or callback and an asset version value or callback; define merge
+precedence so route props override shared props.
+
+- For an ordinary GET, serialize `{ component, props, url, version }` and embed
+  it in a configured HTML shell using HTML-attribute-safe escaping. The shell
+  owns the page layout and asset tags; Zoda need not load templates at runtime.
+- For `X-Inertia: true`, return the same page object as `application/json`, set
+  `X-Inertia: true`, and set `Vary: X-Inertia` on both HTML and JSON page
+  responses. Define behavior for duplicate or malformed Inertia headers.
+- On an Inertia GET with an outdated `X-Inertia-Version`, return 409 with
+  `X-Inertia-Location` set to the current request URL. Define URL construction
+  from Zoda's path/query representation and a trusted origin policy. Version
+  checks must not override ordinary non-Inertia requests.
+- Make redirects explicit. After a non-GET Inertia request, default a local
+  redirect to 303; for an external destination, use 409 and
+  `X-Inertia-Location`. Reuse the safe redirect helper's destination policy
+  when available rather than accepting unvalidated `Location` values.
+- Own serialized data in the response, honor configured response size/header
+  limits, and propagate serialization or allocation errors. Test HTML escaping,
+  JSON shape, shared-prop precedence, version mismatch, redirect status and
+  destination validation, URL/query preservation, and normal request behavior.
+  Document any deferred Inertia protocol features (for example partial reloads)
+  explicitly instead of silently claiming full protocol support.
 
 ## First implementation milestone
 
