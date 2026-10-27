@@ -204,8 +204,7 @@ pub const Response = struct {
     /// so multiple `Set-Cookie` values are preserved. On any error the
     /// response is unchanged.
     pub fn setHeader(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
-        if (!isToken(name)) return error.InvalidHeaderName;
-        if (hasForbiddenValueByte(value)) return error.InvalidHeaderValue;
+        try validateHeader(name, value);
         if (self.header_count >= self.limits.max_headers) return error.TooManyHeaders;
         const additional = name.len + value.len;
         if (self.header_bytes_used + additional > self.limits.header_bytes) {
@@ -279,6 +278,13 @@ pub const Response = struct {
         return found;
     }
 };
+
+/// Checks header syntax without storing a field. Useful when validating
+/// immutable middleware configuration before the first request.
+pub fn validateHeader(name: []const u8, value: []const u8) error{ InvalidHeaderName, InvalidHeaderValue }!void {
+    if (!isToken(name)) return error.InvalidHeaderName;
+    if (hasForbiddenValueByte(value)) return error.InvalidHeaderValue;
+}
 
 /// RFC 7230 field-name: one or more `tchar`s (no separators or control bytes).
 fn isToken(name: []const u8) bool {

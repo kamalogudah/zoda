@@ -69,12 +69,16 @@ fn dispatch(app: *const App, method: zoda.router.Method, target: []const u8) !zo
 
 test "ADR section 5 examples: routing, plugin state, ownership, timing" {
     const header: HeaderConfig = .{ .name = "X-Request-Id" };
+    const defaults: zoda.default_headers.Config = .{
+        .headers = &.{.{ .name = "X-App", .value = "zoda" }},
+    };
     var app = try App.init(std.testing.allocator, .{
         .response_allocator = std.testing.allocator,
         .config = .{ .clock = .monotonic(std.testing.io) },
         .plugins = .{},
         .route_fn = route,
         .middleware = &.{
+            try zoda.default_headers.middleware(App, &defaults),
             zoda.timing.middleware(App),
             .{ .config = &header, .invoke = addRequestId },
         },
@@ -97,6 +101,7 @@ test "ADR section 5 examples: routing, plugin state, ownership, timing" {
         try std.testing.expectEqualStrings(case.type, res.content_type);
         try std.testing.expectEqualStrings(case.body, res.body);
         try std.testing.expectEqualStrings("example", (try res.getHeaderOne("X-Request-Id")).?);
+        try std.testing.expectEqualStrings("zoda", (try res.getHeaderOne("X-App")).?);
         _ = try std.fmt.parseInt(u64, (try res.getHeaderOne(zoda.timing.header_name)).?, 10);
     }
     try std.testing.expectError(error.DuplicateQueryValue, dispatch(&app, .get, "/search?q=a&q=b"));

@@ -44,9 +44,9 @@ runs inside `zig build test`.
   state lifecycle, `composeRoute` wrappers, ordered middleware, default 404,
   and owned `Response` return from `dispatch`.
 - Buffered text, JSON, and embedded HTML template responses; JSON and
-  configured not-found plugins; timing and static-file middleware; signed
-  cookie sessions and session-bound CSRF helpers; bounded cleartext HTTP/1.0
-  and HTTP/1.1 socket service.
+  configured not-found plugins; default-header, timing, and static-file
+  middleware; signed cookie sessions and session-bound CSRF helpers; bounded
+  cleartext HTTP/1.0 and HTTP/1.1 socket service.
 
 The route is ordinary Zig control flow. After `onLiteral` consumes a prefix,
 return from that branch even on a miss; dispatch writes 404 for an unhandled
@@ -78,6 +78,14 @@ may run once, only within that middleware invocation; copies share the same
 single-use state. Do not store or move it to another thread. Route errors
 propagate; recovery middleware must `res.clear()` before replacing a partial
 response.
+
+Default-header middleware validates immutable configuration at entry creation.
+It rejects duplicate names, invalid syntax, and transport-owned framing or
+connection fields. Place it before static serving and other middleware to
+cover their short circuits. Existing response fields win by case-insensitive
+name; configured defaults are appended only after downstream success. Response
+header count and byte limits still apply. See the [README](README.md#default-response-headers)
+and [compiling example](examples/contract.zig).
 
 ## Safe content and sessions
 

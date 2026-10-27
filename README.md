@@ -510,6 +510,38 @@ var app = try App.init(gpa, .{
 defer app.deinit();
 ```
 
+### Default response headers
+
+`zoda.default_headers.middleware(App, &config)` adds configured headers after
+downstream middleware and routing complete. Place it first to cover static
+files, short circuits, and the default 404:
+
+```zig
+const defaults: zoda.default_headers.Config = .{
+    .headers = &.{
+        .{ .name = "X-Frame-Options", .value = "DENY" },
+        .{ .name = "Referrer-Policy", .value = "no-referrer" },
+    },
+};
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{},
+    .route_fn = route,
+    .middleware = &.{try zoda.default_headers.middleware(App, &defaults)},
+});
+defer app.deinit();
+```
+
+The middleware validates its configuration when the entry is created. Header
+names are case-insensitive: duplicate default names are rejected, and any
+existing response field with that name wins. Default fields are appended only
+after successful downstream dispatch; an error propagates without adding
+them. `Content-Type` and transport-owned framing or connection fields cannot
+be configured as defaults. Response header count and byte limits still apply.
+The configuration and its nested strings must remain immutable and valid until
+`app.deinit()`. The [compiling contract example](examples/contract.zig) includes
+this middleware.
+
 ### Response timing
 
 `zoda.timing.middleware(App)` adds `X-Response-Time-Ms` (whole milliseconds,

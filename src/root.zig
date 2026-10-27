@@ -34,6 +34,9 @@ pub const app = @import("app.zig");
 /// (ADR-0001 §5.4).
 pub const timing = @import("timing.zig");
 
+/// Configured default response headers across the middleware chain.
+pub const default_headers = @import("default_headers.zig");
+
 /// Static-file middleware with kernel-enforced document-root confinement
 /// (ADR-0001 §5.4).
 pub const static = @import("static.zig");
@@ -69,6 +72,7 @@ comptime {
     std.testing.refAllDecls(server);
     std.testing.refAllDecls(app);
     std.testing.refAllDecls(timing);
+    std.testing.refAllDecls(default_headers);
     std.testing.refAllDecls(static);
     std.testing.refAllDecls(plugins.json);
     std.testing.refAllDecls(plugins.not_found);
