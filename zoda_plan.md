@@ -1787,14 +1787,27 @@ passed both format and build/test jobs for implementation commit `4f48115`.
 [`src/plugins/sessions.zig`](src/plugins/sessions.zig) verifies explicit cookie
 finalization through successful routes, propagated errors, recovery, and
 middleware short circuits. An unsaved mutation produces no cookie, including
-after failed routes and denied requests. Returned cookie headers survive later
-dispatches, and two independently configured apps reject each other's cookies
-while serving concurrent requests. Allocation-failure injection covers partial
-response construction. The existing [`src/app.zig`](src/app.zig) state lifecycle
-tests verify reverse cleanup after normal dispatch, handler failure, and
-partial plugin initialization; the [`src/plugins/csrf.zig`](src/plugins/csrf.zig)
+after failed routes and denied requests. A saved cookie in a response that
+later fails is discarded; recovery clears that partial response and explicitly
+saves a new cookie. Returned cookie headers survive later dispatches and
+request cleanup. Four concurrent workers exercise distinct request payloads
+through two apps, including simultaneous requests to each app. Distinct keys
+prevent cross-app cookie acceptance; the cookies also show each app's configured
+clock and lifetime.
+Allocation-failure injection covers partial response construction.
+[`src/app.zig`](src/app.zig) verifies reverse cleanup after successful dispatch,
+handler failure, and partial plugin initialization. The [`src/plugins/csrf.zig`](src/plugins/csrf.zig)
 integration test verifies session-backed token persistence and rejection of
 invalid submissions. These tests run in the pinned CI `zig build test` job.
+The public cookie policy is in [`README.md`](README.md#cookie-sessions). No
+conditional follow-up is required for the Phase 5 contract.
+
+Local validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
+`zig build`; `zig build test --summary all` (171/171 tests);
+`zig build test-hardening -Doptimize=ReleaseSafe --summary all` (10/10);
+`zig build test-load -Doptimize=ReleaseSafe --summary all` (2/2);
+`zig build test-devloop --summary all` (1/1); `./zig-out/bin/zoda`
+(seven documented route outcomes); and `git diff --check`. All passed.
 
 ### Phase 6 — Write-up
 

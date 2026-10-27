@@ -619,18 +619,20 @@ test "sequential requests through one app get distinct per-request state" {
     try std.testing.expectEqualStrings("second", deinit_order.items[1]);
 }
 
-test "state cleanup runs after handler failure" {
+test "state cleanup runs in reverse after success and handler failure" {
     var init_dummy: std.ArrayList(u8) = .empty;
     defer init_dummy.deinit(std.testing.allocator);
     var deinit_order: std.ArrayList(u8) = .empty;
     defer deinit_order.deinit(std.testing.allocator);
-    var calls: usize = 0;
+    var first_calls: usize = 0;
+    var second_calls: usize = 0;
 
-    const Plugins = struct { track: TrackingPlugin };
+    const Plugins = struct { first: TrackingPlugin, second: TrackingPlugin };
     const FailApp = App(Plugins);
 
     const route = struct {
-        fn run(_: *FailApp.Context, _: *router.Request, res: *response.Response) !void {
+        fn run(_: *FailApp.Context, req: *router.Request, res: *response.Response) !void {
+            if (!req.isLiteral("fail")) return res.text(200, "ok");
             // Write a partial response, then fail: dispatch must release the
             // response storage as well as the request state on the way out.
             try res.text(500, "partial");
@@ -640,7 +642,8 @@ test "state cleanup runs after handler failure" {
     }.run;
 
     const plugins = Plugins{
-        .track = makeTrackingPlugin('X', &init_dummy, &deinit_order, &calls, null),
+        .first = makeTrackingPlugin('A', &init_dummy, &deinit_order, &first_calls, null),
+        .second = makeTrackingPlugin('B', &init_dummy, &deinit_order, &second_calls, null),
     };
     const app = FailApp{
         .response_allocator = std.testing.allocator,
@@ -649,11 +652,18 @@ test "state cleanup runs after handler failure" {
         .route_fn = route,
     };
 
-    var arena = try request.parseOriginForm(std.testing.allocator, .default, "/");
+    var success_arena = try request.parseOriginForm(std.testing.allocator, .default, "/");
+    defer success_arena.deinit();
+    var success_req = success_arena.requestView(.get);
+    var success_res = try app.dispatch(&success_req);
+    defer success_res.deinit();
+    try std.testing.expectEqualStrings("ok", success_res.body);
+
+    var arena = try request.parseOriginForm(std.testing.allocator, .default, "/fail");
     defer arena.deinit();
     var req = arena.requestView(.get);
     try std.testing.expectError(error.Boom, app.dispatch(&req));
-    try std.testing.expectEqualSlices(u8, "X", deinit_order.items);
+    try std.testing.expectEqualSlices(u8, "BABA", deinit_order.items);
     // `std.testing.allocator` reports a leak if the partial response body and
     // header are not released when dispatch unwinds after the handler error.
 }

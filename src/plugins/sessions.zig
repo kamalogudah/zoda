@@ -403,7 +403,12 @@ test "session cookie policy follows success, recovery, failure, and short circui
                 try ctx.plugins.sessions.save(&ctx.state.sessions, res);
                 return res.text(200, "ok");
             }
-            if (req.isLiteral("fail") or req.isLiteral("recover")) {
+            if (req.isLiteral("fail-saved") or req.isLiteral("recover")) {
+                try ctx.state.sessions.set("discarded");
+                try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+                return error.RouteFailed;
+            }
+            if (req.isLiteral("fail")) {
                 try ctx.state.sessions.set("discarded");
                 return error.RouteFailed;
             }
@@ -449,6 +454,8 @@ test "session cookie policy follows success, recovery, failure, and short circui
 
     var fail_req: router.Request = .{ .method = .get, .segments = &.{"fail"} };
     try std.testing.expectError(error.RouteFailed, app.dispatch(&fail_req));
+    var fail_saved_req: router.Request = .{ .method = .get, .segments = &.{"fail-saved"} };
+    try std.testing.expectError(error.RouteFailed, app.dispatch(&fail_saved_req));
     var read_req: router.Request = .{ .method = .get, .segments = &.{"read"} };
     var read = try app.dispatch(&read_req);
     defer read.deinit();
@@ -492,8 +499,8 @@ test "session app instances use independent keys, clocks, and request state conc
     const A = app_mod.App(struct { sessions: Sessions });
     const Handler = struct {
         fn route(ctx: *A.Context, req: *router.Request, res: *response.Response) !void {
-            if (req.isLiteral("set")) {
-                try ctx.state.sessions.set("thread");
+            if (req.segments.len == 2 and std.mem.eql(u8, req.segments[0], "set")) {
+                try ctx.state.sessions.set(req.segments[1]);
                 try ctx.plugins.sessions.save(&ctx.state.sessions, res);
                 return res.text(200, "ok");
             }
@@ -511,24 +518,27 @@ test "session app instances use independent keys, clocks, and request state conc
     defer second.deinit();
 
     const Worker = struct {
-        fn run(a: *const A, other: *const A, failures: *std.atomic.Value(usize)) void {
+        fn run(a: *const A, other: *const A, value: []const u8, expiry: []const u8, failures: *std.atomic.Value(usize)) void {
             for (0..100) |_| {
-                check(a, other) catch {
+                check(a, other, value, expiry) catch {
                     _ = failures.fetchAdd(1, .monotonic);
                 };
             }
         }
 
-        fn check(a: *const A, other: *const A) !void {
-            var set_req: router.Request = .{ .method = .get, .segments = &.{"set"} };
+        fn check(a: *const A, other: *const A, value: []const u8, expiry: []const u8) !void {
+            const segments = [_][]const u8{ "set", value };
+            var set_req: router.Request = .{ .method = .get, .segments = &segments };
             var res = try a.dispatch(&set_req);
             defer res.deinit();
+            try std.testing.expectEqual(@as(usize, 1), res.header_count);
+            try std.testing.expect(std.mem.indexOf(u8, res.headers[0].value, expiry) != null);
             const cookie = cookieValue(res.headers[0].value);
             const headers = [_]router.Header{.{ .name = "Cookie", .value = cookie }};
             var read_req: router.Request = .{ .method = .get, .segments = &.{"read"}, .headers = &headers };
             var own = try a.dispatch(&read_req);
             defer own.deinit();
-            try std.testing.expectEqualStrings("thread", own.body);
+            try std.testing.expectEqualStrings(value, own.body);
             var foreign = try other.dispatch(&read_req);
             defer foreign.deinit();
             try std.testing.expectEqual(@as(usize, 0), foreign.body.len);
@@ -539,10 +549,14 @@ test "session app instances use independent keys, clocks, and request state conc
         }
     };
     var failures = std.atomic.Value(usize).init(0);
-    const t1 = try std.Thread.spawn(.{}, Worker.run, .{ &first, &second, &failures });
-    const t2 = try std.Thread.spawn(.{}, Worker.run, .{ &second, &first, &failures });
+    const t1 = try std.Thread.spawn(.{}, Worker.run, .{ &first, &second, "first-a", "=v1.1.1300.", &failures });
+    const t2 = try std.Thread.spawn(.{}, Worker.run, .{ &first, &second, "first-b", "=v1.1.1300.", &failures });
+    const t3 = try std.Thread.spawn(.{}, Worker.run, .{ &second, &first, "second-a", "=v1.2.1800.", &failures });
+    const t4 = try std.Thread.spawn(.{}, Worker.run, .{ &second, &first, "second-b", "=v1.2.1800.", &failures });
     t1.join();
     t2.join();
+    t3.join();
+    t4.join();
     try std.testing.expectEqual(@as(usize, 0), failures.load(.monotonic));
 }
 
