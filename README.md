@@ -16,15 +16,19 @@ explicitly. It targets JSON APIs and server-rendered sites.
 
 [`PLATFORM.md`](PLATFORM.md) covers installation, the allocator and threading
 contracts, and validation evidence.
+[`SUPPORTED_API.md`](SUPPORTED_API.md) is the concise public support contract,
+including defaults, unsupported capabilities, ownership, measured results,
+and the compiler-checked [ADR §5 example](examples/contract.zig).
 
 ## Building and testing
 
 ```sh
 zig build                                        # library + demo executable
 zig build test                                   # unit and acceptance tests
+zig build test-examples                          # compiling ADR §5 API example
 zig build test-hardening -Doptimize=ReleaseSafe  # adversarial HTTP/1.1 tests over real sockets
 zig build test-load -Doptimize=ReleaseSafe       # 60-second load and overload measurement
-zig fmt --check build.zig src                    # formatting gate used by CI
+zig fmt --check build.zig src examples           # formatting gate used by CI
 ./zig-out/bin/zoda                               # run the demo
 ```
 
@@ -183,6 +187,8 @@ development watcher rebuilds when that file changes.
 
 Routing is ordinary Zig control flow over a single path cursor. Matchers
 consume path segments, and they never allocate.
+Cost depends on the number of sibling alternatives tried and the string
+comparisons they make; there is no unconditional O(depth) bound.
 
 | Matcher | Behavior |
 |---|---|

@@ -142,6 +142,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Compile and run the public ADR §5 example in the normal test gate.
+    const example_module = b.createModule(.{
+        .root_source_file = b.path("examples/contract.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zoda", .module = mod }},
+    });
+    const example_tests = b.addTest(.{ .root_module = example_module });
+    const example_run = b.addRunArtifact(example_tests);
+    const examples_step = b.step("test-examples", "Compile and run the public API examples");
+    examples_step.dependOn(&example_run.step);
+    test_step.dependOn(&example_run.step);
+
     // Phase 2b adversarial real-socket suite, runnable on its own so CI can
     // repeat it under other optimize modes, e.g.
     // `zig build test-hardening -Doptimize=ReleaseSafe`. It gets its own

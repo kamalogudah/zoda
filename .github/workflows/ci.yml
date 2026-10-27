@@ -18,7 +18,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - run: zig fmt --check build.zig src
+      - run: zig fmt --check build.zig src examples
 
   build:
     name: Build and test
@@ -35,6 +35,8 @@ jobs:
         run: zig build
       - name: Run tests
         run: zig build test
+      - name: Compile public API example
+        run: zig build test-examples
       - name: Adversarial HTTP/1.1 suite (ReleaseSafe)
         run: zig build test-hardening -Doptimize=ReleaseSafe --summary all
       - name: 60-second load and overload measurements (ReleaseSafe)

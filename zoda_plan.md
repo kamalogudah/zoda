@@ -1815,165 +1815,62 @@ the pinned Zig `0.16.0` toolchain.
 
 ### Phase 6 — Write-up
 
-- [ ] Document supported features and measured results, then prepare the
-      Roda-to-Zig design talk once the core and wrapper phases pass.
+- [x] Publish the supported API, ownership rules, defaults, unsupported
+      capabilities, measurements, and Roda deviations in
+      [SUPPORTED_API.md](SUPPORTED_API.md) and the [README](README.md).
+- [x] Convert §5 sketches to the compiling [public API example](examples/contract.zig),
+      run by `zig build test-examples` and pinned CI's `zig build test`.
+- [ ] Record a passing hosted CI run for the Phase 6 change after it is pushed.
+- [ ] Prepare the Roda-to-Zig design talk as separate follow-up work.
 
-## 5. Consistent design sketches
+Local validation on 2026-10-27, Zig `0.16.0`, `x86_64-linux-gnu`:
+`zig fmt --check build.zig src examples`, `zig build`,
+`zig build test --summary all` (172/172), `zig build test-examples --summary all`
+(1/1), `zig build test-hardening -Doptimize=ReleaseSafe --summary all` (10/10),
+`zig build test-load -Doptimize=ReleaseSafe --summary all` (2/2),
+`zig build test-devloop --summary all` (1/1), `./zig-out/bin/zoda`, and
+`git diff --check` all passed. The new local measurements are in
+[SUPPORTED_API.md](SUPPORTED_API.md#reproducible-measurements-and-decisions).
 
-These snippets omit imports, parsing, initialization, and version-specific
-serialization/I/O internals. Helper methods describe required library APIs;
-the sketches must become compiling examples during their implementation phases.
+## 5. Compiling public API examples
+
+The implementation of the original §5.1–§5.4 design sketches is the
+[compiling example](examples/contract.zig), checked by `zig build test-examples`
+and by `zig build test` in pinned CI. It uses the actual `Request` matchers,
+ordered query lookup, `App.init`/`dispatch`, registered JSON and per-request
+plugin state, an app-owned middleware entry, the single-use `Next`, and
+`zoda.timing.middleware(App)` with an injected monotonic clock. Its route matrix
+asserts status, content type, body, and headers, including all §5.3 misses.
 
 ### 5.1 Allocation-free matcher and ordered query data
 
-```zig
-pub const QueryPair = struct { key: []const u8, value: []const u8 };
-pub const Request = struct {
-    method: Method,
-    segments: []const []const u8,
-    cursor: usize = 0,
-    query: []const QueryPair,
-
-    pub fn mark(self: *const Request) usize { return self.cursor; }
-    pub fn restore(self: *Request, saved: usize) void { self.cursor = saved; }
-    pub fn isRoot(self: *const Request) bool { return self.cursor == self.segments.len; }
-    pub fn isGet(self: *const Request) bool { return self.method == .get; }
-
-    pub fn onLiteral(self: *Request, literal: []const u8) bool {
-        if (self.isRoot()) return false;
-        if (!std.mem.eql(u8, self.segments[self.cursor], literal)) return false;
-        self.cursor += 1;
-        return true;
-    }
-
-    pub fn onSegment(self: *Request) ?[]const u8 {
-        if (self.isRoot()) return null;
-        const value = self.segments[self.cursor];
-        self.cursor += 1;
-        return value;
-    }
-
-    // Terminal matcher: succeeds and consumes only when exactly one remaining
-    // segment equals `literal`; otherwise it fails without consuming, and the
-    // caller must keep the branch open.
-    pub fn isLiteral(self: *Request, literal: []const u8) bool {
-        if (self.segments.len - self.cursor != 1) return false;
-        if (!std.mem.eql(u8, self.segments[self.cursor], literal)) return false;
-        self.cursor += 1;
-        return true;
-    }
-};
-```
-
-Checkpoints (`mark`/`restore`) apply only to the same request, restore routing
-state only — never response writes or plugin side effects — and alternatives
-must be attempted before producing output or side effects.
+`Request.mark`/`restore` operate on the cursor only. The example
+tries an alternative before response writes and shows `getOne` rejecting a
+duplicate query key. Request parsing and header semantics are defined in
+[SUPPORTED_API.md](SUPPORTED_API.md#supported-surface).
 
 ### 5.2 App dispatch and registered plugin access
 
-```zig
-pub fn App(comptime Plugins: type) type {
-    return struct {
-        const Self = @This();
-        pub const State = RequestState(Plugins);
-        pub const Context = struct {
-            plugins: *const Plugins,
-            config: *const AppConfig,
-            state: *State,
-        };
-        pub const RouteFn = *const fn (*Context, *Request, *Response) anyerror!void;
-
-        response_allocator: std.mem.Allocator,
-        config: AppConfig,
-        plugins: Plugins,
-        route_fn: RouteFn,
-        middleware: []const Middleware = &.{}, // app-owned copy made by `init` (§3.6)
-
-        pub fn dispatch(self: *const Self, req: *Request) !Response {
-            // init cleans up successfully initialized fields if a later hook fails.
-            var state = try State.init(&self.plugins, req);
-            defer state.deinit(&self.plugins);
-            var ctx = Context{
-                .plugins = &self.plugins,
-                .config = &self.config,
-                .state = &state,
-            };
-            var res = Response.init(self.response_allocator);
-            errdefer res.deinit();
-            // Middleware chain (§3.6); the terminal continuation runs the
-            // route and the default 404.
-            try self.runFrom(0, &ctx, req, &res);
-            // Covers middleware short circuits that left the response unhandled.
-            if (!res.handled) try res.text(404, "Not Found");
-            return res; // Caller owns response; request is still caller-owned.
-        }
-    };
-}
-```
+`App.init` copies middleware entries and `dispatch` returns a
+caller-owned response. The example deinitializes its request arena before
+inspecting the returned response, then deinitializes the response.
 
 ### 5.3 Stateless plugin instance and committed branches
 
-```zig
-pub const Json = struct {
-    pub const State = struct {};
-    pub fn initRequest(_: *const Json, _: *Request) !State { return .{}; }
-    pub fn deinitRequest(_: *const Json, _: *State) void {}
-
-    pub fn render(_: *const Json, res: *Response, comptime T: type, value: T) !void {
-        // Library helper serializes into response-owned bounded storage.
-        // On success it replaces body/status/content type and marks handled.
-        try res.replaceJson(200, T, value);
-    }
-};
-
-const Plugins = struct { json: Json = .{} };
-const Demo = App(Plugins);
-
-fn route(ctx: *Demo.Context, req: *Request, res: *Response) !void {
-    if (req.isRoot() and req.isGet()) return res.text(200, "hello from zoda");
-    if (req.onLiteral("users")) {
-        if (req.onSegment()) |id| {
-            if (req.isRoot() and req.isGet()) {
-                return ctx.plugins.json.render(res, User, .{ .id = id, .name = "unknown" });
-            }
-        }
-        return; // Commit this branch; dispatch supplies 404 if unhandled.
-    }
-}
-```
-
-Required outcomes: `GET /` → 200 text; `GET /users/42` → 200 JSON;
-`GET /users`, `GET /users/42/extra`, `GET /users/42/`, and
-`POST /users/42` → 404. Returning from a delegated branch must use
-`return child(ctx, req, res)`.
+A matched `users` prefix ends with an explicit `return`, whether
+or not the route produced a response. The test pins all seven route outcomes.
 
 ### 5.4 Middleware example
 
-```zig
-fn timing(
-    _: *const anyopaque,
-    ctx: *Context,
-    req: *Request,
-    res: *Response,
-    next: Next,
-) !void {
-    const clock = ctx.config.clock orelse return error.ClockNotConfigured;
-    const start = clock.monotonicNow();
-    try next.call(ctx, req, res);
-    // Copies formatted bytes into response storage; no request allocation escapes.
-    try res.setHeaderFmt(
-        "X-Response-Time-Ms",
-        "{d}",
-        .{clock.elapsedMilliseconds(start)},
-    );
-}
-```
+`zoda.timing.middleware(App)` is the implemented timing API. Its
+clock is configured with `.clock = .monotonic(io)`; the separate entry in the
+example shows the borrowed configuration pointer and `next.call`. Static
+middleware uses `zoda.static.middleware(App, &config)` as documented in the
+[README](README.md#static-files).
 
-The clock is an injected application interface implemented against the pinned
-toolchain (`AppConfig.clock: ?Clock`, `Clock.monotonic(io)` over
-`Io.Clock.awake`; implemented as `zoda.timing.middleware(App)`, §4.2.10). Static-file middleware uses its configuration pointer for the
-document-root handle and calls `next.call` only when it does not serve the path
-(implemented as `zoda.static.middleware(App, &config)`, §4.2.11).
+The original sketches described the design before the API was implemented;
+`examples/contract.zig` is the maintained, compiler-checked form. For a socket
+server setup, see the [complete server example](README.md#a-complete-server).
 
 ## 6. Verification and remaining decisions
 
