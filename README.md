@@ -325,6 +325,9 @@ prefix requires HTTPS and prevents a Domain attribute. `clear` followed by
 ends; cleanup is infallible and never writes a response. The route or
 middleware decides when to persist, including on short circuits. Configure
 CSRF protection before using cookie sessions for state-changing requests.
+If a route fails after `save`, a propagated error discards its partial response.
+Recovery middleware can call `res.clear()` and then explicitly `save` the
+recovered session; cleanup never creates or restores a cookie.
 
 #### CSRF helpers
 
