@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zoda Todo</title>
+  <style>
+    body { font: 16px system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; padding: 0 1rem; color: #20242b; }
+    h1 { margin-bottom: .25rem; }
+    p { color: #59616c; }
+    form, li { display: flex; gap: .5rem; align-items: center; }
+    input[type=text] { flex: 1; min-width: 0; padding: .65rem; font: inherit; }
+    button { padding: .65rem; font: inherit; cursor: pointer; }
+    ul { list-style: none; padding: 0; }
+    li { padding: .55rem 0; border-bottom: 1px solid #ddd; }
+    li span { flex: 1; overflow-wrap: anywhere; }
+    li.done span { text-decoration: line-through; color: #777; }
+    #message { min-height: 1.5em; color: #a12626; }
+  </style>
+</head>
+<body>
+  <h1>Todo list</h1>
+  <p>A small app built with Zoda. Items are kept in memory until the server stops.</p>
+  <form id="add-form">
+    <input id="new-todo" type="text" maxlength="200" placeholder="What needs doing?" aria-label="New todo" required>
+    <button>Add</button>
+  </form>
+  <p id="message" role="status"></p>
+  <ul id="todos"></ul>
+  <script>
+    const list = document.querySelector('#todos');
+    const message = document.querySelector('#message');
+    const input = document.querySelector('#new-todo');
+
+    async function request(path, options) {
+      const response = await fetch(path, options);
+      if (!response.ok) throw new Error(await response.text());
+      return response;
+    }
+
+    async function refresh() {
+      const todos = await (await request('/api/todos')).json();
+      list.replaceChildren();
+      for (const todo of todos) {
+        const row = document.createElement('li');
+        if (todo.done) row.classList.add('done');
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.checked = todo.done;
+        check.setAttribute('aria-label', `Complete ${todo.text}`);
+        check.addEventListener('change', () => act(`/api/todos/${todo.id}/toggle`, { method: 'POST' }));
+        const label = document.createElement('span');
+        label.textContent = todo.text;
+        const remove = document.createElement('button');
+        remove.textContent = 'Delete';
+        remove.setAttribute('aria-label', `Delete ${todo.text}`);
+        remove.addEventListener('click', () => act(`/api/todos/${todo.id}`, { method: 'DELETE' }));
+        row.append(check, label, remove);
+        list.append(row);
+      }
+    }
+
+    async function act(path, options) {
+      try {
+        message.textContent = '';
+        await request(path, options);
+        await refresh();
+      } catch (error) {
+        message.textContent = error.message;
+        await refresh().catch(() => {});
+      }
+    }
+
+    document.querySelector('#add-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      await act('/api/todos', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      });
+      if (!message.textContent) input.value = '';
+    });
+    refresh().catch(error => { message.textContent = error.message; });
+  </script>
+</body>
+</html>

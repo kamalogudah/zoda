@@ -155,6 +155,20 @@ pub fn build(b: *std.Build) void {
     examples_step.dependOn(&example_run.step);
     test_step.dependOn(&example_run.step);
 
+    const todo_module = b.createModule(.{
+        .root_source_file = b.path("examples/todo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zoda", .module = mod }},
+    });
+    const todo_exe = b.addExecutable(.{ .name = "todo", .root_module = todo_module });
+    const todo_run = b.addRunArtifact(todo_exe);
+    const todo_step = b.step("run-todo", "Run the in-memory todo web app on localhost:8080");
+    todo_step.dependOn(&todo_run.step);
+    const todo_tests = b.addRunArtifact(b.addTest(.{ .root_module = todo_module }));
+    examples_step.dependOn(&todo_tests.step);
+    test_step.dependOn(&todo_tests.step);
+
     // Phase 2b adversarial real-socket suite, runnable on its own so CI can
     // repeat it under other optimize modes, e.g.
     // `zig build test-hardening -Doptimize=ReleaseSafe`. It gets its own

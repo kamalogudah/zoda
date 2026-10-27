@@ -91,6 +91,19 @@ exe.root_module.addImport("zoda", zoda.module("zoda"));
 
 ## Usage
 
+### Todo example
+
+Run the interactive, in-memory todo app from this repository:
+
+```sh
+zig build run-todo
+```
+
+Open <http://localhost:8080> to add, complete, and delete todos. The example
+source is in [`examples/todo.zig`](examples/todo.zig) and
+[`examples/todo.html`](examples/todo.html). Its API tests run with
+`zig build test-examples`.
+
 ### A complete server
 
 ```zig
@@ -614,6 +627,24 @@ Requests that break a limit get a 400, 413, 414, or 431 response, and the
 connection is closed. The server rejects `Expect`, content codings, and
 ambiguous framing (for example, a signed `Content-Length` or malformed
 chunked encoding).
+
+### Local `wrk` measurement
+
+With Zig 0.16.0 and a ReleaseFast build, the demo server using the default
+`server.Config` was measured on loopback on 2026-10-27:
+
+```sh
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zoda serve 18080
+# In another terminal:
+wrk -t12 -c128 -d30s http://127.0.0.1:18080
+```
+
+`wrk` completed 1,354,883 requests in 30.10 s (45,019.86 requests/s), with
+2.33 ms average latency and no reported socket errors. This is a local
+measurement, not a throughput guarantee. The default `max_connections` is
+128; a 400-connection run exceeds that cap and can report socket read errors
+and fewer completed requests.
 
 ## License
 
