@@ -74,6 +74,17 @@ pub const HeaderError = error{
 pub const text_content_type = "text/plain";
 pub const json_content_type = "application/json";
 
+/// Redirect status is chosen by the caller. 302/303 may change a follow-up
+/// request to GET; 307/308 preserve its method and body.
+pub const RedirectStatus = enum(u16) {
+    found = 302,
+    see_other = 303,
+    temporary_redirect = 307,
+    permanent_redirect = 308,
+};
+
+pub const RedirectError = HeaderError || error{ InvalidRedirectPath, LocationAlreadySet };
+
 /// An independently owned buffered response. Created by `init`, released with
 /// `deinit` after the transport has sent it.
 pub const Response = struct {
@@ -226,6 +237,24 @@ pub const Response = struct {
         self.header_bytes_used += additional;
     }
 
+    /// Sends a local, origin-relative redirect with an empty body. The path
+    /// must begin with exactly one slash. Rejects URL authority/scheme forms,
+    /// backslashes, controls, spaces, malformed escapes, and encoded slashes,
+    /// backslashes or controls. Never derives a destination from Host or
+    /// forwarded headers. A failure leaves the response unchanged.
+    pub fn redirectPath(self: *Response, status: RedirectStatus, path: []const u8) RedirectError!void {
+        try validateRedirectPath(path);
+        var locations = self.getAllHeaders("Location");
+        if (locations.next() != null) return error.LocationAlreadySet;
+        try self.setHeader("Location", path);
+        if (self.body.len != 0) self.allocator.free(self.body);
+        if (self.content_type.len != 0) self.allocator.free(@constCast(self.content_type));
+        self.body = &.{};
+        self.content_type = &.{};
+        self.status_code = @intFromEnum(status);
+        self.handled = true;
+    }
+
     /// Formats a value with `std.fmt` and appends it via `setHeader`. The
     /// formatted bytes are transient and never stored beyond the header byte
     /// limit; on any error the response is unchanged.
@@ -306,6 +335,97 @@ fn hasForbiddenValueByte(value: []const u8) bool {
         if (c == '\r' or c == '\n' or c == 0) return true;
     }
     return false;
+}
+
+fn validateRedirectPath(path: []const u8) error{InvalidRedirectPath}!void {
+    if (path.len == 0 or path[0] != '/' or (path.len > 1 and path[1] == '/')) return error.InvalidRedirectPath;
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) {
+        const c = path[i];
+        if (c <= ' ' or c >= 0x7f or c == '\\') return error.InvalidRedirectPath;
+        if (c == '%') {
+            if (path.len - i < 3) return error.InvalidRedirectPath;
+            const hi = std.fmt.charToDigit(path[i + 1], 16) catch return error.InvalidRedirectPath;
+            const lo = std.fmt.charToDigit(path[i + 2], 16) catch return error.InvalidRedirectPath;
+            const decoded = hi * 16 + lo;
+            if (decoded < ' ' or decoded >= 0x7f or decoded == '/' or decoded == '\\') return error.InvalidRedirectPath;
+            i += 2;
+        }
+    }
+}
+
+test "redirect paths and explicit method semantics" {
+    const testing = std.testing;
+    const cases = .{
+        .{ RedirectStatus.found, @as(u16, 302) },
+        .{ RedirectStatus.see_other, @as(u16, 303) },
+        .{ RedirectStatus.temporary_redirect, @as(u16, 307) },
+        .{ RedirectStatus.permanent_redirect, @as(u16, 308) },
+    };
+    inline for (cases) |case| {
+        var res = Response.init(testing.allocator);
+        defer res.deinit();
+        try res.text(200, "old body");
+        try res.redirectPath(case[0], "/new?q=1#part");
+        try testing.expectEqual(case[1], res.status_code);
+        try testing.expect(res.handled);
+        try testing.expectEqualStrings("", res.body);
+        try testing.expectEqualStrings("", res.content_type);
+        try testing.expectEqualStrings("/new?q=1#part", (try res.getHeaderOne("Location")).?);
+    }
+    var root = Response.init(testing.allocator);
+    defer root.deinit();
+    try root.redirectPath(.see_other, "/");
+    try testing.expectEqualStrings("/", (try root.getHeaderOne("Location")).?);
+    var encoded = Response.init(testing.allocator);
+    defer encoded.deinit();
+    try encoded.redirectPath(.found, "/hello%20world?next=%3F");
+    try testing.expectEqualStrings("/hello%20world?next=%3F", (try encoded.getHeaderOne("Location")).?);
+}
+
+test "redirect rejects unsafe destinations and preserves response" {
+    const testing = std.testing;
+    var res = Response.init(testing.allocator);
+    defer res.deinit();
+    try res.text(201, "keep");
+    const bad = [_][]const u8{
+        "",            "relative",         "https://evil.test/", "//evil.test/", "/\\evil.test/",
+        "/space here", "/\r\nX-Evil: yes", "/\x00",              "/\x7f",
+        "/é",
+        "/%",          "/%2",              "/%gg",               "/%2f/evil",    "/%5c/evil",
+        "/%0d%0a",
+    };
+    for (bad) |path| {
+        try testing.expectError(error.InvalidRedirectPath, res.redirectPath(.found, path));
+        try testing.expectEqual(@as(u16, 201), res.status_code);
+        try testing.expectEqualStrings("keep", res.body);
+        try testing.expectEqual(@as(usize, 0), res.header_count);
+    }
+    try res.setHeader("location", "/existing");
+    try testing.expectError(error.LocationAlreadySet, res.redirectPath(.found, "/new"));
+    try testing.expectEqual(@as(u16, 201), res.status_code);
+    try testing.expectEqual(@as(usize, 1), res.header_count);
+}
+
+test "redirect honors header limits before changing response" {
+    const testing = std.testing;
+    const limits = [_]struct { limits: Limits, expected: RedirectError }{
+        .{ .limits = .{ .max_headers = 0 }, .expected = error.TooManyHeaders },
+        .{ .limits = .{ .header_bytes = 8 }, .expected = error.HeaderBytesExceeded },
+    };
+    for (limits) |case| {
+        var res = Response.initWithLimits(testing.allocator, case.limits);
+        defer res.deinit();
+        try res.text(200, "old");
+        try testing.expectError(case.expected, res.redirectPath(.temporary_redirect, "/new"));
+        try testing.expectEqual(@as(u16, 200), res.status_code);
+        try testing.expectEqualStrings("old", res.body);
+        try testing.expectEqual(@as(usize, 0), res.header_count);
+    }
+    var empty_body = Response.initWithLimits(testing.allocator, .{ .max_body_bytes = 0 });
+    defer empty_body.deinit();
+    try empty_body.redirectPath(.permanent_redirect, "/new");
+    try testing.expectEqualStrings("", empty_body.body);
 }
 
 test "fresh response is empty and unhandled" {

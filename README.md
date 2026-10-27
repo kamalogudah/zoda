@@ -270,6 +270,27 @@ try res.setHeader("Cache-Control", "no-store");     // CR, LF, and NUL are rejec
 try res.setHeaderFmt("X-Request-Id", "{d}", .{id});
 ```
 
+For a local redirect, choose the status explicitly in a route:
+
+```zig
+if (req.isLiteral("old") and req.isGet()) {
+    return res.redirectPath(.found, "/new"); // 302
+}
+if (req.isLiteral("submit") and req.method == .post) {
+    return res.redirectPath(.see_other, "/receipt"); // 303
+}
+```
+
+`redirectPath` accepts a path beginning with one `/`, including an optional
+query or fragment. It rejects external and ambiguous destinations, header
+injection bytes, malformed escapes, and an existing `Location` header. The
+redirect has an empty body and respects response header limits. Choose `.found`
+(302) or `.see_other` (303) when a client may follow with GET; choose
+`.temporary_redirect` (307) or `.permanent_redirect` (308) to preserve the
+request method and body. See `examples/contract.zig` for a compiling route.
+HTTPS redirection is not provided until the server has a trusted request-scheme
+contract; forwarded scheme headers are not trusted by default.
+
 Repeated headers such as `Set-Cookie` are kept as separate fields. The
 transport sets `Content-Length` and other framing headers itself.
 

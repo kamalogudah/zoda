@@ -47,6 +47,14 @@ runs inside `zig build test`.
   configured not-found plugins; host-authorization, default-header, timing, and static-file
   middleware; signed cookie sessions and session-bound CSRF helpers; bounded
   cleartext HTTP/1.0 and HTTP/1.1 socket service.
+- `Response.redirectPath(status, path)` sets an explicit 302, 303, 307, or 308
+  and a copied `Location` for a local path. It rejects external or ambiguous
+  destinations, invalid header bytes, malformed escapes, and a preexisting
+  `Location`; header limits apply. A successful redirect has an empty body.
+  302/303 may lead a client to use GET; 307/308 preserve method and body.
+  HTTPS redirect middleware is deferred until the transport or trusted-proxy
+  scheme contract is specified and covered by integration tests. Forwarded
+  scheme headers are not trusted by default.
 - `zoda.BearerToken` is an opt-in registered plugin. `token(req)` returns a
   request-borrowed credential or null, and reports duplicate, malformed, or
   oversized Authorization credentials as errors. `authorized(req)` maps all

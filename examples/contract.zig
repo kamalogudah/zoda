@@ -23,6 +23,10 @@ const App = zoda.app.App(Plugins);
 
 fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
     if (req.isRoot() and req.isGet()) return res.text(200, "hello from zoda");
+    if (req.isLiteral("old")) {
+        if (req.isGet()) return res.redirectPath(.found, "/new");
+        if (req.method == .post) return res.redirectPath(.temporary_redirect, "/new");
+    }
 
     // §5.1: mark/restore rewinds only the cursor. Try alternatives before writes.
     const saved = req.mark();
@@ -105,4 +109,11 @@ test "ADR section 5 examples: routing, plugin state, ownership, timing" {
         _ = try std.fmt.parseInt(u64, (try res.getHeaderOne(zoda.timing.header_name)).?, 10);
     }
     try std.testing.expectError(error.DuplicateQueryValue, dispatch(&app, .get, "/search?q=a&q=b"));
+    inline for (.{ .{ zoda.router.Method.get, @as(u16, 302) }, .{ zoda.router.Method.post, @as(u16, 307) } }) |case| {
+        var res = try dispatch(&app, case[0], "/old");
+        defer res.deinit();
+        try std.testing.expectEqual(case[1], res.status_code);
+        try std.testing.expectEqualStrings("/new", (try res.getHeaderOne("Location")).?);
+        try std.testing.expectEqualStrings("", res.body);
+    }
 }
