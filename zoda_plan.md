@@ -1821,7 +1821,8 @@ the pinned Zig `0.16.0` toolchain.
 - [x] Convert §5 sketches to the compiling [public API example](examples/contract.zig),
       run by `zig build test-examples` and pinned CI's `zig build test`.
 - [ ] Record a passing hosted CI run for the Phase 6 change after it is pushed.
-- [ ] Prepare the Roda-to-Zig design talk as separate follow-up work.
+- [x] Prepare the [Roda-to-Zig design talk](DESIGN_TALK.md) from verified core
+      and wrapper behavior, compiling examples, and measured results (issue #37).
 
 Local validation on 2026-10-27, Zig `0.16.0`, `x86_64-linux-gnu`:
 `zig fmt --check build.zig src examples`, `zig build`,

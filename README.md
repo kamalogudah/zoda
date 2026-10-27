@@ -22,6 +22,10 @@ and the compiler-checked [ADR §5 example](examples/contract.zig).
 
 ## Building and testing
 
+The [Roda-to-Zig design talk](DESIGN_TALK.md) walks through the verified
+route, plugin, ownership, middleware, and wrapper behavior with the compiling
+example and measured results.
+
 ```sh
 zig build                                        # library + demo executable
 zig build test                                   # unit and acceptance tests
