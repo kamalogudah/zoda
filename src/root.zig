@@ -51,6 +51,8 @@ pub const plugins = struct {
     pub const sessions = @import("plugins/sessions.zig");
     /// Session-bound synchronizer token helpers.
     pub const csrf = @import("plugins/csrf.zig");
+    /// Application-validated Authorization Bearer credentials.
+    pub const bearer_token = @import("plugins/bearer_token.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
@@ -59,6 +61,7 @@ pub const Json = plugins.json.Json;
 /// Re-export the not-found wrapper instance type for convenience.
 pub const NotFound = plugins.not_found.NotFound;
 pub const Sessions = plugins.sessions.Sessions;
+pub const BearerToken = plugins.bearer_token.BearerToken;
 
 comptime {
     // Collect the imported modules' test declarations into the library test
@@ -78,6 +81,7 @@ comptime {
     std.testing.refAllDecls(plugins.not_found);
     std.testing.refAllDecls(plugins.sessions);
     std.testing.refAllDecls(plugins.csrf);
+    std.testing.refAllDecls(plugins.bearer_token);
 }
 
 test {

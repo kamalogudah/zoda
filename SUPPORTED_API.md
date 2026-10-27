@@ -47,6 +47,20 @@ runs inside `zig build test`.
   configured not-found plugins; default-header, timing, and static-file
   middleware; signed cookie sessions and session-bound CSRF helpers; bounded
   cleartext HTTP/1.0 and HTTP/1.1 socket service.
+- `zoda.BearerToken` is an opt-in registered plugin. `token(req)` returns a
+  request-borrowed credential or null, and reports duplicate, malformed, or
+  oversized Authorization credentials as errors. `authorized(req)` maps all
+  failures to false and calls the application-supplied validator for a parsed
+  credential. The parser accepts exactly one `Authorization: Bearer <token>`
+  field with case-insensitive scheme, one SP separator, and RFC 6750 b64token
+  syntax; it never reads query parameters. The default maximum is 4096 token
+  bytes. The callback must not retain the borrowed token.
+- `BearerToken.guard_routes = true` adds a wrapper through `App.composeRoute`.
+  It sends 401, `WWW-Authenticate: Bearer`, and a fixed body before the inner
+  route on failure. The default is false. With `NotFound` registered,
+  unauthenticated misses receive 401 and authenticated misses receive 404,
+  regardless of these two wrappers' order. Routes may call
+  `ctx.plugins.<name>.authorized(req)` and `.unauthorized(res)` explicitly.
 
 The route is ordinary Zig control flow. After `onLiteral` consumes a prefix,
 return from that branch even on a miss; dispatch writes 404 for an unhandled

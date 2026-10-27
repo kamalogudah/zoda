@@ -307,6 +307,68 @@ const Plugins = struct {
 - Call plugin methods through `ctx.plugins.<name>` so the registered instance
   stays explicit. See the [Phase 4 decision](zoda_plan.md#compiler-supported-conveniences-decision-issue-31).
 
+#### Bearer tokens
+
+Register `zoda.BearerToken` with an application validator. The parser reads
+only one `Authorization: Bearer <token>` field. It accepts the RFC 6750
+`b64token` alphabet, rejects duplicate, malformed, and oversized credentials,
+and returns a slice borrowed from the request. The plugin does not store
+tokens or perform identity lookup.
+
+```zig
+const std = @import("std");
+const zoda = @import("zoda");
+
+fn validate(token: []const u8) bool {
+    // Replace with application-owned validation and identity lookup.
+    return std.mem.eql(u8, token, "example-token");
+}
+
+const Plugins = struct {
+    bearer: zoda.BearerToken = .{ .validate = validate, .guard_routes = true },
+    not_found: zoda.NotFound = .{ .body = "Not Found" },
+};
+const App = zoda.app.App(Plugins);
+
+fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    _ = ctx;
+    if (req.isLiteral("private") and req.isGet()) return res.text(200, "ok");
+}
+
+fn makeApp(gpa: std.mem.Allocator) !App {
+    return App.init(gpa, .{
+        .response_allocator = gpa,
+        .plugins = .{},
+        .route_fn = App.composeRoute(route),
+    });
+}
+
+// For a selected route, leave guard_routes false and check the registered
+// plugin directly before doing protected work.
+fn explicitRoute(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.isLiteral("private") and req.isGet()) {
+        if (!ctx.plugins.bearer.authorized(req)) return ctx.plugins.bearer.unauthorized(res);
+        return res.text(200, "ok");
+    }
+}
+
+fn makeExplicitApp(gpa: std.mem.Allocator) !App {
+    return App.init(gpa, .{
+        .response_allocator = gpa,
+        .plugins = .{ .bearer = .{ .validate = validate, .guard_routes = false } },
+        .route_fn = explicitRoute,
+    });
+}
+```
+
+`guard_routes` defaults to false. With `true`, the wrapper returns 401 with
+`WWW-Authenticate: Bearer` before calling the inner route on any failed
+credential. The fixed response contains no token. With `NotFound` registered,
+unauthenticated route misses receive 401 and authenticated misses
+receive 404. Call `ctx.plugins.bearer.token(req)` when a route needs the
+borrowed credential or a specific parse error. The validator must not retain
+the slice. Query strings are never searched for credentials.
+
 #### Cookie sessions
 
 Register `zoda.Sessions` as a plugin instance. Supply a trusted UTC Unix-second
