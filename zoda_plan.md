@@ -1808,6 +1808,10 @@ Local validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
 `zig build test-load -Doptimize=ReleaseSafe --summary all` (2/2);
 `zig build test-devloop --summary all` (1/1); `./zig-out/bin/zoda`
 (seven documented route outcomes); and `git diff --check`. All passed.
+Implementation and review: [PR #56](https://github.com/kamalogudah/zoda/pull/56).
+[CI run 40459524282](https://github.com/kamalogudah/zoda/actions/runs/40459524282)
+passed both format and build/test jobs for implementation commit `ce7399b` on
+the pinned Zig `0.16.0` toolchain.
 
 ### Phase 6 — Write-up
 
