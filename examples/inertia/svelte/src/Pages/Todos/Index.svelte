@@ -1,7 +1,7 @@
 <script>
-  import { Link, router, useForm } from '@inertiajs/svelte'
+  import { Deferred, Link, router, useForm } from '@inertiajs/svelte'
 
-  let { app, framework, todos, filter, remaining } = $props()
+  let { app, framework, todos, filter, remaining, stats } = $props()
 
   const filters = [
     ['all', 'All'],
@@ -59,5 +59,12 @@
     {/each}
   </ul>
 
-  <footer>{remaining} {remaining === 1 ? 'item' : 'items'} left</footer>
+  <footer>
+    {remaining} {remaining === 1 ? 'item' : 'items'} left
+    <!-- `stats` is a deferred prop: the client requests it after the page renders. -->
+    <Deferred data="stats">
+      {#snippet fallback()}<span class="stats"> · counting…</span>{/snippet}
+      <span class="stats"> · {stats.done} of {stats.total} done</span>
+    </Deferred>
+  </footer>
 </main>

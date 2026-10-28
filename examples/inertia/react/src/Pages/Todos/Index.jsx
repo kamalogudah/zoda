@@ -1,4 +1,4 @@
-import { Link, router, useForm } from '@inertiajs/react'
+import { Deferred, Link, router, useForm } from '@inertiajs/react'
 
 const filters = [
   ['all', 'All'],
@@ -6,7 +6,7 @@ const filters = [
   ['done', 'Done'],
 ]
 
-export default function Index({ app, framework, todos, filter, remaining }) {
+export default function Index({ app, framework, todos, filter, remaining, stats }) {
   const form = useForm({ text: '' })
   // Mutations carry the filter so the server's 303 lands on the same view.
   const query = filter === 'all' ? '' : `?filter=${filter}`
@@ -77,6 +77,15 @@ export default function Index({ app, framework, todos, filter, remaining }) {
 
       <footer>
         {remaining} {remaining === 1 ? 'item' : 'items'} left
+        {/* `stats` is a deferred prop: the client requests it after the page renders. */}
+        <Deferred data="stats" fallback={<span className="stats"> · counting…</span>}>
+          {() => (
+            <span className="stats">
+              {' '}
+              · {stats.done} of {stats.total} done
+            </span>
+          )}
+        </Deferred>
       </footer>
     </main>
   )

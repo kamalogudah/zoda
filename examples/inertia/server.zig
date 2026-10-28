@@ -68,6 +68,20 @@ pub const Store = struct {
     }
 };
 
+/// Counts over every todo, whatever the filter. Sent as a deferred prop.
+pub const Stats = struct {
+    total: usize,
+    done: usize,
+
+    /// Runs inside `render`, which `renderIndex` calls with the store lock
+    /// held, so it reads the items without locking again.
+    fn compute(store: *Store, _: std.mem.Allocator) Stats {
+        var done: usize = 0;
+        for (store.items.items) |todo| done += @intFromBool(todo.done);
+        return .{ .total = store.items.items.len, .done = done };
+    }
+};
+
 /// Sent with every page; route props of the same name would win.
 pub const Shared = struct { app: []const u8, framework: []const u8 };
 
@@ -156,14 +170,21 @@ fn renderIndex(
     }
     // `render` copies everything into the response, so the borrowed todo
     // text only has to live while the lock is held. Without an `errors`
-    // prop, the plugin sends `errors: {}`.
-    const props = .{ .todos = shown.items, .filter = filter, .remaining = remaining };
+    // prop, the plugin sends `errors: {}`. `stats` is left out of the page
+    // and computed when the client asks for it right after.
+    const props = .{
+        .todos = shown.items,
+        .filter = filter,
+        .remaining = remaining,
+        .stats = zoda.plugins.inertia.deferred(store, Stats.compute),
+    };
     const inertia = &ctx.plugins.inertia;
     if (text_error) |message| {
         return inertia.render(req, res, "Todos/Index", .{
             .todos = props.todos,
             .filter = props.filter,
             .remaining = props.remaining,
+            .stats = props.stats,
             .errors = .{ .text = message },
         });
     }
@@ -293,7 +314,7 @@ test "first visit renders the HTML shell with the page object" {
     try std.testing.expectEqual(@as(u16, 200), page.status_code);
     try std.testing.expect(std.mem.indexOf(u8, page.body, "<script type=\"module\" src=\"/assets/app.js\"></script>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page.body,
-        \\<script data-page="app" type="application/json">{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[],"filter":"all","remaining":0,"errors":{}},"url":"/todos","version":"v1","sharedProps":["app","framework"]}</script><div id="app"></div>
+        \\<script data-page="app" type="application/json">{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[],"filter":"all","remaining":0,"errors":{}},"url":"/todos","version":"v1","deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}</script><div id="app"></div>
     ) != null);
 }
 
@@ -320,7 +341,7 @@ test "Inertia visits add, toggle, filter, and delete todos" {
     defer active.deinit();
     try std.testing.expectEqualStrings("true", (try active.getHeaderOne("X-Inertia")).?);
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[{"id":2,"text":"Walk <dog>","done":false}],"filter":"active","remaining":1,"errors":{}},"url":"/todos?filter=active","version":"v1","sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[{"id":2,"text":"Walk <dog>","done":false}],"filter":"active","remaining":1,"errors":{}},"url":"/todos?filter=active","version":"v1","deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}
     , active.body);
 
     var deleted = try visit(&app, .delete, "/todos/2", &inertia_json, "");
@@ -384,4 +405,33 @@ test "router.reload({ only: ['todos'] }) returns only todos and errors" {
         .{ .name = "X-Inertia-Partial-Data", .value = "todos,,filter" },
     };
     try std.testing.expectError(error.MalformedPartialHeader, visit(&app, .get, "/todos", &bad, ""));
+}
+
+test "the client loads deferred stats with a partial reload" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+    _ = try store.add("Buy milk");
+    _ = try store.add("Walk dog");
+    _ = store.toggle(1);
+
+    // The first response lists `stats` instead of sending it.
+    var page = try visit(&app, .get, "/todos?filter=active", &inertia_get, "");
+    defer page.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, page.body, "\"stats\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page.body, "\"deferredProps\":{\"default\":[\"stats\"]}") != null);
+
+    // What `<Deferred data="stats">` makes the client send next.
+    const reload = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "stats" },
+    };
+    var stats = try visit(&app, .get, "/todos?filter=active", &reload, "");
+    defer stats.deinit();
+    try std.testing.expectEqualStrings(
+        \\{"component":"Todos/Index","props":{"stats":{"total":2,"done":1},"errors":{}},"url":"/todos?filter=active","version":"v1","sharedProps":["app","framework"]}
+    , stats.body);
 }

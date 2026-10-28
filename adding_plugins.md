@@ -74,7 +74,8 @@ Available as `zoda.Inertia(SharedProps)`. The contract below was implemented
 with a configured layout containing one `@inertia` marker, `render`,
 `redirect`, and `location` methods, and a same-origin relative URL policy.
 Partial reloads with `optional` and `always` props followed
-([#69](https://github.com/kamalogudah/zoda/issues/69)); the remaining
+([#69](https://github.com/kamalogudah/zoda/issues/69)), then deferred props
+([#70](https://github.com/kamalogudah/zoda/issues/70)); the remaining
 deferred features are listed in
 [PLUGINS.md](PLUGINS.md#supported-protocol-features).
 

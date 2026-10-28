@@ -67,6 +67,12 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   `X-Inertia-Partial-Data: todos`, and the server answers with only `todos`
   and `errors`; the client keeps its other props. The page component has no
   reload button, but the server test below sends exactly those headers.
+- **Deferred props.** The footer's "1 of 2 done" comes from `stats`, a
+  `zoda.plugins.inertia.deferred` prop. Every full page response leaves it
+  out and lists it as `deferredProps: {"default": ["stats"]}`; the client
+  then requests it with `X-Inertia-Partial-Data: stats` and the page's
+  `<Deferred data="stats">` shows "counting…" until it arrives. The counts
+  are cheap here; a real app would defer a slow query.
 - **Asset version.** At startup the server hashes `app.js` into the Inertia
   version. After you rebuild the frontend and restart the server, an open tab
   that sends the old version gets 409 and `X-Inertia-Location` and does a full
@@ -85,4 +91,5 @@ relates to Zoda's CSRF helpers.
 `zig build test` (and `zig build test-examples`) runs the server tests in
 `server.zig`, which dispatch requests without a browser or a built frontend.
 They cover the HTML shell, the JSON page, add, toggle, filter, and delete,
-validation errors, the version conflict, and a partial reload of `todos`.
+validation errors, the version conflict, a partial reload of `todos`, and
+loading the deferred `stats`.

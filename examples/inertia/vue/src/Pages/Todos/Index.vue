@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { Link, router, useForm } from '@inertiajs/vue3'
+import { Deferred, Link, router, useForm } from '@inertiajs/vue3'
 
 const props = defineProps({
   app: String,
@@ -8,6 +8,7 @@ const props = defineProps({
   todos: Array,
   filter: String,
   remaining: Number,
+  stats: Object,
 })
 
 const filters = [
@@ -61,6 +62,13 @@ function add() {
       <li v-if="todos.length === 0" class="empty">Nothing here yet.</li>
     </ul>
 
-    <footer>{{ remaining }} {{ remaining === 1 ? 'item' : 'items' }} left</footer>
+    <footer>
+      {{ remaining }} {{ remaining === 1 ? 'item' : 'items' }} left
+      <!-- `stats` is a deferred prop: the client requests it after the page renders. -->
+      <Deferred data="stats">
+        <template #fallback><span class="stats"> · counting…</span></template>
+        <span class="stats"> · {{ stats.done }} of {{ stats.total }} done</span>
+      </Deferred>
+    </footer>
   </main>
 </template>

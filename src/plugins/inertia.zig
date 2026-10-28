@@ -39,8 +39,14 @@
 //!   `errors` is always sent. `optional(context, resolve)` props are resolved
 //!   only for a partial reload that asks for them; `always(value)` props
 //!   ignore both lists.
+//! - Deferred props: `deferred(context, resolve)` and
+//!   `deferredGroup(group, context, resolve)` are left out of full visits
+//!   without being resolved and listed in the page as
+//!   `deferredProps: {group: [names]}`. The client then requests each group
+//!   with a partial reload, which resolves them like `optional` props and
+//!   sends no `deferredProps`.
 //!
-//! Deferred: top-level `flash`, deferred/once/merge props, error bags,
+//! Not implemented: top-level `flash`, once/merge props, error bags,
 //! history encryption, precognition, and server-side rendering.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
@@ -105,15 +111,34 @@ pub const PropKind = enum {
     optional,
     /// Sent on every visit, whatever the partial reload lists.
     always,
+    /// Like `optional`, but full visits list it in `deferredProps` so the
+    /// client requests it right after the page loads.
+    deferred,
 };
 
 /// The prop type `optional(context, resolve)` returns. `resolve` is
 /// `fn (Context, std.mem.Allocator) T` or `... E!T`; `render` calls it at
 /// most once, only when the prop is sent, and returns its error unchanged.
 pub fn Optional(comptime Context: type, comptime resolve: anytype) type {
+    return Lazy(.optional, "", Context, resolve);
+}
+
+/// The prop type `deferredGroup(group, context, resolve)` returns. `resolve`
+/// follows the `Optional` rules. `group` is 1-64 `[A-Za-z0-9_-]` bytes.
+pub fn Deferred(comptime group: []const u8, comptime Context: type, comptime resolve: anytype) type {
+    comptime {
+        if (group.len == 0 or group.len > 64) @compileError("deferred group names are 1-64 bytes");
+        for (group) |c| {
+            if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) @compileError("deferred group names use [A-Za-z0-9_-]");
+        }
+    }
+    return Lazy(.deferred, group, Context, resolve);
+}
+
+fn Lazy(comptime kind: PropKind, comptime group: []const u8, comptime Context: type, comptime resolve: anytype) type {
     const info = @typeInfo(@TypeOf(resolve));
     if (info != .@"fn" or info.@"fn".params.len != 2 or info.@"fn".return_type == null) {
-        @compileError("optional props take fn (context, std.mem.Allocator) T or E!T");
+        @compileError(@tagName(kind) ++ " props take fn (context, std.mem.Allocator) T or E!T");
     }
     const Return = info.@"fn".return_type.?;
     const Value, const ResolveError = switch (@typeInfo(Return)) {
@@ -121,7 +146,8 @@ pub fn Optional(comptime Context: type, comptime resolve: anytype) type {
         else => .{ Return, error{} },
     };
     return struct {
-        pub const inertia_prop: PropKind = .optional;
+        pub const inertia_prop: PropKind = kind;
+        pub const inertia_group = group;
         pub const Error = ResolveError;
 
         context: Context,
@@ -139,8 +165,27 @@ pub fn optional(context: anytype, comptime resolve: anytype) Optional(@TypeOf(co
     return .{ .context = context };
 }
 
+/// A prop left out of full visits and loaded by the client right after the
+/// page renders, in the `"default"` group. `resolve` follows the `optional`
+/// rules and runs only on the partial reload that requests the prop.
+pub fn deferred(context: anytype, comptime resolve: anytype) Deferred("default", @TypeOf(context), resolve) {
+    return .{ .context = context };
+}
+
+/// Like `deferred`, in the named group. The client requests each group with
+/// its own partial reload, so slow props in different groups load in
+/// parallel.
+pub fn deferredGroup(
+    comptime group: []const u8,
+    context: anytype,
+    comptime resolve: anytype,
+) Deferred(group, @TypeOf(context), resolve) {
+    return .{ .context = context };
+}
+
 /// The prop type `always(value)` returns.
 pub fn Always(comptime T: type) type {
+    if (propKind(T) != .eager) @compileError("always() takes a plain value, not another prop wrapper");
     return struct {
         pub const inertia_prop: PropKind = .always;
 
@@ -162,7 +207,10 @@ pub fn propKind(comptime T: type) PropKind {
 pub fn PropsError(comptime P: type) type {
     comptime var E = error{};
     inline for (std.meta.fields(P)) |field| {
-        if (comptime propKind(field.type) == .optional) E = E || field.type.Error;
+        switch (comptime propKind(field.type)) {
+            .optional, .deferred => E = E || field.type.Error,
+            .eager, .always => {},
+        }
     }
     return E;
 }
@@ -177,7 +225,7 @@ pub const Partial = struct {
     /// for a full visit.
     pub fn wants(partial: ?Partial, name: []const u8, kind: PropKind) bool {
         if (kind == .always) return true;
-        const p = partial orelse return kind != .optional;
+        const p = partial orelse return kind == .eager;
         // `a.b` keeps all of `a`; filtering never goes below the top level.
         if (p.only) |list| if (!listNames(list, name, .first_segment)) return false;
         // Only a whole top-level name removes a prop, so `a.b` keeps `a`.
@@ -271,7 +319,8 @@ pub fn Inertia(comptime SharedProps: type) type {
         }
 
         /// The errors `render` can return for route props of type `Props`:
-        /// its own, plus those of every `optional` route or shared prop.
+        /// its own, plus those of every `optional` or `deferred` route or
+        /// shared prop.
         pub fn Error(comptime Props: type) type {
             return RenderError || PropsError(SharedProps) || PropsError(Props);
         }
@@ -410,7 +459,7 @@ pub fn Inertia(comptime SharedProps: type) type {
                 .value => |value| value,
                 .callback => |callback| callback(req),
             };
-            // `optional` results live here until they are serialized.
+            // `optional` and `deferred` results live here until serialized.
             var arena: std.heap.ArenaAllocator = .init(allocator);
             defer arena.deinit();
             var out: std.Io.Writer.Allocating = .init(allocator);
@@ -421,7 +470,8 @@ pub fn Inertia(comptime SharedProps: type) type {
         }
 
         /// Writes the page. The writer allocates, so its only failure is
-        /// `OutOfMemory`; any other error came from an `optional` prop.
+        /// `OutOfMemory`; any other error came from an `optional` or
+        /// `deferred` prop.
         fn writePage(
             json: *std.json.Stringify,
             arena: std.mem.Allocator,
@@ -455,6 +505,9 @@ pub fn Inertia(comptime SharedProps: type) type {
             json.endObject() catch return error.OutOfMemory;
             try writeField(json, "url", url);
             try writeField(json, "version", version);
+            // Only full visits announce deferred props; a partial reload
+            // either resolves them or leaves them to the client.
+            if (partial == null) try writeDeferred(json, shared != null, comptime deferredProps(P));
             if (shared != null) {
                 // v3 carries these props over to instant client-side visits.
                 // The list names every shared prop, even on partial reloads.
@@ -466,6 +519,63 @@ pub fn Inertia(comptime SharedProps: type) type {
                 json.endArray() catch return error.OutOfMemory;
             }
             json.endObject() catch return error.OutOfMemory;
+        }
+
+        const DeferredProp = struct { group: []const u8, name: []const u8, shared: bool };
+
+        /// The deferred props of a page with route props `P`, shared ones
+        /// first, leaving out shared props that a route prop overrides.
+        fn deferredProps(comptime P: type) []const DeferredProp {
+            var found: []const DeferredProp = &.{};
+            for (.{ SharedProps, P }, .{ true, false }) |T, is_shared| {
+                for (std.meta.fields(T)) |field| {
+                    if (propKind(field.type) != .deferred) continue;
+                    if (is_shared and @hasField(P, field.name)) continue;
+                    if (std.mem.eql(u8, field.name, "errors")) @compileError("the errors prop cannot be deferred");
+                    // The client sends the name back in `X-Inertia-Partial-Data`.
+                    if (field.name.len == 0) @compileError("deferred prop names cannot be empty");
+                    for (field.name) |c| {
+                        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '$')) {
+                            @compileError("deferred prop \"" ++ field.name ++ "\" must be named with [A-Za-z0-9_$-]");
+                        }
+                    }
+                    found = found ++ .{DeferredProp{ .group = field.type.inertia_group, .name = field.name, .shared = is_shared }};
+                }
+            }
+            return found;
+        }
+
+        /// Writes `deferredProps` as `{group: [names]}` in first-seen group
+        /// order, leaving out shared props when no shared values are set,
+        /// and the whole field when no group has a prop.
+        fn writeDeferred(json: *std.json.Stringify, has_shared: bool, comptime props: []const DeferredProp) error{OutOfMemory}!void {
+            var started = false;
+            inline for (props, 0..) |first, i| {
+                const new_group = comptime for (props[0..i]) |earlier| {
+                    if (std.mem.eql(u8, earlier.group, first.group)) break false;
+                } else true;
+                if (new_group) {
+                    var opened = false;
+                    inline for (props[i..]) |prop| {
+                        if (comptime !std.mem.eql(u8, prop.group, first.group)) continue;
+                        if (!prop.shared or has_shared) {
+                            if (!started) {
+                                json.objectField("deferredProps") catch return error.OutOfMemory;
+                                json.beginObject() catch return error.OutOfMemory;
+                                started = true;
+                            }
+                            if (!opened) {
+                                json.objectField(first.group) catch return error.OutOfMemory;
+                                json.beginArray() catch return error.OutOfMemory;
+                                opened = true;
+                            }
+                            json.write(prop.name) catch return error.OutOfMemory;
+                        }
+                    }
+                    if (opened) json.endArray() catch return error.OutOfMemory;
+                }
+            }
+            if (started) json.endObject() catch return error.OutOfMemory;
         }
 
         fn writeProp(
@@ -481,7 +591,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             switch (kind) {
                 .eager => try writeField(json, name, value),
                 .always => try writeField(json, name, value.value),
-                .optional => try writeField(json, name, try value.resolveIn(arena)),
+                .optional, .deferred => try writeField(json, name, try value.resolveIn(arena)),
             }
         }
 
@@ -1319,4 +1429,171 @@ test "malformed, duplicate, and oversized partial headers fail without changing 
         try testing.expectEqual(@as(usize, 0), res.header_count);
     }
     try testing.expectEqual(@as(usize, 0), state.calls);
+}
+
+const DeferredTest = struct {
+    stats_calls: usize = 0,
+    feed_calls: usize = 0,
+
+    fn stats(self: *DeferredTest, _: std.mem.Allocator) u32 {
+        self.stats_calls += 1;
+        return 42;
+    }
+
+    fn feed(self: *DeferredTest, _: std.mem.Allocator) error{FeedUnavailable}![]const []const u8 {
+        self.feed_calls += 1;
+        return &.{"post"};
+    }
+
+    fn fail(_: *DeferredTest, _: std.mem.Allocator) error{FeedUnavailable}![]const u8 {
+        return error.FeedUnavailable;
+    }
+
+    fn render(self: *DeferredTest, headers: []const router.Header, res: *response.Response) !void {
+        const req = testRequest(.get, "/dashboard", headers);
+        try deferred_plugin.render(&req, res, "Dashboard", .{
+            .title = "hi",
+            .stats = deferred(self, stats),
+            .feed = deferredGroup("social", self, feed),
+            .totals = deferred(self, stats),
+        });
+    }
+};
+
+const DeferredShared = struct {
+    app_name: []const u8,
+    notifications: Deferred("social", *DeferredTest, DeferredTest.stats),
+};
+
+var deferred_shared_state: DeferredTest = .{};
+const deferred_plugin: Inertia(DeferredShared) = .{
+    .layout = test_layout,
+    .shared = .{ .value = .{
+        .app_name = "zoda",
+        .notifications = deferredGroup("social", &deferred_shared_state, DeferredTest.stats),
+    } },
+};
+
+fn expectDeferredPage(comptime props: []const u8, comptime deferred_props: []const u8, body: []const u8) !void {
+    try testing.expectEqualStrings(
+        "{\"component\":\"Dashboard\",\"props\":{" ++ props ++ "},\"url\":\"/dashboard\",\"version\":null," ++
+            deferred_props ++ "\"sharedProps\":[\"app_name\",\"notifications\"]}",
+        body,
+    );
+}
+
+test "full visits omit deferred props and list them by group" {
+    deferred_shared_state = .{};
+    var state: DeferredTest = .{};
+    var json = response.Response.init(testing.allocator);
+    defer json.deinit();
+    try state.render(&inertia_headers, &json);
+    try expectDeferredPage(
+        "\"app_name\":\"zoda\",\"title\":\"hi\",\"errors\":{}",
+        "\"deferredProps\":{\"social\":[\"notifications\",\"feed\"],\"default\":[\"stats\",\"totals\"]},",
+        json.body,
+    );
+    try testing.expectEqual(@as(usize, 0), state.stats_calls + state.feed_calls + deferred_shared_state.stats_calls);
+
+    // The shape matches `Page.deferredProps` in @inertiajs/core 3.9.1:
+    // `Record<string, string[]>`.
+    const Page = struct { deferredProps: std.json.ArrayHashMap([]const []const u8) };
+    const parsed = try std.json.parseFromSlice(Page, testing.allocator, json.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.deferredProps.map.count());
+    try testing.expectEqualStrings("totals", parsed.value.deferredProps.map.get("default").?[1]);
+
+    // The HTML shell lists them the same way.
+    var html = response.Response.init(testing.allocator);
+    defer html.deinit();
+    try state.render(&.{}, &html);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"deferredProps\":{\"social\":[\"notifications\",\"feed\"],\"default\":[\"stats\",\"totals\"]}") != null);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"stats\":") == null);
+
+    // Another component's partial reload is a full visit for this one.
+    var other = response.Response.init(testing.allocator);
+    defer other.deinit();
+    try state.render(partialHeaders("Other", &.{.{ .name = "X-Inertia-Partial-Data", .value = "stats" }}), &other);
+    try testing.expectEqualStrings(json.body, other.body);
+    try testing.expectEqual(@as(usize, 0), state.stats_calls + state.feed_calls + deferred_shared_state.stats_calls);
+}
+
+test "a partial reload for a group resolves only its props and lists no groups" {
+    deferred_shared_state = .{};
+    var state: DeferredTest = .{};
+    // What the client sends for the "default" group: `only: ['stats', 'totals']`.
+    var default_group = response.Response.init(testing.allocator);
+    defer default_group.deinit();
+    try state.render(partialHeaders("Dashboard", &.{.{ .name = "X-Inertia-Partial-Data", .value = "stats,totals" }}), &default_group);
+    try expectDeferredPage("\"stats\":42,\"totals\":42,\"errors\":{}", "", default_group.body);
+    try testing.expectEqual(@as(usize, 2), state.stats_calls);
+    try testing.expectEqual(@as(usize, 0), state.feed_calls + deferred_shared_state.stats_calls);
+
+    var social = response.Response.init(testing.allocator);
+    defer social.deinit();
+    try state.render(partialHeaders("Dashboard", &.{.{ .name = "X-Inertia-Partial-Data", .value = "notifications,feed" }}), &social);
+    try expectDeferredPage("\"notifications\":42,\"feed\":[\"post\"],\"errors\":{}", "", social.body);
+    try testing.expectEqual(@as(usize, 1), state.feed_calls);
+    try testing.expectEqual(@as(usize, 1), deferred_shared_state.stats_calls);
+    try testing.expectEqual(@as(usize, 2), state.stats_calls);
+
+    // An unrelated partial reload neither resolves nor lists them.
+    var unrelated = response.Response.init(testing.allocator);
+    defer unrelated.deinit();
+    try state.render(partialHeaders("Dashboard", &.{.{ .name = "X-Inertia-Partial-Data", .value = "title" }}), &unrelated);
+    try expectDeferredPage("\"title\":\"hi\",\"errors\":{}", "", unrelated.body);
+    try testing.expectEqual(@as(usize, 2), state.stats_calls);
+
+    // Like `optional` props, an except-only reload resolves the rest.
+    var except = response.Response.init(testing.allocator);
+    defer except.deinit();
+    try state.render(partialHeaders("Dashboard", &.{.{ .name = "X-Inertia-Partial-Except", .value = "app_name,title,feed,notifications" }}), &except);
+    try expectDeferredPage("\"stats\":42,\"totals\":42,\"errors\":{}", "", except.body);
+    try testing.expectEqual(@as(usize, 4), state.stats_calls);
+    try testing.expectEqual(@as(usize, 1), state.feed_calls);
+}
+
+test "route props override deferred shared props and unset shared ones are not listed" {
+    deferred_shared_state = .{};
+    var state: DeferredTest = .{};
+    const req = testRequest(.get, "/dashboard", &inertia_headers);
+    var overridden = response.Response.init(testing.allocator);
+    defer overridden.deinit();
+    try deferred_plugin.render(&req, &overridden, "Dashboard", .{ .notifications = @as(u32, 3), .feed = deferredGroup("social", &state, DeferredTest.feed) });
+    try expectDeferredPage("\"app_name\":\"zoda\",\"notifications\":3,\"errors\":{}", "\"deferredProps\":{\"social\":[\"feed\"]},", overridden.body);
+
+    // Without shared values, only the route's deferred props are listed,
+    // and with none at all the field is left out.
+    const unset: Inertia(DeferredShared) = .{ .layout = test_layout };
+    var route_only = response.Response.init(testing.allocator);
+    defer route_only.deinit();
+    try unset.render(&req, &route_only, "Dashboard", .{ .stats = deferred(&state, DeferredTest.stats) });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Dashboard\",\"props\":{\"errors\":{}},\"url\":\"/dashboard\",\"version\":null,\"deferredProps\":{\"default\":[\"stats\"]}}",
+        route_only.body,
+    );
+    var none = response.Response.init(testing.allocator);
+    defer none.deinit();
+    try unset.render(&req, &none, "Dashboard", .{});
+    try testing.expectEqualStrings("{\"component\":\"Dashboard\",\"props\":{\"errors\":{}},\"url\":\"/dashboard\",\"version\":null}", none.body);
+    try testing.expectEqual(@as(usize, 0), state.stats_calls + state.feed_calls + deferred_shared_state.stats_calls);
+}
+
+test "deferred callback errors propagate and leave the response unchanged" {
+    var state: DeferredTest = .{};
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const req = testRequest(.get, "/dashboard", partialHeaders("Dashboard", &.{.{ .name = "X-Inertia-Partial-Data", .value = "feed" }}));
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try res.text(201, "keep");
+    try testing.expectError(error.FeedUnavailable, plugin.render(&req, &res, "Dashboard", .{ .feed = deferred(&state, DeferredTest.fail) }));
+    try testing.expectEqual(@as(u16, 201), res.status_code);
+    try testing.expectEqualStrings("keep", res.body);
+    try testing.expectEqual(@as(usize, 0), res.header_count);
+
+    // A full visit never runs the failing callback.
+    const full = testRequest(.get, "/dashboard", &inertia_headers);
+    try plugin.render(&full, &res, "Dashboard", .{ .feed = deferred(&state, DeferredTest.fail) });
+    try testing.expectEqual(@as(u16, 200), res.status_code);
+    try testing.expect(std.mem.indexOf(u8, res.body, "\"deferredProps\":{\"default\":[\"feed\"]}") != null);
 }

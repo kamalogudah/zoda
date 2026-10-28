@@ -506,6 +506,24 @@ fn inertiaReportRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: 
     }
 }
 
+// PLUGINS.md "Deferred props".
+const InertiaDashboard = struct {
+    fn count(ids: []const u32, _: std.mem.Allocator) usize {
+        return ids.len;
+    }
+};
+
+fn inertiaDashboardRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    const ids: []const u32 = &.{ 1, 2, 3 };
+    if (req.onLiteral("dashboard") and req.isRoot() and req.isGet()) {
+        return ctx.plugins.inertia.render(req, res, "Dashboard", .{
+            .ids = ids,
+            .stats = zoda.plugins.inertia.deferred(ids, InertiaDashboard.count),
+            .feed = zoda.plugins.inertia.deferredGroup("social", ids, InertiaReport.totals),
+        });
+    }
+}
+
 fn inertiaVisit(app: *const InertiaApp, method: zoda.router.Method, target: []const u8, headers: []const zoda.request.Header) !zoda.response.Response {
     var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
     defer arena.deinit();
@@ -575,5 +593,33 @@ test "PLUGINS Inertia.js partial reload example" {
     try std.testing.expectEqualStrings(
         "{\"component\":\"Reports/Index\",\"props\":{\"totals\":[6],\"notice\":\"ready\",\"errors\":{}},\"url\":\"/reports\",\"version\":null,\"sharedProps\":[\"app_name\"]}",
         partial.body,
+    );
+}
+
+test "PLUGINS Inertia.js deferred props example" {
+    var app = try InertiaApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{ .inertia = .{ .layout = inertia_layout } },
+        .route_fn = inertiaDashboardRoute,
+    });
+    defer app.deinit();
+
+    var full = try inertiaVisit(&app, .get, "/dashboard", &.{.{ .name = "X-Inertia", .value = "true" }});
+    defer full.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Dashboard\",\"props\":{\"ids\":[1,2,3],\"errors\":{}},\"url\":\"/dashboard\",\"version\":null,\"deferredProps\":{\"default\":[\"stats\"],\"social\":[\"feed\"]}}",
+        full.body,
+    );
+
+    // What the client sends for the "social" group.
+    var social = try inertiaVisit(&app, .get, "/dashboard", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Dashboard" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "feed" },
+    });
+    defer social.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Dashboard\",\"props\":{\"feed\":[6],\"errors\":{}},\"url\":\"/dashboard\",\"version\":null}",
+        social.body,
     );
 }

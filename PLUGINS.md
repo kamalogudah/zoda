@@ -660,6 +660,8 @@ layout or root id before the first request; `render` checks again.
     client-side visits.
   - On an Inertia visit with `X-Inertia-Partial-Component`, only some props
     are sent; see [Partial reloads](#partial-reloads).
+  - Props wrapped in `deferred` are left out of the first response and
+    listed in `deferredProps`; see [Deferred props](#deferred-props).
   - Nested empty values need a named type: in Zig an empty `.{}` literal is
     a tuple and serializes as `[]`. Pass a named empty struct such as
     `struct {}{}` for an empty nested object. Tuples with values are a
@@ -736,7 +738,7 @@ return ctx.plugins.inertia.render(req, res, "Reports/Index", .{
 - **Errors.** An error from `resolve` is returned by `render` unchanged and
   leaves the response untouched. `render`'s error set is
   `Inertia(S).Error(@TypeOf(props))`: the plugin errors plus those of every
-  `optional` route and shared prop.
+  `optional` and `deferred` route and shared prop.
 - **Shared props.** Fields of `SharedProps` may use the same wrappers, for
   example `stats: zoda.plugins.inertia.Optional(*Stats, Stats.compute)` and
   `auth: zoda.plugins.inertia.Always([]const u8)`, initialized as
@@ -753,6 +755,60 @@ return ctx.plugins.inertia.render(req, res, "Reports/Index", .{
 - **Caching.** Partial and full responses share `Vary: X-Inertia`; no
   `Vary` is added for the partial headers, so do not let a shared cache
   store Inertia JSON responses.
+
+### Deferred props
+
+A deferred prop is left out of the first response, so the page renders
+without waiting for it, and the client fetches it right after with a partial
+reload. The v3 client components render a fallback meanwhile:
+
+```zig
+return ctx.plugins.inertia.render(req, res, "Dashboard", .{
+    .user = user,
+    // Both load in one follow-up request for the "default" group.
+    .stats = zoda.plugins.inertia.deferred(store, Stats.compute),
+    .totals = zoda.plugins.inertia.deferred(ids, Report.totals),
+    // A separate group is fetched with its own request, in parallel.
+    .feed = zoda.plugins.inertia.deferredGroup("social", store, Feed.load),
+});
+```
+
+```jsx
+<Deferred data="stats" fallback={<p>Loading…</p>}>
+  {() => <Stats {...stats} />}
+</Deferred>
+```
+
+- **Full visits.** The HTML shell and full Inertia JSON visits leave
+  deferred props out of `props` without calling `resolve`, and add
+  `"deferredProps": {"default": ["stats", "totals"], "social": ["feed"]}`
+  after `version`. Groups appear in the order their first prop is declared,
+  shared props first. With no deferred props the field is left out. A
+  partial reload for another component counts as a full visit.
+- **Loading.** For each group the client sends a partial reload with
+  `X-Inertia-Partial-Data` set to that group's names. `render` resolves
+  deferred props exactly as it resolves `optional` ones, so `-Data`,
+  `-Except`, and a bare component header behave as described above, and
+  `resolve` runs only for the props a reload keeps.
+- **Partial reloads never send `deferredProps`.** The values a reload asks
+  for are sent; the others stay unsent and unlisted, so the client does not
+  start another round. This matches the Laravel adapter.
+- **`deferred(context, resolve)`** returns a
+  `Deferred("default", Context, resolve)` prop and
+  **`deferredGroup(group, context, resolve)`** a `Deferred(group, ...)`
+  one. `resolve` follows the `optional` rules: same signature, arena,
+  error propagation, and the same warning about locks the route holds. The
+  group is comptime: 1-64 `[A-Za-z0-9_-]` bytes, checked at compile time.
+- **Shared props.** A `SharedProps` field may be deferred, for example
+  `notifications: zoda.plugins.inertia.Deferred("default", *Store, Notes.count)`.
+  It is listed only when shared values are configured and no route prop of
+  the same name overrides it.
+- **Rules checked at compile time.** `errors` cannot be deferred. A
+  deferred prop's name must be non-empty `[A-Za-z0-9_$-]`, since the client
+  sends it back in `X-Inertia-Partial-Data`. `always` takes a plain value,
+  so `always(deferred(...))` is rejected; wrappers do not nest.
+- **Request headers.** Deferred loading adds no headers of its own; the
+  partial-reload header rules and errors apply unchanged.
 
 ### URL and origin policy
 
@@ -812,8 +868,9 @@ Checked against `@inertiajs/core`, `@inertiajs/react`, `@inertiajs/svelte`,
 and `@inertiajs/vue3` 3.9.1. The three frontends in
 [examples/inertia](examples/inertia/README.md) were driven in headless Chrome
 through the script-element page, JSON visits, shared props, `errors`, 303
-and fragment redirects, and filter links. The other rows are covered by the
-plugin's unit tests only.
+and fragment redirects, filter links, and the deferred `stats` prop that
+each renders with `<Deferred>`. The other rows are covered by the plugin's
+unit tests only.
 
 The features not yet implemented are tracked in
 [#80](https://github.com/kamalogudah/zoda/issues/80), with one issue each.
@@ -830,10 +887,11 @@ The features not yet implemented are tracked in
 | Fragment redirects, 409 + `X-Inertia-Redirect` | Implemented (`redirect` with `#`) |
 | External and full-page visits, 409 + `X-Inertia-Location` | Implemented (`location`) |
 | Prefetching (`Purpose: prefetch`) | Not special-cased: a prefetch is an ordinary Inertia GET and gets a full response. Not exercised by the example. |
-| Partial reloads (`X-Inertia-Partial-Data`, `-Component`, `-Except`) | Implemented, top-level names only (dot paths select the whole top-level prop). Covered by unit and example tests, not driven in a browser. |
+| Partial reloads (`X-Inertia-Partial-Data`, `-Component`, `-Except`) | Implemented, top-level names only (dot paths select the whole top-level prop). Driven in a browser through deferred loading (`only`); `except` is covered by unit tests only. |
 | Top-level `flash` | Not implemented: the client defaults it to `{}`. Pass flash messages as props, as the example's README describes. |
 | Optional props (`optional`) and always props (`always`) | Implemented |
-| Deferred, once, merge, and scroll props | Not implemented |
+| Deferred props (`deferred`, `deferredGroup`, `deferredProps`) | Implemented, including groups and shared deferred props |
+| Once, merge, and scroll props | Not implemented |
 | Error bags (`X-Inertia-Error-Bag`) | Not implemented: the header is ignored |
 | History encryption (`encryptHistory`, `clearHistory`) | Not implemented: never sent, so off |
 | Precognition validation | Not implemented |
