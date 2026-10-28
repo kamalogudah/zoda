@@ -60,8 +60,15 @@
 //!   `mergeProps`. `reset` is true when `X-Inertia-Reset` names it. The route
 //!   reads the page number from its own query parameter and pages its data
 //!   itself.
+//! - Once props: `once(context, resolve)` is resolved like a plain prop and
+//!   listed in `onceProps: {key: {prop, expiresAt}}`, keyed by the prop name
+//!   or `.as(key)`. `.expiresIn(ms)` sets `expiresAt` from the injected
+//!   `now_milliseconds` clock. An Inertia visit whose
+//!   `X-Inertia-Except-Once-Props` names the key keeps the entry but neither
+//!   resolves nor sends the prop, since the client still holds it, unless a
+//!   partial reload of the component lists it in `X-Inertia-Partial-Data`.
 //!
-//! Not implemented: top-level `flash`, once props, error bags,
+//! Not implemented: top-level `flash`, once deferred props, error bags,
 //! history encryption, precognition, and server-side rendering.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
@@ -88,13 +95,17 @@ pub const max_partial_props = 64;
 /// Most bytes in one `X-Inertia-Partial-Data`, `-Except`, or
 /// `X-Inertia-Reset` value.
 pub const max_partial_bytes = 1024;
+/// Largest `expiresAt`: the largest integer a JavaScript number holds
+/// exactly.
+pub const max_once_expires_at: i64 = (1 << 53) - 1;
 
 pub const HeaderError = error{ DuplicateInertiaHeader, MalformedInertiaHeader, DuplicateVersionHeader };
 pub const PartialError = error{ DuplicatePartialHeader, MalformedPartialHeader, PartialHeaderTooLarge };
 pub const ScrollError = error{InvalidScrollPageName};
+pub const OnceError = error{ OnceClockNotConfigured, InvalidOnceTime };
 pub const ConfigError = error{ InvalidLayout, InvalidRootId };
 pub const TargetError = error{ MissingRequestTarget, UnsafeRequestTarget };
-pub const RenderError = HeaderError || PartialError || ScrollError || ConfigError || TargetError || response.HeaderError || error{
+pub const RenderError = HeaderError || PartialError || ScrollError || OnceError || ConfigError || TargetError || response.HeaderError || error{
     BodyTooLarge,
     InvalidComponent,
 };
@@ -132,6 +143,9 @@ pub const PropKind = enum {
     /// Like `optional`, but full visits list it in `deferredProps` so the
     /// client requests it right after the page loads.
     deferred,
+    /// Resolved and sent like `eager`, unless the client says it still
+    /// holds the value; listed in `onceProps` either way.
+    once,
 };
 
 /// The prop type `optional(context, resolve)` returns. `resolve` is
@@ -167,6 +181,7 @@ fn Lazy(comptime kind: PropKind, comptime group: []const u8, comptime Context: t
         pub const inertia_prop: PropKind = kind;
         pub const inertia_group = group;
         pub const Error = ResolveError;
+        pub const Resolved = Value;
 
         context: Context,
 
@@ -199,6 +214,67 @@ pub fn deferredGroup(
     comptime resolve: anytype,
 ) Deferred(group, @TypeOf(context), resolve) {
     return .{ .context = context };
+}
+
+/// The prop type `once(context, resolve)` returns, keyed by `key` in
+/// `onceProps` and `X-Inertia-Except-Once-Props`, or by the prop's name when
+/// `key` is null. `resolve` follows the `Optional` rules. A key is one or more
+/// non-empty `.`-separated segments of `[A-Za-z0-9_$-]`.
+pub fn Onceable(comptime key: ?[]const u8, comptime Context: type, comptime resolve: anytype) type {
+    comptime if (key) |k| checkOnceKey(k);
+    const Base = Lazy(.once, "", Context, resolve);
+    return struct {
+        pub const inertia_prop: PropKind = .once;
+        pub const inertia_once_key = key;
+        pub const Error = Base.Error;
+
+        context: Context,
+        /// How long the client may reuse the value, in milliseconds; null
+        /// keeps it until the page is left.
+        expires_in_ms: ?u64 = null,
+
+        /// Keys the prop as `new_key`. Props on different pages with the same
+        /// key share one value on the client.
+        pub fn as(self: @This(), comptime new_key: []const u8) Onceable(new_key, Context, resolve) {
+            return .{ .context = self.context, .expires_in_ms = self.expires_in_ms };
+        }
+
+        /// Sends `expiresAt` as the clock's time plus `ms`. Once it has
+        /// passed, the client stops listing the key and gets a fresh value.
+        pub fn expiresIn(self: @This(), ms: u64) @This() {
+            return .{ .context = self.context, .expires_in_ms = ms };
+        }
+
+        fn resolveIn(self: @This(), allocator: std.mem.Allocator) Error!Base.Resolved {
+            return resolve(self.context, allocator);
+        }
+    };
+}
+
+/// The prop type `once(context, resolve)` returns.
+pub fn Once(comptime Context: type, comptime resolve: anytype) type {
+    return Onceable(null, Context, resolve);
+}
+
+/// A prop the client keeps once it has it. `resolve` follows the `optional`
+/// rules but runs on every visit that sends the prop, full visits included.
+/// Later Inertia visits that list its key in `X-Inertia-Except-Once-Props`
+/// skip `resolve` and only list the key in `onceProps`, and the client reuses
+/// its value.
+pub fn once(context: anytype, comptime resolve: anytype) Once(@TypeOf(context), resolve) {
+    return .{ .context = context };
+}
+
+fn checkOnceKey(comptime key: []const u8) void {
+    var segments = std.mem.splitScalar(u8, key, '.');
+    while (segments.next()) |segment| {
+        if (segment.len == 0) @compileError("once keys are non-empty dot-separated names");
+        for (segment) |c| {
+            if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '$')) {
+                @compileError("once key \"" ++ key ++ "\" must use [A-Za-z0-9_$-]");
+            }
+        }
+    }
 }
 
 /// The prop type `always(value)` returns.
@@ -235,6 +311,7 @@ pub fn Mergeable(comptime mode: MergeMode, comptime T: type, comptime match_on: 
     comptime {
         if (mergeMode(T) != null) @compileError("merge props do not nest");
         if (propKind(T) == .always) @compileError("always props cannot be merged");
+        if (propKind(T) == .once) @compileError("once props cannot be merged");
         checkMatchKeys(mode, match_on);
     }
     return struct {
@@ -333,6 +410,7 @@ pub fn Scrollable(comptime T: type, comptime match_on: []const []const u8) type 
     comptime {
         if (mergeMode(T) != null) @compileError("scroll props do not wrap merge props");
         if (propKind(T) == .always) @compileError("always props cannot be scroll props");
+        if (propKind(T) == .once) @compileError("once props cannot be scroll props");
         checkMatchKeys(.append, match_on);
     }
     return struct {
@@ -382,12 +460,13 @@ pub fn propKind(comptime T: type) PropKind {
     return .eager;
 }
 
-/// The errors the `optional` props of the struct `P` can return.
+/// The errors the `optional`, `deferred`, and `once` props of the struct
+/// `P` can return.
 pub fn PropsError(comptime P: type) type {
     comptime var E = error{};
     inline for (std.meta.fields(P)) |field| {
         switch (comptime propKind(field.type)) {
-            .optional, .deferred => E = E || Unmerged(field.type).Error,
+            .optional, .deferred, .once => E = E || Unmerged(field.type).Error,
             .eager, .always => {},
         }
     }
@@ -408,7 +487,7 @@ pub const Partial = struct {
     /// for a full visit.
     pub fn wants(partial: ?Partial, name: []const u8, kind: PropKind) bool {
         if (kind == .always) return true;
-        const p = partial orelse return kind == .eager;
+        const p = partial orelse return kind == .eager or kind == .once;
         // `a.b` keeps all of `a`; filtering never goes below the top level.
         if (p.only) |list| if (!listNames(list, name, .first_segment)) return false;
         // Only a whole top-level name removes a prop, so `a.b` keeps `a`.
@@ -435,6 +514,12 @@ pub const Partial = struct {
         return false;
     }
 };
+
+/// Reads `X-Inertia-Except-Once-Props`: the once keys the client still
+/// holds. It follows the partial-list rules and errors.
+pub fn exceptOnceProps(req: *const router.Request) PartialError!?[]const u8 {
+    return partialList(req, "X-Inertia-Except-Once-Props");
+}
 
 /// Reads the partial-reload headers of an Inertia request, including
 /// `X-Inertia-Reset` and `X-Inertia-Infinite-Scroll-Merge-Intent`. All five
@@ -515,6 +600,10 @@ pub fn Inertia(comptime SharedProps: type) type {
         initial_page: InitialPage = .script,
         version: Version = .none,
         shared: Shared = .none,
+        /// UTC Unix milliseconds for once props' `expiresAt`. Supply a
+        /// trusted wall clock; tests can inject one. Read at most once per
+        /// `render`, and only when a listed once prop has an expiry.
+        now_milliseconds: ?*const fn () i64 = null,
 
         /// Checks the layout and root id. `render` repeats the check, so
         /// calling this at startup only reports mistakes earlier.
@@ -555,6 +644,10 @@ pub fn Inertia(comptime SharedProps: type) type {
             const inertia = try isInertia(req);
             // Partial headers only mean something on Inertia visits.
             const partial = if (inertia) try partialReload(req, component) else null;
+            const once_visit: OnceVisit = .{
+                .except = if (inertia) try exceptOnceProps(req) else null,
+                .clock = self.now_milliseconds,
+            };
             const url = try requestUrl(req);
             const version = self.currentVersion(req);
             if (inertia and req.method == .get) {
@@ -565,7 +658,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             }
             if (component.len == 0) return error.InvalidComponent;
 
-            const page = try self.pageJson(res.allocator, req, partial, component, props, url, version);
+            const page = try self.pageJson(res.allocator, req, partial, once_visit, component, props, url, version);
             if (inertia) {
                 var committed = false;
                 defer if (!committed) res.allocator.free(page);
@@ -657,39 +750,43 @@ pub fn Inertia(comptime SharedProps: type) type {
             allocator: std.mem.Allocator,
             req: *const router.Request,
             partial: ?Partial,
+            once_visit: OnceVisit,
             component: []const u8,
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
-        ) (error{OutOfMemory} || ScrollError || PropsError(SharedProps) || PropsError(@TypeOf(props)))![]u8 {
+        ) (error{OutOfMemory} || ScrollError || OnceError || PropsError(SharedProps) || PropsError(@TypeOf(props)))![]u8 {
             const shared: ?SharedProps = switch (self.shared) {
                 .none => null,
                 .value => |value| value,
                 .callback => |callback| callback(req),
             };
-            // `optional` and `deferred` results live here until serialized.
+            // `optional`, `deferred`, and `once` results live here until
+            // serialized.
             var arena: std.heap.ArenaAllocator = .init(allocator);
             defer arena.deinit();
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var json: std.json.Stringify = .{ .writer = &out.writer };
-            try writePage(&json, arena.allocator(), partial, component, shared, props, url, version);
+            try writePage(&json, arena.allocator(), partial, once_visit, component, shared, props, url, version);
             return out.toOwnedSlice();
         }
 
         /// Writes the page. The writer allocates, so its only failures are
-        /// `OutOfMemory` and an invalid scroll page name; any other error
-        /// came from an `optional` or `deferred` prop.
+        /// `OutOfMemory`, an invalid scroll page name, and a once expiry
+        /// error; any other error came from an `optional`, `deferred`, or
+        /// `once` prop.
         fn writePage(
             json: *std.json.Stringify,
             arena: std.mem.Allocator,
             partial: ?Partial,
+            once_visit: OnceVisit,
             component: []const u8,
             shared: ?SharedProps,
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
-        ) (error{OutOfMemory} || ScrollError || PropsError(SharedProps) || PropsError(@TypeOf(props)))!void {
+        ) (error{OutOfMemory} || ScrollError || OnceError || PropsError(SharedProps) || PropsError(@TypeOf(props)))!void {
             const P = @TypeOf(props);
             json.beginObject() catch return error.OutOfMemory;
             try writeField(json, "component", component);
@@ -698,12 +795,12 @@ pub fn Inertia(comptime SharedProps: type) type {
             if (shared) |value| {
                 inline for (std.meta.fields(SharedProps)) |field| {
                     if (comptime !@hasField(P, field.name)) {
-                        try writeProp(json, arena, partial, field.name, @field(value, field.name));
+                        try writeProp(json, arena, partial, once_visit, field.name, @field(value, field.name));
                     }
                 }
             }
             inline for (std.meta.fields(P)) |field| {
-                try writeProp(json, arena, partial, field.name, @field(props, field.name));
+                try writeProp(json, arena, partial, once_visit, field.name, @field(props, field.name));
             }
             // Clients treat `errors` as always present, as Laravel sends it.
             const shared_errors = shared != null and @hasField(SharedProps, "errors");
@@ -718,6 +815,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             // Only full visits announce deferred props; a partial reload
             // either resolves them or leaves them to the client.
             if (partial == null) try writeDeferred(json, shared != null, comptime deferredProps(P));
+            try writeOnce(json, partial, once_visit, shared, props, comptime onceProps(P));
             if (shared != null) {
                 // v3 carries these props over to instant client-side visits.
                 // The list names every shared prop, even on partial reloads.
@@ -758,6 +856,59 @@ pub fn Inertia(comptime SharedProps: type) type {
                     @compileError(what ++ " prop \"" ++ name ++ "\" must be named with [A-Za-z0-9_$-]");
                 }
             }
+        }
+
+        const OnceProp = struct { name: []const u8, key: []const u8, shared: bool };
+
+        /// The once props of a page with route props `P`, shared ones first,
+        /// leaving out shared props that a route prop overrides. Keys are
+        /// unique, since each is one `onceProps` field.
+        fn onceProps(comptime P: type) []const OnceProp {
+            var found: []const OnceProp = &.{};
+            for (.{ SharedProps, P }, .{ true, false }) |T, is_shared| {
+                for (std.meta.fields(T)) |field| {
+                    if (propKind(field.type) != .once) continue;
+                    if (is_shared and @hasField(P, field.name)) continue;
+                    checkListedName("once", field.name);
+                    const key = field.type.inertia_once_key orelse field.name;
+                    for (found) |earlier| {
+                        if (std.mem.eql(u8, earlier.key, key)) {
+                            @compileError("once props \"" ++ earlier.name ++ "\" and \"" ++ field.name ++ "\" share the key \"" ++ key ++ "\"");
+                        }
+                    }
+                    found = found ++ .{OnceProp{ .name = field.name, .key = key, .shared = is_shared }};
+                }
+            }
+            return found;
+        }
+
+        /// Writes `onceProps` as `{key: {prop, expiresAt}}` for the once
+        /// props this page would send, whether or not the client already
+        /// holds them, in declaration order, and leaves it out when there
+        /// are none. `expiresAt` is null without an expiry.
+        fn writeOnce(
+            json: *std.json.Stringify,
+            partial: ?Partial,
+            once_visit: OnceVisit,
+            shared: ?SharedProps,
+            props: anytype,
+            comptime list: []const OnceProp,
+        ) (error{OutOfMemory} || OnceError)!void {
+            var now: ?i64 = null;
+            var started = false;
+            inline for (list) |prop| {
+                if ((!prop.shared or shared != null) and Partial.wants(partial, prop.name, .once)) {
+                    const value = if (prop.shared) @field(shared.?, prop.name) else @field(props, prop.name);
+                    const expires_at: ?i64 = if (value.expires_in_ms) |ms| try once_visit.expiresAt(&now, ms) else null;
+                    if (!started) {
+                        json.objectField("onceProps") catch return error.OutOfMemory;
+                        json.beginObject() catch return error.OutOfMemory;
+                        started = true;
+                    }
+                    try writeField(json, prop.key, .{ .prop = prop.name, .expiresAt = expires_at });
+                }
+            }
+            if (started) json.endObject() catch return error.OutOfMemory;
         }
 
         const MergeProp = struct {
@@ -928,6 +1079,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             json: *std.json.Stringify,
             arena: std.mem.Allocator,
             partial: ?Partial,
+            once_visit: OnceVisit,
             comptime name: []const u8,
             value: anytype,
         ) (error{OutOfMemory} || PropsError(struct { value: @TypeOf(value) }))!void {
@@ -939,6 +1091,11 @@ pub fn Inertia(comptime SharedProps: type) type {
                 .eager => try writeField(json, name, prop),
                 .always => try writeField(json, name, prop.value),
                 .optional, .deferred => try writeField(json, name, try prop.resolveIn(arena)),
+                .once => {
+                    const key = comptime @TypeOf(prop).inertia_once_key orelse name;
+                    if (once_visit.holds(partial, name, key)) return;
+                    try writeField(json, name, try prop.resolveIn(arena));
+                },
             }
         }
 
@@ -990,6 +1147,39 @@ pub fn Inertia(comptime SharedProps: type) type {
         }
     };
 }
+
+/// What a visit says about once props: the keys the client still holds and
+/// the clock for their expiry.
+const OnceVisit = struct {
+    /// The validated `X-Inertia-Except-Once-Props`; null on ordinary visits.
+    except: ?[]const u8 = null,
+    clock: ?*const fn () i64 = null,
+
+    /// Whether the once prop `name` keyed `key` is left to the client's
+    /// copy. A partial reload whose `-Data` names the prop asks for a fresh
+    /// value, so it is sent anyway.
+    fn holds(self: OnceVisit, partial: ?Partial, name: []const u8, key: []const u8) bool {
+        const list = self.except orelse return false;
+        if (!Partial.listNames(list, key, .exact)) return false;
+        if (partial) |p| if (p.only) |only| if (Partial.listNames(only, name, .first_segment)) return false;
+        return true;
+    }
+
+    /// The clock's time plus `ms`, reading the clock into `now` on first
+    /// use so every entry of a page shares one time.
+    fn expiresAt(self: OnceVisit, now: *?i64, ms: u64) OnceError!i64 {
+        const current = now.* orelse current: {
+            const read = (self.clock orelse return error.OnceClockNotConfigured)();
+            if (read < 0) return error.InvalidOnceTime;
+            now.* = read;
+            break :current read;
+        };
+        const delta = std.math.cast(i64, ms) orelse return error.InvalidOnceTime;
+        const at = std.math.add(i64, current, delta) catch return error.InvalidOnceTime;
+        if (at > max_once_expires_at) return error.InvalidOnceTime;
+        return at;
+    }
+};
 
 pub const InitialPage = enum {
     /// `<script data-page="id" type="application/json">` plus `<div id="id">`
@@ -2413,4 +2603,319 @@ test "shared and optional scroll props are listed only when sent and their error
     try testing.expectEqual(@as(u16, 201), res.status_code);
     try testing.expectEqualStrings("keep", res.body);
     try testing.expectEqual(@as(usize, 0), res.header_count);
+}
+
+const OnceTest = struct {
+    plans_calls: usize = 0,
+    rates_calls: usize = 0,
+
+    fn plans(self: *OnceTest, _: std.mem.Allocator) []const []const u8 {
+        self.plans_calls += 1;
+        return &.{ "free", "pro" };
+    }
+
+    fn rates(self: *OnceTest, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+        self.rates_calls += 1;
+        return std.fmt.allocPrint(allocator, "rates {d}", .{self.rates_calls});
+    }
+
+    fn fail(_: *OnceTest, _: std.mem.Allocator) error{PlansUnavailable}![]const u8 {
+        return error.PlansUnavailable;
+    }
+
+    fn render(self: *OnceTest, plugin: anytype, headers: []const router.Header, res: *response.Response) !void {
+        const req = testRequest(.get, "/billing", headers);
+        try plugin.render(&req, res, "Billing", .{
+            .title = "hi",
+            .plans = once(self, plans),
+            .rates = once(self, rates).as("billing.rates").expiresIn(60_000),
+        });
+    }
+};
+
+/// The injected wall clock: reads return `once_now_ms`.
+var once_now_ms: i64 = 1_700_000_000_000;
+var once_clock_reads: usize = 0;
+
+fn onceClock() i64 {
+    once_clock_reads += 1;
+    return once_now_ms;
+}
+
+const OnceShared = struct {
+    app_name: []const u8,
+    locale: Onceable("locale", *OnceTest, OnceTest.rates),
+};
+
+var once_shared_state: OnceTest = .{};
+const once_plugin: Inertia(OnceShared) = .{
+    .layout = test_layout,
+    .now_milliseconds = onceClock,
+    .shared = .{ .value = .{
+        .app_name = "zoda",
+        .locale = once(&once_shared_state, OnceTest.rates).as("locale"),
+    } },
+};
+
+fn expectOncePage(comptime props: []const u8, comptime fields: []const u8, body: []const u8) !void {
+    try testing.expectEqualStrings(
+        "{\"component\":\"Billing\",\"props\":{" ++ props ++ "},\"url\":\"/billing\",\"version\":null," ++
+            fields ++ "\"sharedProps\":[\"app_name\",\"locale\"]}",
+        body,
+    );
+}
+
+const once_entries = "\"onceProps\":{\"locale\":{\"prop\":\"locale\",\"expiresAt\":null}," ++
+    "\"plans\":{\"prop\":\"plans\",\"expiresAt\":null}," ++
+    "\"billing.rates\":{\"prop\":\"rates\",\"expiresAt\":1700000060000}},";
+
+fn onceHeaders(comptime except: []const u8) []const router.Header {
+    return &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = except },
+    };
+}
+
+test "the first visit resolves once props and lists them in onceProps" {
+    once_shared_state = .{};
+    once_clock_reads = 0;
+    var state: OnceTest = .{};
+    var json = response.Response.init(testing.allocator);
+    defer json.deinit();
+    try state.render(&once_plugin, &inertia_headers, &json);
+    try expectOncePage(
+        "\"app_name\":\"zoda\",\"locale\":\"rates 1\",\"title\":\"hi\",\"plans\":[\"free\",\"pro\"],\"rates\":\"rates 1\",\"errors\":{}",
+        once_entries,
+        json.body,
+    );
+    try testing.expectEqual(@as(usize, 1), state.plans_calls);
+    try testing.expectEqual(@as(usize, 1), state.rates_calls);
+    // One clock read serves every entry of the page.
+    try testing.expectEqual(@as(usize, 1), once_clock_reads);
+
+    // The shape matches `Page.onceProps` in @inertiajs/core 3.9.1:
+    // `Record<string, {prop, expiresAt?: number | null}>`.
+    const OnceProp = struct { prop: []const u8, expiresAt: ?i64 = null };
+    const Page = struct { onceProps: std.json.ArrayHashMap(OnceProp) };
+    const parsed = try std.json.parseFromSlice(Page, testing.allocator, json.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqualStrings("rates", parsed.value.onceProps.map.get("billing.rates").?.prop);
+    try testing.expectEqual(@as(?i64, 1_700_000_060_000), parsed.value.onceProps.map.get("billing.rates").?.expiresAt);
+
+    // The HTML shell does the same and ignores the header, even malformed:
+    // a full page load has no client copy to reuse.
+    var html = response.Response.init(testing.allocator);
+    defer html.deinit();
+    try state.render(&once_plugin, &.{.{ .name = "X-Inertia-Except-Once-Props", .value = ",," }}, &html);
+    try testing.expectEqualStrings(html_content_type, html.content_type);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"plans\":[\"free\",\"pro\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"onceProps\":{\"locale\":") != null);
+    try testing.expectEqual(@as(usize, 2), state.plans_calls);
+}
+
+test "later visits skip once props the client holds but keep their entries" {
+    once_shared_state = .{};
+    once_clock_reads = 0;
+    var state: OnceTest = .{};
+    // What the client sends after the first visit: every key it still
+    // holds, unexpired.
+    var later = response.Response.init(testing.allocator);
+    defer later.deinit();
+    try state.render(&once_plugin, onceHeaders("locale,plans,billing.rates"), &later);
+    try expectOncePage("\"app_name\":\"zoda\",\"title\":\"hi\",\"errors\":{}", once_entries, later.body);
+    try testing.expectEqual(@as(usize, 0), state.plans_calls + state.rates_calls + once_shared_state.rates_calls);
+
+    // Keys, not prop names, are matched: `rates` is keyed `billing.rates`.
+    // Unknown keys are ignored.
+    var by_name = response.Response.init(testing.allocator);
+    defer by_name.deinit();
+    try state.render(&once_plugin, onceHeaders("rates,missing,plans.x"), &by_name);
+    try expectOncePage(
+        "\"app_name\":\"zoda\",\"locale\":\"rates 1\",\"title\":\"hi\",\"plans\":[\"free\",\"pro\"],\"rates\":\"rates 1\",\"errors\":{}",
+        once_entries,
+        by_name.body,
+    );
+
+    // A visit to another component is a full visit for this one, and the
+    // keys still apply.
+    var other = response.Response.init(testing.allocator);
+    defer other.deinit();
+    try state.render(&once_plugin, &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Other" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "plans" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "plans" },
+    }, &other);
+    try testing.expect(std.mem.indexOf(u8, other.body, "\"plans\":[") == null);
+    try testing.expectEqual(@as(usize, 1), state.plans_calls);
+}
+
+test "a partial reload that lists a once prop sends it fresh" {
+    once_shared_state = .{};
+    var state: OnceTest = .{};
+    // `router.reload({ only: ['plans'] })` while the client holds `plans`.
+    var only = response.Response.init(testing.allocator);
+    defer only.deinit();
+    try state.render(&once_plugin, partialHeaders("Billing", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "plans,rates.0" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "plans,billing.rates,locale" },
+    }), &only);
+    // Props the list leaves out get no entry; the client keeps its old one.
+    try expectOncePage(
+        "\"plans\":[\"free\",\"pro\"],\"rates\":\"rates 1\",\"errors\":{}",
+        "\"onceProps\":{\"plans\":{\"prop\":\"plans\",\"expiresAt\":null},\"billing.rates\":{\"prop\":\"rates\",\"expiresAt\":1700000060000}},",
+        only.body,
+    );
+    try testing.expectEqual(@as(usize, 1), state.plans_calls);
+    try testing.expectEqual(@as(usize, 0), once_shared_state.rates_calls);
+
+    // Only `-Data` asks explicitly: an except-only reload or a bare
+    // component header still leaves held props to the client.
+    inline for (.{
+        &[_]router.Header{.{ .name = "X-Inertia-Partial-Except", .value = "title" }},
+        &[_]router.Header{},
+    }) |extra| {
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try state.render(&once_plugin, partialHeaders("Billing", extra ++ &[_]router.Header{
+            .{ .name = "X-Inertia-Except-Once-Props", .value = "plans,billing.rates,locale" },
+        }), &res);
+        try testing.expect(std.mem.indexOf(u8, res.body, "\"plans\":[") == null);
+        try testing.expect(std.mem.indexOf(u8, res.body, "\"plans\":{\"prop\":\"plans\"") != null);
+    }
+    try testing.expectEqual(@as(usize, 1), state.plans_calls);
+
+    // `-Except` removes a once prop and its entry.
+    var except = response.Response.init(testing.allocator);
+    defer except.deinit();
+    try state.render(&once_plugin, partialHeaders("Billing", &.{.{ .name = "X-Inertia-Partial-Except", .value = "plans,rates,locale" }}), &except);
+    try expectOncePage("\"app_name\":\"zoda\",\"title\":\"hi\",\"errors\":{}", "", except.body);
+}
+
+test "once expiry uses the injected clock and is checked before the response changes" {
+    once_shared_state = .{};
+    var state: OnceTest = .{};
+    once_now_ms = 5_000;
+    defer once_now_ms = 1_700_000_000_000;
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try state.render(&once_plugin, &inertia_headers, &res);
+    try testing.expect(std.mem.indexOf(u8, res.body, "\"billing.rates\":{\"prop\":\"rates\",\"expiresAt\":65000}") != null);
+
+    // The client reuses a held value with its own expiry, but the entry is
+    // still recomputed from the clock.
+    once_now_ms = 9_000;
+    try state.render(&once_plugin, onceHeaders("billing.rates"), &res);
+    try testing.expect(std.mem.indexOf(u8, res.body, "\"billing.rates\":{\"prop\":\"rates\",\"expiresAt\":69000}") != null);
+
+    // Without an expiry the clock is not needed, or read.
+    once_clock_reads = 0;
+    const clockless: TestInertia = .{ .layout = test_layout };
+    const req = testRequest(.get, "/billing", &inertia_headers);
+    try clockless.render(&req, &res, "Billing", .{ .plans = once(&state, OnceTest.plans) });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Billing\",\"props\":{\"plans\":[\"free\",\"pro\"],\"errors\":{}},\"url\":\"/billing\",\"version\":null,\"onceProps\":{\"plans\":{\"prop\":\"plans\",\"expiresAt\":null}}}",
+        res.body,
+    );
+    try testing.expectEqual(@as(usize, 0), once_clock_reads);
+
+    const Bad = struct {
+        fn negative() i64 {
+            return -1;
+        }
+        fn late() i64 {
+            return max_once_expires_at - 10;
+        }
+    };
+    const cases = .{
+        .{ TestInertia{ .layout = test_layout }, @as(u64, 1), error.OnceClockNotConfigured },
+        .{ TestInertia{ .layout = test_layout, .now_milliseconds = Bad.negative }, @as(u64, 1), error.InvalidOnceTime },
+        .{ TestInertia{ .layout = test_layout, .now_milliseconds = Bad.late }, @as(u64, 11), error.InvalidOnceTime },
+        .{ TestInertia{ .layout = test_layout, .now_milliseconds = onceClock }, std.math.maxInt(u64), error.InvalidOnceTime },
+    };
+    inline for (cases) |case| {
+        // Checked even when the client holds the value, and on HTML visits.
+        inline for (.{ &inertia_headers, onceHeaders("plans"), &[_]router.Header{} }) |headers| {
+            const failing = testRequest(.get, "/billing", headers);
+            var kept = response.Response.init(testing.allocator);
+            defer kept.deinit();
+            try kept.text(201, "keep");
+            const plugin: TestInertia = case[0];
+            try testing.expectError(case[2], plugin.render(&failing, &kept, "Billing", .{ .plans = once(&state, OnceTest.plans).expiresIn(case[1]) }));
+            try testing.expectEqual(@as(u16, 201), kept.status_code);
+            try testing.expectEqualStrings("keep", kept.body);
+            try testing.expectEqual(@as(usize, 0), kept.header_count);
+        }
+    }
+
+    // The largest exact JavaScript integer is accepted.
+    const edge: TestInertia = .{ .layout = test_layout, .now_milliseconds = Bad.late };
+    try edge.render(&req, &res, "Billing", .{ .plans = once(&state, OnceTest.plans).expiresIn(10) });
+    try testing.expect(std.mem.indexOf(u8, res.body, "\"expiresAt\":9007199254740991}") != null);
+}
+
+test "malformed, duplicate, and oversized once headers fail without changing the response" {
+    var state: OnceTest = .{};
+    const cases = .{
+        .{ "", error.MalformedPartialHeader },
+        .{ "plans,", error.MalformedPartialHeader },
+        .{ "plans, rates", error.MalformedPartialHeader },
+        .{ "a..b", error.MalformedPartialHeader },
+        .{ "plans;x", error.MalformedPartialHeader },
+        .{ "a," ** max_partial_props ++ "a", error.PartialHeaderTooLarge },
+        .{ "a" ** (max_partial_bytes + 1), error.PartialHeaderTooLarge },
+    };
+    inline for (cases) |case| {
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try res.text(201, "keep");
+        try testing.expectError(case[1], state.render(&once_plugin, onceHeaders(case[0]), &res));
+        try testing.expectEqual(@as(u16, 201), res.status_code);
+        try testing.expectEqualStrings("keep", res.body);
+        try testing.expectEqual(@as(usize, 0), res.header_count);
+    }
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try testing.expectError(error.DuplicatePartialHeader, state.render(&once_plugin, &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "plans" },
+        .{ .name = "x-inertia-except-once-props", .value = "rates" },
+    }, &res));
+    try testing.expectEqual(@as(usize, 0), res.header_count);
+    try testing.expectEqual(@as(usize, 0), state.plans_calls + state.rates_calls);
+}
+
+test "once callback errors propagate and route props override shared once props" {
+    var state: OnceTest = .{};
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const req = testRequest(.get, "/billing", &inertia_headers);
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try res.text(201, "keep");
+    try testing.expectError(error.PlansUnavailable, plugin.render(&req, &res, "Billing", .{ .plans = once(&state, OnceTest.fail) }));
+    try testing.expectEqual(@as(u16, 201), res.status_code);
+    try testing.expectEqualStrings("keep", res.body);
+    try testing.expectEqual(@as(usize, 0), res.header_count);
+
+    // A held value never runs the failing callback.
+    const held = testRequest(.get, "/billing", onceHeaders("plans"));
+    try plugin.render(&held, &res, "Billing", .{ .plans = once(&state, OnceTest.fail) });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Billing\",\"props\":{\"errors\":{}},\"url\":\"/billing\",\"version\":null,\"onceProps\":{\"plans\":{\"prop\":\"plans\",\"expiresAt\":null}}}",
+        res.body,
+    );
+
+    // A plain route prop replaces the shared once prop and its entry, and
+    // unset shared values list nothing.
+    once_shared_state = .{};
+    var overridden = response.Response.init(testing.allocator);
+    defer overridden.deinit();
+    try once_plugin.render(&req, &overridden, "Billing", .{ .locale = "fr" });
+    try expectOncePage("\"app_name\":\"zoda\",\"locale\":\"fr\",\"errors\":{}", "", overridden.body);
+    try testing.expectEqual(@as(usize, 0), once_shared_state.rates_calls);
+    const unset: Inertia(OnceShared) = .{ .layout = test_layout };
+    var bare = response.Response.init(testing.allocator);
+    defer bare.deinit();
+    try unset.render(&req, &bare, "Billing", .{});
+    try testing.expectEqualStrings("{\"component\":\"Billing\",\"props\":{\"errors\":{}},\"url\":\"/billing\",\"version\":null}", bare.body);
 }

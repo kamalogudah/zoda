@@ -585,6 +585,48 @@ fn inertiaUsersRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: *
     }
 }
 
+// PLUGINS.md "Once props".
+const InertiaBilling = struct {
+    const Store = struct { plans: []const []const u8, rate: u32 };
+    var store: Store = .{ .plans = &.{ "free", "pro" }, .rate = 7 };
+    var loads: usize = 0;
+
+    const Plans = struct {
+        fn load(s: *const Store, _: std.mem.Allocator) []const []const u8 {
+            loads += 1;
+            return s.plans;
+        }
+    };
+    const Rates = struct {
+        fn load(s: *const Store, _: std.mem.Allocator) u32 {
+            loads += 1;
+            return s.rate;
+        }
+    };
+
+    fn unixMilliseconds() i64 {
+        return 1_767_222_000_000;
+    }
+};
+
+fn inertiaBillingRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    const user = "ada";
+    const store: *const InertiaBilling.Store = &InertiaBilling.store;
+    const Plans = InertiaBilling.Plans;
+    const Rates = InertiaBilling.Rates;
+    if (req.onLiteral("plans") and req.isRoot() and req.isGet()) {
+        const inertia = zoda.plugins.inertia;
+        return ctx.plugins.inertia.render(req, res, "Billing/Plans", .{
+            .user = user,
+            // Resolved on the first visit, then reused by the client.
+            .plans = inertia.once(store, Plans.load),
+            // Shared with any other page that uses the key "rates"; the client
+            // fetches it again after an hour.
+            .exchange = inertia.once(store, Rates.load).as("rates").expiresIn(60 * 60 * 1000),
+        });
+    }
+}
+
 fn inertiaVisit(app: *const InertiaApp, method: zoda.router.Method, target: []const u8, headers: []const zoda.request.Header) !zoda.response.Response {
     var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
     defer arena.deinit();
@@ -789,4 +831,54 @@ test "PLUGINS Inertia.js scroll props example" {
         .{ .name = "X-Inertia-Partial-Component", .value = "Users/Index" },
         .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "down" },
     }));
+}
+
+test "PLUGINS Inertia.js once props example" {
+    var app = try InertiaApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{ .inertia = .{
+            .layout = inertia_layout,
+            .now_milliseconds = InertiaBilling.unixMilliseconds,
+        } },
+        .route_fn = inertiaBillingRoute,
+    });
+    defer app.deinit();
+    InertiaBilling.loads = 0;
+
+    const entries = "\"onceProps\":{\"plans\":{\"prop\":\"plans\",\"expiresAt\":null},\"rates\":{\"prop\":\"exchange\",\"expiresAt\":1767225600000}}}";
+    var first = try inertiaVisit(&app, .get, "/plans", &.{.{ .name = "X-Inertia", .value = "true" }});
+    defer first.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Billing/Plans\",\"props\":{\"user\":\"ada\",\"plans\":[\"free\",\"pro\"],\"exchange\":7,\"errors\":{}}," ++
+            "\"url\":\"/plans\",\"version\":null," ++ entries,
+        first.body,
+    );
+    try std.testing.expectEqual(@as(usize, 2), InertiaBilling.loads);
+
+    // The client holds both values, so neither is resolved again.
+    var later = try inertiaVisit(&app, .get, "/plans", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "plans,rates" },
+    });
+    defer later.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Billing/Plans\",\"props\":{\"user\":\"ada\",\"errors\":{}},\"url\":\"/plans\",\"version\":null," ++ entries,
+        later.body,
+    );
+    try std.testing.expectEqual(@as(usize, 2), InertiaBilling.loads);
+
+    // `router.reload({ only: ['plans'] })` asks for it anyway.
+    var reload = try inertiaVisit(&app, .get, "/plans", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Billing/Plans" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "plans" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "plans,rates" },
+    });
+    defer reload.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Billing/Plans\",\"props\":{\"plans\":[\"free\",\"pro\"],\"errors\":{}},\"url\":\"/plans\",\"version\":null," ++
+            "\"onceProps\":{\"plans\":{\"prop\":\"plans\",\"expiresAt\":null}}}",
+        reload.body,
+    );
+    try std.testing.expectEqual(@as(usize, 3), InertiaBilling.loads);
 }

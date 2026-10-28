@@ -76,8 +76,9 @@ with a configured layout containing one `@inertia` marker, `render`,
 Partial reloads with `optional` and `always` props followed
 ([#69](https://github.com/kamalogudah/zoda/issues/69)), then deferred props
 ([#70](https://github.com/kamalogudah/zoda/issues/70)), merge props with
-reset ([#71](https://github.com/kamalogudah/zoda/issues/71)), and scroll
-props ([#72](https://github.com/kamalogudah/zoda/issues/72)); the remaining
+reset ([#71](https://github.com/kamalogudah/zoda/issues/71)), scroll
+props ([#72](https://github.com/kamalogudah/zoda/issues/72)), and once
+props ([#73](https://github.com/kamalogudah/zoda/issues/73)); the remaining
 deferred features are listed in
 [PLUGINS.md](PLUGINS.md#supported-protocol-features).
 

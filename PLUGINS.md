@@ -626,6 +626,7 @@ layout or root id before the first request; `render` checks again.
 | `initial_page` | `.script` | `.script` for Inertia v3 clients, `.attribute` for v1 and v2. See below. |
 | `version` | `.none` | `.value = "..."` or `.callback = fn (*const Request) []const u8`. `.none` sends `"version":null` and skips version checks. |
 | `shared` | `.none` | `.value = SharedProps{...}` or `.callback = fn (*const Request) SharedProps`. Use `zoda.Inertia(struct {})` for no shared props. |
+| `now_milliseconds` | `null` | Trusted UTC Unix-millisecond clock, `fn () i64`, for once props with an expiry. See [Once props](#once-props). |
 
 ### Responses
 
@@ -667,6 +668,8 @@ layout or root id before the first request; `render` checks again.
     adds to them; see [Merge props](#merge-props).
   - Props wrapped in `scroll` are merge props with pagination state in
     `scrollProps`, for `<InfiniteScroll>`; see [Scroll props](#scroll-props).
+  - Props made with `once` are listed in `onceProps` and not resolved again
+    while the client holds them; see [Once props](#once-props).
   - Nested empty values need a named type: in Zig an empty `.{}` literal is
     a tuple and serializes as `[]`. Pass a named empty struct such as
     `struct {}{}` for an empty nested object. Tuples with values are a
@@ -743,7 +746,7 @@ return ctx.plugins.inertia.render(req, res, "Reports/Index", .{
 - **Errors.** An error from `resolve` is returned by `render` unchanged and
   leaves the response untouched. `render`'s error set is
   `Inertia(S).Error(@TypeOf(props))`: the plugin errors plus those of every
-  `optional` and `deferred` route and shared prop.
+  `optional`, `deferred`, and `once` route and shared prop.
 - **Shared props.** Fields of `SharedProps` may use the same wrappers, for
   example `stats: zoda.plugins.inertia.Optional(*Stats, Stats.compute)` and
   `auth: zoda.plugins.inertia.Always([]const u8)`, initialized as
@@ -963,6 +966,90 @@ fn usersRoute(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.
   `error.InvalidScrollPageName` before the response changes, whether or
   not the prop is sent.
 
+### Once props
+
+A once prop is sent on the first visit and then reused by the client, for
+data that rarely changes, such as a list of plans or a country list. On later
+Inertia visits the client says which values it still holds, and `render`
+skips them without calling `resolve`:
+
+```zig
+const inertia = zoda.plugins.inertia;
+return ctx.plugins.inertia.render(req, res, "Billing/Plans", .{
+    .user = user,
+    // Resolved on the first visit, then reused by the client.
+    .plans = inertia.once(store, Plans.load),
+    // Shared with any other page that uses the key "rates"; the client
+    // fetches it again after an hour.
+    .exchange = inertia.once(store, Rates.load).as("rates").expiresIn(60 * 60 * 1000),
+});
+
+// .plugins = .{ .inertia = .{
+//     .layout = layout,
+//     // `unixMilliseconds` is the application's trusted wall-clock function.
+//     .now_milliseconds = unixMilliseconds,
+// } },
+```
+
+- **`once(context, resolve)`** returns a `Once(Context, resolve)` prop.
+  `resolve` follows the `optional` rules (signature, arena, error
+  propagation, and the warning about locks the route holds), but a once prop
+  is sent like a plain value: on full visits and on partial reloads that
+  keep it.
+- **Page fields.** Every response that would send the prop adds an entry to
+  `"onceProps": {"plans": {"prop": "plans", "expiresAt": null}, "rates":
+  {"prop": "exchange", "expiresAt": 1767225600000}}`, after `deferredProps`
+  and in declaration order, shared props first. This is `Page.onceProps` in
+  `@inertiajs/core` 3.9.1. Props left out by the partial-reload lists, and
+  shared props overridden by a route prop or not configured, get no entry;
+  the field is left out when there are none.
+- **Keys.** The entry is keyed by the prop name, or by `.as(key)`. Props on
+  different pages with the same key share one value on the client. A key is
+  one or more non-empty `.`-separated segments of `[A-Za-z0-9_$-]`, and two
+  once props of one page cannot share a key; both are checked at compile
+  time.
+- **Later visits.** The v3 client sends `X-Inertia-Except-Once-Props` with
+  the keys of the current page's once props that it holds and that have not
+  expired. On an Inertia visit, a once prop whose key is listed is not
+  resolved or sent, but its entry stays in `onceProps`, and the client
+  carries its current value over. Prop names that are not keys are ignored.
+  The header applies to every Inertia visit, including visits to other
+  components. Ordinary HTML visits ignore it, since a full page load has no
+  client copy.
+- **Partial reloads.** A partial reload of the rendered component that
+  lists the prop in `X-Inertia-Partial-Data` always resolves and sends it,
+  even when its key is in `X-Inertia-Except-Once-Props`, so
+  `router.reload({ only: ['plans'] })` refreshes it. As with the other
+  filters, a dot path such as `plans.0` asks for the whole prop. An
+  except-only reload or a bare component header does not count as asking,
+  so held props stay with the client.
+- **Expiry.** `.expiresIn(ms)` sets `expiresAt` to the
+  `now_milliseconds` clock's time plus `ms`, as Unix milliseconds. Once it has
+  passed, the client stops listing the key and the next visit resolves the
+  prop again. Without an expiry, `expiresAt` is `null` and the client keeps
+  the value until a visit's response has no entry for the key. `render`
+  reads the clock at most once, and only when a listed once prop has an
+  expiry. It returns `error.OnceClockNotConfigured`
+  when `now_milliseconds` is unset, and `error.InvalidOnceTime` when the clock
+  is negative or `expiresAt` would exceed `max_once_expires_at`
+  (2<sup>53</sup> − 1, the largest integer a JavaScript number holds
+  exactly). Both happen before the response changes. When the client
+  holds the value, it keeps the `expiresAt` it already has.
+- **Request headers.** `X-Inertia-Except-Once-Props` follows the
+  partial-list rules: 1 to `max_partial_props` names in at most
+  `max_partial_bytes` bytes (`error.PartialHeaderTooLarge`), each non-empty
+  `.`-separated segments of `[A-Za-z0-9_$-]`
+  (`error.MalformedPartialHeader`). A repeated field returns
+  `error.DuplicatePartialHeader`. These failures leave the response unchanged.
+- **Shared props.** A `SharedProps` field may be a once prop, typed
+  `Once(Context, resolve)`, or `Onceable(key, Context, resolve)` with a key,
+  for example `plans: zoda.plugins.inertia.Onceable("plans", *Store, Plans.load)`.
+- **Rules checked at compile time.** `errors` cannot be a once prop, and a
+  once prop's name must be non-empty `[A-Za-z0-9_$-]`, since the client
+  reads `prop` as a dot path. Once props cannot be wrapped in `merge`,
+  `prepend`, `deepMerge`, `scroll`, or `always`. Deferred once props
+  (Laravel's `Inertia::defer(...)->once()`) are not implemented.
+
 ### URL and origin policy
 
 The page `url` and the conflict's `X-Inertia-Location` are the raw
@@ -996,8 +1083,8 @@ origin. A target that starts with `//` or contains `\` is refused with
   `error_handler` clears the partial response.
 - **Ownership.** The response owns every serialized byte. Shared values and
   the version string are borrowed from the instance and must outlive the app;
-  callback results must stay valid until the call returns. Callbacks must be
-  safe to call concurrently.
+  callback results must stay valid until the call returns. Callbacks,
+  including `now_milliseconds`, must be safe to call concurrently.
 
 ### Interactions
 
@@ -1048,7 +1135,7 @@ The features not yet implemented are tracked in
 | Merge props (`merge`, `prepend`, `deepMerge`, `matchOn`; `mergeProps`, `prependProps`, `deepMergeProps`, `matchPropsOn`) | Implemented, including optional, deferred, and shared merge props |
 | Reset (`X-Inertia-Reset`) | Implemented: listed props are sent without merge metadata on partial reloads of the rendered component |
 | Scroll props (`scroll`; `scrollProps`, `X-Inertia-Infinite-Scroll-Merge-Intent`) | Implemented: one page of items per response with route-supplied page numbers; the intent picks `mergeProps` or `prependProps`, and `X-Inertia-Reset` sets `reset`. Driven in a browser through the example's paged todo list. |
-| Once props | Not implemented |
+| Once props (`once`, `.as(key)`, `.expiresIn(ms)`; `onceProps`, `X-Inertia-Except-Once-Props`) | Implemented: held keys are listed but not resolved, a partial reload that lists the prop in `-Data` always sends it, and `expiresAt` comes from the injected `now_milliseconds` clock. Covered by unit tests only. Deferred once props are not implemented. |
 | Error bags (`X-Inertia-Error-Bag`) | Not implemented: the header is ignored |
 | History encryption (`encryptHistory`, `clearHistory`) | Not implemented: never sent, so off |
 | Precognition validation | Not implemented |

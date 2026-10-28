@@ -171,11 +171,21 @@ runs inside `zig build test`.
   sets `reset: true`. The route reads the page query parameter and pages
   its own data. The intent accepts only `append` or `prepend`; an invalid
   `page_name` (1-64 `[A-Za-z0-9_-]` bytes) returns
-  `error.InvalidScrollPageName`. Lists (including `X-Inertia-Reset`) are
+  `error.InvalidScrollPageName`. `once(context, resolve)` props (types
+  `Once(Context, resolve)`, `Onceable(key, Context, resolve)`) are resolved
+  like plain props and listed as `onceProps: {key: {prop, expiresAt}}`,
+  keyed by the prop name or `.as(key)`; on an Inertia visit whose
+  `X-Inertia-Except-Once-Props` names the key they keep the entry but are
+  neither resolved nor sent, unless a partial reload of the component lists
+  them in `X-Inertia-Partial-Data`. `.expiresIn(ms)` sets `expiresAt` from
+  the instance's `now_milliseconds` clock (UTC Unix milliseconds); an unset
+  clock returns `error.OnceClockNotConfigured` and a negative time or an
+  `expiresAt` above `max_once_expires_at` returns `error.InvalidOnceTime`.
+  Lists (including `X-Inertia-Reset` and `X-Inertia-Except-Once-Props`) are
   bounded by `max_partial_props` and `max_partial_bytes`; malformed,
   oversized, or duplicate partial headers return errors. Top-level `flash`,
-  once props, error bags, history encryption, precognition, and SSR are not
-  implemented. See
+  deferred once props, error bags, history encryption, precognition, and SSR
+  are not implemented. See
   [PLUGINS.md](PLUGINS.md#inertiajs).
 - `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
   local-path rules without changing a response.
