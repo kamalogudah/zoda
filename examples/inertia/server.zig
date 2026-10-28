@@ -357,3 +357,31 @@ test "validation errors re-render the page and stale clients reload" {
     try std.testing.expectEqual(@as(u16, 409), stale.status_code);
     try std.testing.expectEqualStrings("/todos?filter=done", (try stale.getHeaderOne("X-Inertia-Location")).?);
 }
+
+test "router.reload({ only: ['todos'] }) returns only todos and errors" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+    _ = try store.add("Buy milk");
+
+    // The headers the v3 client sends for this reload.
+    const reload = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "todos" },
+    };
+    var partial = try visit(&app, .get, "/todos", &reload, "");
+    defer partial.deinit();
+    try std.testing.expectEqualStrings(
+        \\{"component":"Todos/Index","props":{"todos":[{"id":1,"text":"Buy milk","done":false}],"errors":{}},"url":"/todos","version":"v1","sharedProps":["app","framework"]}
+    , partial.body);
+
+    const bad = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "todos,,filter" },
+    };
+    try std.testing.expectError(error.MalformedPartialHeader, visit(&app, .get, "/todos", &bad, ""));
+}

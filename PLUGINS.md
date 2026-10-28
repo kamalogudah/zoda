@@ -658,6 +658,8 @@ layout or root id before the first request; `render` checks again.
   - With shared props configured, the page also lists their names in
     `sharedProps`. v3 clients use it to keep shared props during instant
     client-side visits.
+  - On an Inertia visit with `X-Inertia-Partial-Component`, only some props
+    are sent; see [Partial reloads](#partial-reloads).
   - Nested empty values need a named type: in Zig an empty `.{}` literal is
     a tuple and serializes as `[]`. Pass a named empty struct such as
     `struct {}{}` for an empty nested object. Tuples with values are a
@@ -678,6 +680,80 @@ layout or root id before the first request; `render` checks again.
   gets 409, `X-Inertia-Location`, and `Vary: X-Inertia`; any other request
   gets a 302/303 `Location`.
 
+### Partial reloads
+
+`router.reload({ only: [...] })` and `except: [...]` send
+`X-Inertia-Partial-Component` with `X-Inertia-Partial-Data` (only) and/or
+`X-Inertia-Partial-Except`. `render` honors them like the Laravel adapter:
+
+- They apply only to Inertia visits whose `X-Inertia-Partial-Component`
+  equals the component being rendered. Any other visit gets the full page.
+  Ordinary HTML visits ignore the headers.
+- `-Data` keeps only the listed props, `-Except` removes the listed props,
+  and when both are sent `-Except` wins. A component header with no list
+  sends every prop, including `optional` ones.
+- Shared props are filtered the same way. `errors` is always sent, and
+  `sharedProps` still names every shared prop.
+- Filtering is top-level only. A dot path such as `user.name` in `-Data`
+  keeps the whole `user` prop; in `-Except` it removes nothing. So the
+  server never sends less than was asked for, and the client merges the
+  result into its current props.
+
+Plain values are computed by the route before `render` is called; a partial
+reload only skips serializing them. Wrap expensive values so they are never
+computed unless sent:
+
+```zig
+const Report = struct {
+    fn totals(ids: []const u32, allocator: std.mem.Allocator) error{OutOfMemory}![]u32 {
+        const sums = try allocator.alloc(u32, 1);
+        sums[0] = 0;
+        for (ids) |id| sums[0] += id;
+        return sums;
+    }
+};
+
+return ctx.plugins.inertia.render(req, res, "Reports/Index", .{
+    .ids = ids,
+    // Resolved only when a partial reload asks for `totals`.
+    .totals = zoda.plugins.inertia.optional(ids, Report.totals),
+    // Sent on every visit, even `only: ['totals']`.
+    .notice = zoda.plugins.inertia.always("ready"),
+});
+```
+
+- **`optional(context, resolve)`** returns an `Optional(Context, resolve)`
+  prop. `resolve` is `fn (Context, std.mem.Allocator) T` or `... E!T`.
+  It is left out of full visits and called at most once, during `render`,
+  only when a partial reload keeps the prop (listed in `-Data`, or not
+  excluded when only `-Except` is sent). `allocator` is an arena owned by
+  `render` and freed once the page is serialized, so the result may live
+  there or borrow from `context`. Pass a pointer as `context` for state and
+  `{}` for none. Keep in mind that it runs inside `render`: do not take a
+  lock there that the route already holds.
+- **`always(value)`** returns an `Always(T)` prop that is sent on every
+  visit, whatever the lists say.
+- **Errors.** An error from `resolve` is returned by `render` unchanged and
+  leaves the response untouched. `render`'s error set is
+  `Inertia(S).Error(@TypeOf(props))`: the plugin errors plus those of every
+  `optional` route and shared prop.
+- **Shared props.** Fields of `SharedProps` may use the same wrappers, for
+  example `stats: zoda.plugins.inertia.Optional(*Stats, Stats.compute)` and
+  `auth: zoda.plugins.inertia.Always([]const u8)`, initialized as
+  `.{ .value = "..." }`.
+- **Headers.** Each list holds 1 to `max_partial_props` (64)
+  comma-separated names in at most `max_partial_bytes` (1024) bytes; larger
+  lists return `error.PartialHeaderTooLarge`. A name is one or more
+  non-empty `.`-separated segments of `[A-Za-z0-9_$-]`; an empty item,
+  whitespace, or any other byte returns `error.MalformedPartialHeader`.
+  A repeated `X-Inertia-Partial-*` field returns
+  `error.DuplicatePartialHeader`. On Inertia visits all three are checked
+  even when the component does not match. These failures leave the response
+  unchanged.
+- **Caching.** Partial and full responses share `Vary: X-Inertia`; no
+  `Vary` is added for the partial headers, so do not let a shared cache
+  store Inertia JSON responses.
+
 ### URL and origin policy
 
 The page `url` and the conflict's `X-Inertia-Location` are the raw
@@ -694,7 +770,9 @@ origin. A target that starts with `//` or contains `\` is refused with
 - **Headers.** `X-Inertia` must appear once with the exact value `true`.
   Another value returns `error.MalformedInertiaHeader`; a repeated field
   returns `error.DuplicateInertiaHeader`; a repeated `X-Inertia-Version`
-  returns `error.DuplicateVersionHeader`. There is no silent HTML fallback.
+  returns `error.DuplicateVersionHeader`. Partial-reload headers have their
+  own errors; see [Partial reloads](#partial-reloads). There is no silent
+  HTML fallback.
   `zoda.plugins.inertia.isInertia(req)` applies the same rules.
 - **Limits.** The finished HTML or JSON must fit `max_body_bytes`
   (`error.BodyTooLarge`), and every header the call adds must fit the
@@ -752,9 +830,10 @@ The features not yet implemented are tracked in
 | Fragment redirects, 409 + `X-Inertia-Redirect` | Implemented (`redirect` with `#`) |
 | External and full-page visits, 409 + `X-Inertia-Location` | Implemented (`location`) |
 | Prefetching (`Purpose: prefetch`) | Not special-cased: a prefetch is an ordinary Inertia GET and gets a full response. Not exercised by the example. |
-| Partial reloads (`X-Inertia-Partial-Data`, `-Component`, `-Except`) | Not implemented: headers are ignored and every prop is sent. v3 merges the response into the current props, so pages stay correct, but nothing is skipped on the server. |
+| Partial reloads (`X-Inertia-Partial-Data`, `-Component`, `-Except`) | Implemented, top-level names only (dot paths select the whole top-level prop). Covered by unit and example tests, not driven in a browser. |
 | Top-level `flash` | Not implemented: the client defaults it to `{}`. Pass flash messages as props, as the example's README describes. |
-| Deferred, optional, once, merge, and scroll props | Not implemented |
+| Optional props (`optional`) and always props (`always`) | Implemented |
+| Deferred, once, merge, and scroll props | Not implemented |
 | Error bags (`X-Inertia-Error-Bag`) | Not implemented: the header is ignored |
 | History encryption (`encryptHistory`, `clearHistory`) | Not implemented: never sent, so off |
 | Precognition validation | Not implemented |

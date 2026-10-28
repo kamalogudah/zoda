@@ -31,9 +31,17 @@
 //!   fragment, which XHR would drop. `location` forces a full visit: 409 and
 //!   `X-Inertia-Location` for an Inertia request, a plain 302/303 otherwise.
 //!
-//! Deferred: partial reloads (`X-Inertia-Partial-*` are ignored and every prop
-//! is sent), top-level `flash`, deferred/optional/once/merge props, error
-//! bags, history encryption, precognition, and server-side rendering.
+//! - Partial reloads: when `X-Inertia-Partial-Component` equals the rendered
+//!   component, `X-Inertia-Partial-Data` keeps only the listed props and
+//!   `X-Inertia-Partial-Except` removes listed props, winning over `-Data`.
+//!   Filtering is top-level: `a.b` in `-Data` keeps all of `a`, and `a.b` in
+//!   `-Except` removes nothing. Shared props are filtered the same way;
+//!   `errors` is always sent. `optional(context, resolve)` props are resolved
+//!   only for a partial reload that asks for them; `always(value)` props
+//!   ignore both lists.
+//!
+//! Deferred: top-level `flash`, deferred/once/merge props, error bags,
+//! history encryption, precognition, and server-side rendering.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
 //! the current page are the raw origin-form request target, so path and
@@ -53,11 +61,16 @@ const http_cache = @import("http_cache.zig");
 pub const layout_marker = "@inertia";
 pub const html_content_type = "text/html; charset=utf-8";
 pub const max_root_id_bytes = 64;
+/// Most names one `X-Inertia-Partial-Data` or `-Except` field may list.
+pub const max_partial_props = 64;
+/// Most bytes in one `X-Inertia-Partial-Data` or `-Except` value.
+pub const max_partial_bytes = 1024;
 
 pub const HeaderError = error{ DuplicateInertiaHeader, MalformedInertiaHeader, DuplicateVersionHeader };
+pub const PartialError = error{ DuplicatePartialHeader, MalformedPartialHeader, PartialHeaderTooLarge };
 pub const ConfigError = error{ InvalidLayout, InvalidRootId };
 pub const TargetError = error{ MissingRequestTarget, UnsafeRequestTarget };
-pub const RenderError = HeaderError || ConfigError || TargetError || response.HeaderError || error{
+pub const RenderError = HeaderError || PartialError || ConfigError || TargetError || response.HeaderError || error{
     BodyTooLarge,
     InvalidComponent,
 };
@@ -82,6 +95,140 @@ pub fn requestUrl(req: *const router.Request) TargetError![]const u8 {
         if (c <= ' ' or c >= 0x7f or c == '\\') return error.UnsafeRequestTarget;
     }
     return target;
+}
+
+/// How a prop takes part in partial reloads.
+pub const PropKind = enum {
+    /// A plain value: sent on full visits and when a partial reload keeps it.
+    eager,
+    /// Resolved and sent only when a partial reload keeps it.
+    optional,
+    /// Sent on every visit, whatever the partial reload lists.
+    always,
+};
+
+/// The prop type `optional(context, resolve)` returns. `resolve` is
+/// `fn (Context, std.mem.Allocator) T` or `... E!T`; `render` calls it at
+/// most once, only when the prop is sent, and returns its error unchanged.
+pub fn Optional(comptime Context: type, comptime resolve: anytype) type {
+    const info = @typeInfo(@TypeOf(resolve));
+    if (info != .@"fn" or info.@"fn".params.len != 2 or info.@"fn".return_type == null) {
+        @compileError("optional props take fn (context, std.mem.Allocator) T or E!T");
+    }
+    const Return = info.@"fn".return_type.?;
+    const Value, const ResolveError = switch (@typeInfo(Return)) {
+        .error_union => |eu| .{ eu.payload, eu.error_set },
+        else => .{ Return, error{} },
+    };
+    return struct {
+        pub const inertia_prop: PropKind = .optional;
+        pub const Error = ResolveError;
+
+        context: Context,
+
+        fn resolveIn(self: @This(), allocator: std.mem.Allocator) Error!Value {
+            return resolve(self.context, allocator);
+        }
+    };
+}
+
+/// A prop computed only when a partial reload requests it. `allocator` is
+/// an arena that `render` frees once the page is serialized, so the result
+/// may live there or borrow from `context`.
+pub fn optional(context: anytype, comptime resolve: anytype) Optional(@TypeOf(context), resolve) {
+    return .{ .context = context };
+}
+
+/// The prop type `always(value)` returns.
+pub fn Always(comptime T: type) type {
+    return struct {
+        pub const inertia_prop: PropKind = .always;
+
+        value: T,
+    };
+}
+
+/// A prop sent on every visit, even when a partial reload leaves it out.
+pub fn always(value: anytype) Always(@TypeOf(value)) {
+    return .{ .value = value };
+}
+
+pub fn propKind(comptime T: type) PropKind {
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "inertia_prop")) return T.inertia_prop;
+    return .eager;
+}
+
+/// The errors the `optional` props of the struct `P` can return.
+pub fn PropsError(comptime P: type) type {
+    comptime var E = error{};
+    inline for (std.meta.fields(P)) |field| {
+        if (comptime propKind(field.type) == .optional) E = E || field.type.Error;
+    }
+    return E;
+}
+
+/// The validated partial-reload lists for the component being rendered.
+/// Each list is the raw comma-separated header value.
+pub const Partial = struct {
+    only: ?[]const u8 = null,
+    except: ?[]const u8 = null,
+
+    /// Reports whether the prop `name` belongs in the page. `partial` is null
+    /// for a full visit.
+    pub fn wants(partial: ?Partial, name: []const u8, kind: PropKind) bool {
+        if (kind == .always) return true;
+        const p = partial orelse return kind != .optional;
+        // `a.b` keeps all of `a`; filtering never goes below the top level.
+        if (p.only) |list| if (!listNames(list, name, .first_segment)) return false;
+        // Only a whole top-level name removes a prop, so `a.b` keeps `a`.
+        if (p.except) |list| if (listNames(list, name, .exact)) return false;
+        return true;
+    }
+
+    fn listNames(list: []const u8, name: []const u8, match: enum { exact, first_segment }) bool {
+        var items = std.mem.splitScalar(u8, list, ',');
+        while (items.next()) |item| {
+            const key = switch (match) {
+                .exact => item,
+                .first_segment => item[0 .. std.mem.indexOfScalar(u8, item, '.') orelse item.len],
+            };
+            if (std.mem.eql(u8, key, name)) return true;
+        }
+        return false;
+    }
+};
+
+/// Reads the partial-reload headers of an Inertia request. All three are
+/// validated whatever the component; the result is null unless
+/// `X-Inertia-Partial-Component` equals `component`.
+pub fn partialReload(req: *const router.Request, component: []const u8) PartialError!?Partial {
+    const target = req.getHeaderOne("X-Inertia-Partial-Component") catch return error.DuplicatePartialHeader;
+    const only = try partialList(req, "X-Inertia-Partial-Data");
+    const except = try partialList(req, "X-Inertia-Partial-Except");
+    if (!std.mem.eql(u8, target orelse return null, component)) return null;
+    return .{ .only = only, .except = except };
+}
+
+/// Accepts 1 to `max_partial_props` comma-separated names in at most
+/// `max_partial_bytes`. A name is one or more dot-separated non-empty
+/// segments of `[A-Za-z0-9_$-]`; spaces and empty items are malformed.
+fn partialList(req: *const router.Request, name: []const u8) PartialError!?[]const u8 {
+    const value = (req.getHeaderOne(name) catch return error.DuplicatePartialHeader) orelse return null;
+    if (value.len > max_partial_bytes) return error.PartialHeaderTooLarge;
+    var count: usize = 0;
+    var items = std.mem.splitScalar(u8, value, ',');
+    while (items.next()) |item| {
+        count += 1;
+        if (count > max_partial_props) return error.PartialHeaderTooLarge;
+        var segments = std.mem.splitScalar(u8, item, '.');
+        while (segments.next()) |segment| {
+            if (segment.len == 0) return error.MalformedPartialHeader;
+            for (segment) |c| {
+                if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '$')) return error.MalformedPartialHeader;
+            }
+        }
+    }
+    return value;
 }
 
 pub fn Inertia(comptime SharedProps: type) type {
@@ -123,17 +270,24 @@ pub fn Inertia(comptime SharedProps: type) type {
             }
         }
 
+        /// The errors `render` can return for route props of type `Props`:
+        /// its own, plus those of every `optional` route or shared prop.
+        pub fn Error(comptime Props: type) type {
+            return RenderError || PropsError(SharedProps) || PropsError(Props);
+        }
+
         /// Renders `component` with the struct `props`, as HTML or as an
         /// Inertia JSON page depending on `X-Inertia`, with status 200. A
         /// stale asset version on an Inertia GET produces the 409 conflict
-        /// instead.
+        /// instead. A partial reload for `component` sends only the props it
+        /// asks for.
         pub fn render(
             self: *const Self,
             req: *const router.Request,
             res: *response.Response,
             component: []const u8,
             props: anytype,
-        ) RenderError!void {
+        ) Error(@TypeOf(props))!void {
             comptime {
                 const info = @typeInfo(@TypeOf(props));
                 if (info != .@"struct" or (info.@"struct".is_tuple and info.@"struct".fields.len != 0)) {
@@ -142,6 +296,8 @@ pub fn Inertia(comptime SharedProps: type) type {
             }
             try self.validate();
             const inertia = try isInertia(req);
+            // Partial headers only mean something on Inertia visits.
+            const partial = if (inertia) try partialReload(req, component) else null;
             const url = try requestUrl(req);
             const version = self.currentVersion(req);
             if (inertia and req.method == .get) {
@@ -152,7 +308,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             }
             if (component.len == 0) return error.InvalidComponent;
 
-            const page = try self.pageJson(res.allocator, req, component, props, url, version);
+            const page = try self.pageJson(res.allocator, req, partial, component, props, url, version);
             if (inertia) {
                 var committed = false;
                 defer if (!committed) res.allocator.free(page);
@@ -243,71 +399,95 @@ pub fn Inertia(comptime SharedProps: type) type {
             self: *const Self,
             allocator: std.mem.Allocator,
             req: *const router.Request,
+            partial: ?Partial,
             component: []const u8,
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
-        ) error{OutOfMemory}![]u8 {
+        ) (error{OutOfMemory} || PropsError(SharedProps) || PropsError(@TypeOf(props)))![]u8 {
             const shared: ?SharedProps = switch (self.shared) {
                 .none => null,
                 .value => |value| value,
                 .callback => |callback| callback(req),
             };
+            // `optional` results live here until they are serialized.
+            var arena: std.heap.ArenaAllocator = .init(allocator);
+            defer arena.deinit();
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var json: std.json.Stringify = .{ .writer = &out.writer };
-            writePage(&json, component, shared, props, url, version) catch return error.OutOfMemory;
+            try writePage(&json, arena.allocator(), partial, component, shared, props, url, version);
             return out.toOwnedSlice();
         }
 
+        /// Writes the page. The writer allocates, so its only failure is
+        /// `OutOfMemory`; any other error came from an `optional` prop.
         fn writePage(
             json: *std.json.Stringify,
+            arena: std.mem.Allocator,
+            partial: ?Partial,
             component: []const u8,
             shared: ?SharedProps,
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
-        ) std.json.Stringify.Error!void {
+        ) (error{OutOfMemory} || PropsError(SharedProps) || PropsError(@TypeOf(props)))!void {
             const P = @TypeOf(props);
-            try json.beginObject();
-            try json.objectField("component");
-            try json.write(component);
-            try json.objectField("props");
-            try json.beginObject();
+            json.beginObject() catch return error.OutOfMemory;
+            try writeField(json, "component", component);
+            json.objectField("props") catch return error.OutOfMemory;
+            json.beginObject() catch return error.OutOfMemory;
             if (shared) |value| {
                 inline for (std.meta.fields(SharedProps)) |field| {
                     if (comptime !@hasField(P, field.name)) {
-                        try json.objectField(field.name);
-                        try json.write(@field(value, field.name));
+                        try writeProp(json, arena, partial, field.name, @field(value, field.name));
                     }
                 }
             }
             inline for (std.meta.fields(P)) |field| {
-                try json.objectField(field.name);
-                try json.write(@field(props, field.name));
+                try writeProp(json, arena, partial, field.name, @field(props, field.name));
             }
             // Clients treat `errors` as always present, as Laravel sends it.
             const shared_errors = shared != null and @hasField(SharedProps, "errors");
             if (comptime !@hasField(P, "errors")) {
-                if (!shared_errors) {
-                    try json.objectField("errors");
-                    try json.beginObject();
-                    try json.endObject();
-                }
+                if (!shared_errors) try writeField(json, "errors", struct {}{});
             }
-            try json.endObject();
-            try json.objectField("url");
-            try json.write(url);
-            try json.objectField("version");
-            try json.write(version);
+            json.endObject() catch return error.OutOfMemory;
+            try writeField(json, "url", url);
+            try writeField(json, "version", version);
             if (shared != null) {
                 // v3 carries these props over to instant client-side visits.
-                try json.objectField("sharedProps");
-                try json.beginArray();
-                inline for (std.meta.fields(SharedProps)) |field| try json.write(field.name);
-                try json.endArray();
+                // The list names every shared prop, even on partial reloads.
+                json.objectField("sharedProps") catch return error.OutOfMemory;
+                json.beginArray() catch return error.OutOfMemory;
+                inline for (std.meta.fields(SharedProps)) |field| {
+                    json.write(field.name) catch return error.OutOfMemory;
+                }
+                json.endArray() catch return error.OutOfMemory;
             }
-            try json.endObject();
+            json.endObject() catch return error.OutOfMemory;
+        }
+
+        fn writeProp(
+            json: *std.json.Stringify,
+            arena: std.mem.Allocator,
+            partial: ?Partial,
+            comptime name: []const u8,
+            value: anytype,
+        ) (error{OutOfMemory} || PropsError(struct { value: @TypeOf(value) }))!void {
+            const kind = comptime propKind(@TypeOf(value));
+            const is_errors = comptime std.mem.eql(u8, name, "errors");
+            if (!is_errors and !Partial.wants(partial, name, kind)) return;
+            switch (kind) {
+                .eager => try writeField(json, name, value),
+                .always => try writeField(json, name, value.value),
+                .optional => try writeField(json, name, try value.resolveIn(arena)),
+            }
+        }
+
+        fn writeField(json: *std.json.Stringify, name: []const u8, value: anytype) error{OutOfMemory}!void {
+            json.objectField(name) catch return error.OutOfMemory;
+            json.write(value) catch return error.OutOfMemory;
         }
 
         fn htmlBody(self: *const Self, res: *const response.Response, page: []const u8) RenderError![]u8 {
@@ -910,4 +1090,233 @@ test "registered instance renders through app dispatch with errors propagating" 
     var miss_res = try app.dispatch(&miss_req);
     defer miss_res.deinit();
     try testing.expectEqual(@as(u16, 404), miss_res.status_code);
+}
+
+const PartialTest = struct {
+    calls: usize = 0,
+
+    fn stats(self: *PartialTest, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+        self.calls += 1;
+        return std.fmt.allocPrint(allocator, "computed {d}", .{self.calls});
+    }
+
+    fn fail(_: *PartialTest, _: std.mem.Allocator) error{StatsUnavailable}![]const u8 {
+        return error.StatsUnavailable;
+    }
+
+    fn render(self: *PartialTest, plugin: *const TestInertia, headers: []const router.Header, res: *response.Response) !void {
+        const req = testRequest(.get, "/todos", headers);
+        try plugin.render(&req, res, "Todos/Index", .{
+            .todos = &[_][]const u8{"milk"},
+            .filter = "all",
+            .stats = optional(self, stats),
+            .flash = always("saved"),
+        });
+    }
+};
+
+fn partialHeaders(comptime component: []const u8, comptime extra: []const router.Header) []const router.Header {
+    return &([_]router.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Partial-Component", .value = component },
+    } ++ extra[0..extra.len].*);
+}
+
+const partial_plugin: TestInertia = .{
+    .layout = test_layout,
+    .version = .{ .value = "v1" },
+    .shared = .{ .value = .{ .app_name = "zoda", .user = "ada" } },
+};
+
+fn expectProps(comptime props: []const u8, body: []const u8) !void {
+    try testing.expectEqualStrings(
+        "{\"component\":\"Todos/Index\",\"props\":{" ++ props ++ "},\"url\":\"/todos\",\"version\":\"v1\",\"sharedProps\":[\"app_name\",\"user\"]}",
+        body,
+    );
+}
+
+test "partial reload applies only to the rendered component" {
+    var state: PartialTest = .{};
+    var full = response.Response.init(testing.allocator);
+    defer full.deinit();
+    try state.render(&partial_plugin, &inertia_headers, &full);
+    // A full visit skips optional props without calling them.
+    try expectProps("\"app_name\":\"zoda\",\"user\":\"ada\",\"todos\":[\"milk\"],\"filter\":\"all\",\"flash\":\"saved\",\"errors\":{}", full.body);
+    try testing.expectEqual(@as(usize, 0), state.calls);
+
+    var other = response.Response.init(testing.allocator);
+    defer other.deinit();
+    try state.render(&partial_plugin, partialHeaders("Users/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = "todos" }}), &other);
+    try testing.expectEqualStrings(full.body, other.body);
+    try testing.expectEqual(@as(usize, 0), state.calls);
+
+    // Component without lists: everything, optional props included.
+    var bare = response.Response.init(testing.allocator);
+    defer bare.deinit();
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{}), &bare);
+    try expectProps("\"app_name\":\"zoda\",\"user\":\"ada\",\"todos\":[\"milk\"],\"filter\":\"all\",\"stats\":\"computed 1\",\"flash\":\"saved\",\"errors\":{}", bare.body);
+    try testing.expectEqual(@as(usize, 1), state.calls);
+
+    // Ordinary visits ignore the partial headers, even malformed ones.
+    const html_headers = [_]router.Header{
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "todos,,x y" },
+    };
+    var html = response.Response.init(testing.allocator);
+    defer html.deinit();
+    try state.render(&partial_plugin, &html_headers, &html);
+    try testing.expectEqualStrings(html_content_type, html.content_type);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"todos\":[\"milk\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"stats\"") == null);
+    try testing.expectEqual(@as(usize, 1), state.calls);
+}
+
+test "partial data keeps only listed props plus always and errors" {
+    var state: PartialTest = .{};
+    var only = response.Response.init(testing.allocator);
+    defer only.deinit();
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = "todos" }}), &only);
+    try expectProps("\"todos\":[\"milk\"],\"flash\":\"saved\",\"errors\":{}", only.body);
+    try testing.expectEqual(@as(usize, 0), state.calls);
+
+    var requested = response.Response.init(testing.allocator);
+    defer requested.deinit();
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = "stats,user,missing,stats" }}), &requested);
+    try expectProps("\"user\":\"ada\",\"stats\":\"computed 1\",\"flash\":\"saved\",\"errors\":{}", requested.body);
+    try testing.expectEqual(@as(usize, 1), state.calls);
+
+    // Filtering is top-level: a dot path keeps the whole prop.
+    var dotted = response.Response.init(testing.allocator);
+    defer dotted.deinit();
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = "todos.0,app_name" }}), &dotted);
+    try expectProps("\"app_name\":\"zoda\",\"todos\":[\"milk\"],\"flash\":\"saved\",\"errors\":{}", dotted.body);
+}
+
+test "partial except removes props and wins over partial data" {
+    var state: PartialTest = .{};
+    var except = response.Response.init(testing.allocator);
+    defer except.deinit();
+    // Like Laravel, an except-only reload includes optional props.
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Except", .value = "todos,app_name,flash,errors" }}), &except);
+    try expectProps("\"user\":\"ada\",\"filter\":\"all\",\"stats\":\"computed 1\",\"flash\":\"saved\",\"errors\":{}", except.body);
+    try testing.expectEqual(@as(usize, 1), state.calls);
+
+    var both = response.Response.init(testing.allocator);
+    defer both.deinit();
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "todos,stats,user" },
+        .{ .name = "X-Inertia-Partial-Except", .value = "stats,user.name" },
+    }), &both);
+    // `user.name` is below the top level, so `user` stays.
+    try expectProps("\"user\":\"ada\",\"todos\":[\"milk\"],\"flash\":\"saved\",\"errors\":{}", both.body);
+    try testing.expectEqual(@as(usize, 1), state.calls);
+}
+
+test "shared optional, always, and errors props follow the same filtering" {
+    const Shared = struct {
+        locale: []const u8,
+        auth: Always([]const u8),
+        errors: struct { text: []const u8 },
+        stats: Optional(*PartialTest, PartialTest.stats),
+    };
+    var state: PartialTest = .{};
+    const plugin: Inertia(Shared) = .{ .layout = test_layout, .shared = .{ .value = .{
+        .locale = "en",
+        .auth = .{ .value = "ada" },
+        .errors = .{ .text = "required" },
+        .stats = optional(&state, PartialTest.stats),
+    } } };
+    const req = testRequest(.get, "/", partialHeaders("Home", &.{.{ .name = "X-Inertia-Partial-Data", .value = "title" }}));
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try plugin.render(&req, &res, "Home", .{ .title = "hi", .body = "skipped" });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Home\",\"props\":{\"auth\":\"ada\",\"errors\":{\"text\":\"required\"},\"title\":\"hi\"},\"url\":\"/\",\"version\":null,\"sharedProps\":[\"locale\",\"auth\",\"errors\",\"stats\"]}",
+        res.body,
+    );
+    try testing.expectEqual(@as(usize, 0), state.calls);
+
+    const wanted = testRequest(.get, "/", partialHeaders("Home", &.{.{ .name = "X-Inertia-Partial-Data", .value = "stats" }}));
+    var with_stats = response.Response.init(testing.allocator);
+    defer with_stats.deinit();
+    try plugin.render(&wanted, &with_stats, "Home", .{});
+    try testing.expect(std.mem.indexOf(u8, with_stats.body, "\"props\":{\"auth\":\"ada\",\"errors\":{\"text\":\"required\"},\"stats\":\"computed 1\"}") != null);
+}
+
+test "optional callback errors propagate and leave the response unchanged" {
+    var state: PartialTest = .{};
+    const req = testRequest(.get, "/todos", partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = "stats" }}));
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try res.text(201, "keep");
+    try testing.expectError(error.StatsUnavailable, partial_plugin.render(&req, &res, "Todos/Index", .{ .stats = optional(&state, PartialTest.fail) }));
+    try testing.expectEqual(@as(u16, 201), res.status_code);
+    try testing.expectEqualStrings("keep", res.body);
+    try testing.expectEqual(@as(usize, 0), res.header_count);
+
+    // Not requested, so the failing callback never runs.
+    const skip = testRequest(.get, "/todos", &inertia_headers);
+    try partial_plugin.render(&skip, &res, "Todos/Index", .{ .stats = optional(&state, PartialTest.fail) });
+    try testing.expectEqual(@as(u16, 200), res.status_code);
+
+    // A plain callback without an error set and a void context also work.
+    const Plain = struct {
+        fn answer(_: void, _: std.mem.Allocator) u32 {
+            return 42;
+        }
+    };
+    try partial_plugin.render(&req, &res, "Todos/Index", .{ .stats = optional({}, Plain.answer) });
+    try expectProps("\"stats\":42,\"errors\":{}", res.body);
+}
+
+test "malformed, duplicate, and oversized partial headers fail without changing the response" {
+    var state: PartialTest = .{};
+    const too_many = "a," ** max_partial_props ++ "a";
+    const too_long = "a" ** (max_partial_bytes + 1);
+    const cases = .{
+        .{ "X-Inertia-Partial-Data", "", error.MalformedPartialHeader },
+        .{ "X-Inertia-Partial-Data", "todos,", error.MalformedPartialHeader },
+        .{ "X-Inertia-Partial-Data", ",todos", error.MalformedPartialHeader },
+        .{ "X-Inertia-Partial-Data", "todos, filter", error.MalformedPartialHeader },
+        .{ "X-Inertia-Partial-Except", "a..b", error.MalformedPartialHeader },
+        .{ "X-Inertia-Partial-Except", ".a", error.MalformedPartialHeader },
+        .{ "X-Inertia-Partial-Except", "a\"b", error.MalformedPartialHeader },
+        .{ "X-Inertia-Partial-Data", too_many, error.PartialHeaderTooLarge },
+        .{ "X-Inertia-Partial-Except", too_long, error.PartialHeaderTooLarge },
+    };
+    inline for (cases) |case| {
+        // Lists are validated even when another component is named.
+        inline for (.{ "Todos/Index", "Other" }) |component| {
+            var res = response.Response.init(testing.allocator);
+            defer res.deinit();
+            try res.text(201, "keep");
+            try testing.expectError(case[2], state.render(&partial_plugin, partialHeaders(component, &.{.{ .name = case[0], .value = case[1] }}), &res));
+            try testing.expectEqual(@as(u16, 201), res.status_code);
+            try testing.expectEqualStrings("keep", res.body);
+            try testing.expectEqual(@as(usize, 0), res.header_count);
+        }
+    }
+
+    // The limits themselves are accepted.
+    var at_limit = response.Response.init(testing.allocator);
+    defer at_limit.deinit();
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = "a," ** (max_partial_props - 1) ++ "todos" }}), &at_limit);
+    try expectProps("\"todos\":[\"milk\"],\"flash\":\"saved\",\"errors\":{}", at_limit.body);
+    var long_name = response.Response.init(testing.allocator);
+    defer long_name.deinit();
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = "a" ** max_partial_bytes }}), &long_name);
+
+    const duplicates = .{
+        &[_]router.Header{ .{ .name = "X-Inertia", .value = "true" }, .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" }, .{ .name = "x-inertia-partial-component", .value = "Todos/Index" } },
+        partialHeaders("Todos/Index", &.{ .{ .name = "X-Inertia-Partial-Data", .value = "todos" }, .{ .name = "X-Inertia-Partial-Data", .value = "todos" } }),
+        partialHeaders("Other", &.{ .{ .name = "X-Inertia-Partial-Except", .value = "a" }, .{ .name = "x-inertia-partial-except", .value = "b" } }),
+    };
+    inline for (duplicates) |headers| {
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try testing.expectError(error.DuplicatePartialHeader, state.render(&partial_plugin, headers, &res));
+        try testing.expectEqual(@as(usize, 0), res.header_count);
+    }
+    try testing.expectEqual(@as(usize, 0), state.calls);
 }

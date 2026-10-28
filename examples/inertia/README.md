@@ -62,6 +62,11 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
 - **Validation.** An empty or too-long todo re-renders the page with
   `errors: { text: "…" }`, which `useForm` exposes as `form.errors.text`.
   Other renders leave `errors` out and the plugin sends `errors: {}`.
+- **Partial reloads.** `router.reload({ only: ['todos'] })` sends
+  `X-Inertia-Partial-Component: Todos/Index` and
+  `X-Inertia-Partial-Data: todos`, and the server answers with only `todos`
+  and `errors`; the client keeps its other props. The page component has no
+  reload button, but the server test below sends exactly those headers.
 - **Asset version.** At startup the server hashes `app.js` into the Inertia
   version. After you rebuild the frontend and restart the server, an open tab
   that sends the old version gets 409 and `X-Inertia-Location` and does a full
@@ -80,4 +85,4 @@ relates to Zoda's CSRF helpers.
 `zig build test` (and `zig build test-examples`) runs the server tests in
 `server.zig`, which dispatch requests without a browser or a built frontend.
 They cover the HTML shell, the JSON page, add, toggle, filter, and delete,
-validation errors, and the version conflict.
+validation errors, the version conflict, and a partial reload of `todos`.

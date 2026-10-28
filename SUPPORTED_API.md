@@ -144,8 +144,18 @@ runs inside `zig build test`.
   no origin is read from `Host` or forwarded headers. Duplicate or malformed
   `X-Inertia`/`X-Inertia-Version` fields, unsafe targets, configuration, and
   limit failures return errors and leave the response unchanged. Partial
-  reloads, top-level `flash`, deferred/optional/once/merge props, error
-  bags, history encryption, precognition, and SSR are not implemented. See
+  reloads apply when `X-Inertia-Partial-Component` names the rendered
+  component: `X-Inertia-Partial-Data` keeps and `X-Inertia-Partial-Except`
+  removes top-level props (except wins; a dot path selects its top-level
+  prop), shared props included, and `errors` is always sent.
+  `zoda.plugins.inertia.optional(context, resolve)` props call
+  `resolve(context, arena)` only when a partial reload keeps them, and
+  `render` returns its errors unchanged (`Inertia(S).Error(Props)`);
+  `always(value)` props are always sent. Lists are bounded by
+  `max_partial_props` and `max_partial_bytes`; malformed, oversized, or
+  duplicate partial headers return errors. Top-level `flash`,
+  deferred/once/merge props, error bags, history encryption, precognition,
+  and SSR are not implemented. See
   [PLUGINS.md](PLUGINS.md#inertiajs).
 - `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
   local-path rules without changing a response.

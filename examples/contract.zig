@@ -485,6 +485,27 @@ fn inertiaRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: *zoda.
     }
 }
 
+// PLUGINS.md "Partial reloads": `optional` and `always` props.
+const InertiaReport = struct {
+    fn totals(ids: []const u32, allocator: std.mem.Allocator) error{OutOfMemory}![]u32 {
+        const sums = try allocator.alloc(u32, 1);
+        sums[0] = 0;
+        for (ids) |id| sums[0] += id;
+        return sums;
+    }
+};
+
+fn inertiaReportRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    const ids: []const u32 = &.{ 1, 2, 3 };
+    if (req.onLiteral("reports") and req.isRoot() and req.isGet()) {
+        return ctx.plugins.inertia.render(req, res, "Reports/Index", .{
+            .ids = ids,
+            .totals = zoda.plugins.inertia.optional(ids, InertiaReport.totals),
+            .notice = zoda.plugins.inertia.always("ready"),
+        });
+    }
+}
+
 fn inertiaVisit(app: *const InertiaApp, method: zoda.router.Method, target: []const u8, headers: []const zoda.request.Header) !zoda.response.Response {
     var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
     defer arena.deinit();
@@ -527,4 +548,32 @@ test "PLUGINS Inertia.js example" {
     defer created.deinit();
     try std.testing.expectEqual(@as(u16, 303), created.status_code);
     try std.testing.expectEqualStrings("/users", (try created.getHeaderOne("Location")).?);
+}
+
+test "PLUGINS Inertia.js partial reload example" {
+    var app = try InertiaApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{ .inertia = .{ .layout = inertia_layout, .shared = .{ .value = .{ .app_name = "Zoda" } } } },
+        .route_fn = inertiaReportRoute,
+    });
+    defer app.deinit();
+
+    var full = try inertiaVisit(&app, .get, "/reports", &.{.{ .name = "X-Inertia", .value = "true" }});
+    defer full.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Reports/Index\",\"props\":{\"app_name\":\"Zoda\",\"ids\":[1,2,3],\"notice\":\"ready\",\"errors\":{}},\"url\":\"/reports\",\"version\":null,\"sharedProps\":[\"app_name\"]}",
+        full.body,
+    );
+
+    // router.reload({ only: ['totals'] })
+    var partial = try inertiaVisit(&app, .get, "/reports", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Reports/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "totals" },
+    });
+    defer partial.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Reports/Index\",\"props\":{\"totals\":[6],\"notice\":\"ready\",\"errors\":{}},\"url\":\"/reports\",\"version\":null,\"sharedProps\":[\"app_name\"]}",
+        partial.body,
+    );
 }
