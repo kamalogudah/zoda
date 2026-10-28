@@ -154,6 +154,19 @@ li button:hover { color: var(--error); }
   color: var(--muted);
 }
 
+button.more {
+  display: block;
+  width: 100%;
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  color: var(--muted);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+}
+
+button.more:hover:not(:disabled) { color: var(--ink); }
+
 footer {
   margin-top: 0.75rem;
   font-size: 0.9rem;

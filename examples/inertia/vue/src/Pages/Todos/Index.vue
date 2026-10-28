@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { Deferred, Link, router, useForm } from '@inertiajs/vue3'
+import { Deferred, InfiniteScroll, Link, router, useForm } from '@inertiajs/vue3'
 
 const props = defineProps({
   app: String,
@@ -17,7 +17,9 @@ const filters = [
   ['done', 'Done'],
 ]
 const form = useForm({ text: '' })
-const options = { preserveScroll: true }
+// Mutations keep this component mounted, so they reset `todos`: the list
+// starts again at page 1 instead of merging into the pages loaded so far.
+const options = { preserveScroll: true, only: ['todos', 'remaining', 'stats'], reset: ['todos'] }
 // Mutations carry the filter so the server's 303 lands on the same view.
 const query = computed(() => (props.filter === 'all' ? '' : `?filter=${props.filter}`))
 
@@ -47,7 +49,13 @@ function add() {
       </Link>
     </nav>
 
-    <ul>
+    <!-- Each page of `todos` is a scroll prop; the buttons load the next or previous one. -->
+    <InfiniteScroll data="todos" as="ul" manual>
+      <template #previous="{ hasMore, loading, fetch }">
+        <button v-if="hasMore" class="more" :disabled="loading" @click="fetch">
+          {{ loading ? 'Loading…' : 'Show earlier' }}
+        </button>
+      </template>
       <li v-for="todo in todos" :id="`todo-${todo.id}`" :key="todo.id" :class="{ done: todo.done }">
         <label>
           <input
@@ -60,7 +68,12 @@ function add() {
         <button :aria-label="`Delete ${todo.text}`" @click="router.delete(`/todos/${todo.id}${query}`, options)">×</button>
       </li>
       <li v-if="todos.length === 0" class="empty">Nothing here yet.</li>
-    </ul>
+      <template #next="{ hasMore, loading, fetch }">
+        <button v-if="hasMore" class="more" :disabled="loading" @click="fetch">
+          {{ loading ? 'Loading…' : 'Show more' }}
+        </button>
+      </template>
+    </InfiniteScroll>
 
     <footer>
       {{ remaining }} {{ remaining === 1 ? 'item' : 'items' }} left

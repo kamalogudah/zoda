@@ -554,6 +554,37 @@ fn inertiaMessagesRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res
     }
 }
 
+// PLUGINS.md "Scroll props".
+const InertiaUsers = struct {
+    const Member = struct { id: u32, name: []const u8 };
+    const all = [_]Member{
+        .{ .id = 1, .name = "Ada" },    .{ .id = 2, .name = "Grace" },
+        .{ .id = 3, .name = "Edsger" }, .{ .id = 4, .name = "Barbara" },
+        .{ .id = 5, .name = "Ken" },
+    };
+};
+
+fn inertiaUsersRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.onLiteral("users") and req.isRoot() and req.isGet()) {
+        const per_page = 2;
+        const users = &InertiaUsers.all;
+        const last: u32 = @max(1, (users.len + per_page - 1) / per_page);
+        // The route owns pagination: `<InfiniteScroll>` only sets `?page=`.
+        const raw = (req.getOne("page") catch null) orelse "1";
+        const page = std.fmt.parseInt(u32, raw, 10) catch 0;
+        if (page < 1 or page > last) return res.text(404, "No such page");
+        const start = (page - 1) * per_page;
+        const inertia = zoda.plugins.inertia;
+        return ctx.plugins.inertia.render(req, res, "Users/Index", .{
+            .users = inertia.scroll(users[start..@min(start + per_page, users.len)], .{
+                .previous = if (page > 1) page - 1 else null,
+                .next = if (page < last) page + 1 else null,
+                .current = page,
+            }).matchOn("id"),
+        });
+    }
+}
+
 fn inertiaVisit(app: *const InertiaApp, method: zoda.router.Method, target: []const u8, headers: []const zoda.request.Header) !zoda.response.Response {
     var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
     defer arena.deinit();
@@ -706,4 +737,56 @@ test "PLUGINS Inertia.js merge props example" {
         "{\"component\":\"Messages/Index\",\"props\":{\"activity\":{\"events\":[7]},\"errors\":{}},\"url\":\"/messages\",\"version\":null,\"deepMergeProps\":[\"activity\"]}",
         activity.body,
     );
+}
+
+test "PLUGINS Inertia.js scroll props example" {
+    var app = try InertiaApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{ .inertia = .{ .layout = inertia_layout } },
+        .route_fn = inertiaUsersRoute,
+    });
+    defer app.deinit();
+
+    var first = try inertiaVisit(&app, .get, "/users", &.{.{ .name = "X-Inertia", .value = "true" }});
+    defer first.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Users/Index\",\"props\":{\"users\":[{\"id\":1,\"name\":\"Ada\"},{\"id\":2,\"name\":\"Grace\"}],\"errors\":{}}," ++
+            "\"url\":\"/users\",\"version\":null,\"mergeProps\":[\"users\"],\"matchPropsOn\":[\"users.id\"]," ++
+            "\"scrollProps\":{\"users\":{\"pageName\":\"page\",\"previousPage\":null,\"nextPage\":2,\"currentPage\":1,\"reset\":false}}}",
+        first.body,
+    );
+
+    // What `<InfiniteScroll data="users">` sends for the next page.
+    var next = try inertiaVisit(&app, .get, "/users?page=2", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Users/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "users" },
+        .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "append" },
+    });
+    defer next.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Users/Index\",\"props\":{\"users\":[{\"id\":3,\"name\":\"Edsger\"},{\"id\":4,\"name\":\"Barbara\"}],\"errors\":{}}," ++
+            "\"url\":\"/users?page=2\",\"version\":null,\"mergeProps\":[\"users\"],\"matchPropsOn\":[\"users.id\"]," ++
+            "\"scrollProps\":{\"users\":{\"pageName\":\"page\",\"previousPage\":1,\"nextPage\":3,\"currentPage\":2,\"reset\":false}}}",
+        next.body,
+    );
+
+    // Opened at `?page=3`, scrolling up prepends page 2.
+    var previous = try inertiaVisit(&app, .get, "/users?page=2", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Users/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "users" },
+        .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "prepend" },
+    });
+    defer previous.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, previous.body, "\"prependProps\":[\"users\"],\"matchPropsOn\":[\"users.id\"],\"scrollProps\"") != null);
+
+    var bad = try inertiaVisit(&app, .get, "/users?page=4", &.{.{ .name = "X-Inertia", .value = "true" }});
+    defer bad.deinit();
+    try std.testing.expectEqual(@as(u16, 404), bad.status_code);
+    try std.testing.expectError(error.MalformedPartialHeader, inertiaVisit(&app, .get, "/users?page=2", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Users/Index" },
+        .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "down" },
+    }));
 }

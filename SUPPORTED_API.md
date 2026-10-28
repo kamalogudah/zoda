@@ -160,11 +160,22 @@ runs inside `zig build test`.
   sent, its name is listed in `mergeProps`, `prependProps`, or
   `deepMergeProps`, and each `.matchOn(key)` adds `name.key` to
   `matchPropsOn`. On a partial reload of the rendered component, props named
-  in `X-Inertia-Reset` are sent without that metadata. Lists (including
-  `X-Inertia-Reset`) are bounded by `max_partial_props` and
-  `max_partial_bytes`; malformed, oversized, or duplicate partial headers
-  return errors. Top-level `flash`, once and scroll props, error bags,
-  history encryption, precognition, and SSR are not implemented. See
+  in `X-Inertia-Reset` are sent without that metadata.
+  `scroll(prop, .{ .page_name = "page", .previous = ?u32, .next = ?u32,
+  .current = u32 })` (types `Scroll(T)`, `Scrollable(T, match_on)`) is a
+  merge prop for `<InfiniteScroll>` that also adds
+  `scrollProps: {name: {pageName, previousPage, nextPage, currentPage,
+  reset}}` when sent; a partial reload with
+  `X-Inertia-Infinite-Scroll-Merge-Intent: prepend` lists it in
+  `prependProps`, otherwise it is in `mergeProps`, and `X-Inertia-Reset`
+  sets `reset: true`. The route reads the page query parameter and pages
+  its own data. The intent accepts only `append` or `prepend`; an invalid
+  `page_name` (1-64 `[A-Za-z0-9_-]` bytes) returns
+  `error.InvalidScrollPageName`. Lists (including `X-Inertia-Reset`) are
+  bounded by `max_partial_props` and `max_partial_bytes`; malformed,
+  oversized, or duplicate partial headers return errors. Top-level `flash`,
+  once props, error bags, history encryption, precognition, and SSR are not
+  implemented. See
   [PLUGINS.md](PLUGINS.md#inertiajs).
 - `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
   local-path rules without changing a response.

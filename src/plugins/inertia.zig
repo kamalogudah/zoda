@@ -52,8 +52,16 @@
 //!   merges them into its current props on a partial reload. Props named in
 //!   `X-Inertia-Reset` on such a reload are sent without the listing, so the
 //!   client replaces them.
+//! - Scroll props: `scroll(prop, .{ .current = n, .next = ..., ... })` is a
+//!   merge prop for `<InfiniteScroll>`. When it is in `props`, the page also
+//!   carries `scrollProps: {name: {pageName, previousPage, nextPage,
+//!   currentPage, reset}}`, and it is listed in `prependProps` when a partial
+//!   reload sends `X-Inertia-Infinite-Scroll-Merge-Intent: prepend`, else in
+//!   `mergeProps`. `reset` is true when `X-Inertia-Reset` names it. The route
+//!   reads the page number from its own query parameter and pages its data
+//!   itself.
 //!
-//! Not implemented: top-level `flash`, once and scroll props, error bags,
+//! Not implemented: top-level `flash`, once props, error bags,
 //! history encryption, precognition, and server-side rendering.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
@@ -83,9 +91,10 @@ pub const max_partial_bytes = 1024;
 
 pub const HeaderError = error{ DuplicateInertiaHeader, MalformedInertiaHeader, DuplicateVersionHeader };
 pub const PartialError = error{ DuplicatePartialHeader, MalformedPartialHeader, PartialHeaderTooLarge };
+pub const ScrollError = error{InvalidScrollPageName};
 pub const ConfigError = error{ InvalidLayout, InvalidRootId };
 pub const TargetError = error{ MissingRequestTarget, UnsafeRequestTarget };
-pub const RenderError = HeaderError || PartialError || ConfigError || TargetError || response.HeaderError || error{
+pub const RenderError = HeaderError || PartialError || ScrollError || ConfigError || TargetError || response.HeaderError || error{
     BodyTooLarge,
     InvalidComponent,
 };
@@ -226,24 +235,7 @@ pub fn Mergeable(comptime mode: MergeMode, comptime T: type, comptime match_on: 
     comptime {
         if (mergeMode(T) != null) @compileError("merge props do not nest");
         if (propKind(T) == .always) @compileError("always props cannot be merged");
-        if (mode != .deep and match_on.len > 1) @compileError("merge and prepend props match on one key");
-        for (match_on, 0..) |key, i| {
-            if (mode != .deep and std.mem.indexOfScalar(u8, key, '.') != null) {
-                @compileError("only deepMerge match keys may be dot paths");
-            }
-            var segments = std.mem.splitScalar(u8, key, '.');
-            while (segments.next()) |segment| {
-                if (segment.len == 0) @compileError("match keys are non-empty dot-separated names");
-                for (segment) |c| {
-                    if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '$')) {
-                        @compileError("match key \"" ++ key ++ "\" must use [A-Za-z0-9_$-]");
-                    }
-                }
-            }
-            for (match_on[0..i]) |earlier| {
-                if (std.mem.eql(u8, earlier, key)) @compileError("match key \"" ++ key ++ "\" is repeated");
-            }
-        }
+        checkMatchKeys(mode, match_on);
     }
     return struct {
         pub const inertia_merge: MergeMode = mode;
@@ -258,6 +250,27 @@ pub fn Mergeable(comptime mode: MergeMode, comptime T: type, comptime match_on: 
             return .{ .inner = self.inner };
         }
     };
+}
+
+fn checkMatchKeys(comptime mode: MergeMode, comptime match_on: []const []const u8) void {
+    if (mode != .deep and match_on.len > 1) @compileError("merge, prepend, and scroll props match on one key");
+    for (match_on, 0..) |key, i| {
+        if (mode != .deep and std.mem.indexOfScalar(u8, key, '.') != null) {
+            @compileError("only deepMerge match keys may be dot paths");
+        }
+        var segments = std.mem.splitScalar(u8, key, '.');
+        while (segments.next()) |segment| {
+            if (segment.len == 0) @compileError("match keys are non-empty dot-separated names");
+            for (segment) |c| {
+                if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '$')) {
+                    @compileError("match key \"" ++ key ++ "\" must use [A-Za-z0-9_$-]");
+                }
+            }
+        }
+        for (match_on[0..i]) |earlier| {
+            if (std.mem.eql(u8, earlier, key)) @compileError("match key \"" ++ key ++ "\" is repeated");
+        }
+    }
 }
 
 /// The prop type `merge(prop)` returns.
@@ -291,6 +304,65 @@ pub fn prepend(prop: anytype) Prepend(@TypeOf(prop)) {
 /// appended and nested fields kept.
 pub fn deepMerge(prop: anytype) DeepMerge(@TypeOf(prop)) {
     return .{ .inner = prop };
+}
+
+/// `X-Inertia-Infinite-Scroll-Merge-Intent`: where `<InfiniteScroll>` puts
+/// the page it is loading.
+pub const MergeIntent = enum {
+    /// The next page, after the current items.
+    append,
+    /// The previous page, before them.
+    prepend,
+};
+
+/// Pagination state of a `scroll` prop, sent as its `scrollProps` entry.
+/// `<InfiniteScroll>` loads `previous` or `next` with a partial reload that
+/// sets the query parameter `page_name` to that number; null means there is
+/// no such page. `page_name` is 1-64 `[A-Za-z0-9_-]` bytes.
+pub const ScrollPage = struct {
+    page_name: []const u8 = "page",
+    previous: ?u32 = null,
+    next: ?u32 = null,
+    current: u32,
+};
+
+/// The prop type `scroll(prop, page)` returns, wrapping the prop `T` (a
+/// plain value, `Optional`, or `Deferred`) that holds one page of items.
+/// `match_on` follows the `merge` rules.
+pub fn Scrollable(comptime T: type, comptime match_on: []const []const u8) type {
+    comptime {
+        if (mergeMode(T) != null) @compileError("scroll props do not wrap merge props");
+        if (propKind(T) == .always) @compileError("always props cannot be scroll props");
+        checkMatchKeys(.append, match_on);
+    }
+    return struct {
+        /// The listing a full visit uses; partial reloads follow the merge
+        /// intent instead.
+        pub const inertia_merge: MergeMode = .append;
+        pub const inertia_scroll = true;
+        pub const inertia_match_on = match_on;
+        pub const Inner = T;
+
+        inner: T,
+        page: ScrollPage,
+
+        /// Like `Mergeable.matchOn`: a loaded item whose `key` field equals a
+        /// current one replaces it in place.
+        pub fn matchOn(self: @This(), comptime key: []const u8) Scrollable(T, match_on ++ .{key}) {
+            return .{ .inner = self.inner, .page = self.page };
+        }
+    };
+}
+
+/// The prop type `scroll(prop, page)` returns.
+pub fn Scroll(comptime T: type) type {
+    return Scrollable(T, &.{});
+}
+
+/// One page of items for `<InfiniteScroll data="name">`, with its pagination
+/// state. The client appends the next page and prepends the previous one.
+pub fn scroll(prop: anytype, page: ScrollPage) Scroll(@TypeOf(prop)) {
+    return .{ .inner = prop, .page = page };
 }
 
 pub fn mergeMode(comptime T: type) ?MergeMode {
@@ -329,6 +401,8 @@ pub const Partial = struct {
     except: ?[]const u8 = null,
     /// `X-Inertia-Reset`: merge props the client replaces this time.
     reset: ?[]const u8 = null,
+    /// How scroll props merge on this reload.
+    merge_intent: MergeIntent = .append,
 
     /// Reports whether the prop `name` belongs in the page. `partial` is null
     /// for a full visit.
@@ -363,20 +437,37 @@ pub const Partial = struct {
 };
 
 /// Reads the partial-reload headers of an Inertia request, including
-/// `X-Inertia-Reset`. All four are validated whatever the component; the
-/// result is null unless `X-Inertia-Partial-Component` equals `component`.
+/// `X-Inertia-Reset` and `X-Inertia-Infinite-Scroll-Merge-Intent`. All five
+/// are validated whatever the component; the result is null unless
+/// `X-Inertia-Partial-Component` equals `component`.
 pub fn partialReload(req: *const router.Request, component: []const u8) PartialError!?Partial {
     const target = req.getHeaderOne("X-Inertia-Partial-Component") catch return error.DuplicatePartialHeader;
     const only = try partialList(req, "X-Inertia-Partial-Data");
     const except = try partialList(req, "X-Inertia-Partial-Except");
     const reset = try partialList(req, "X-Inertia-Reset");
+    const intent = try mergeIntent(req);
     if (!std.mem.eql(u8, target orelse return null, component)) return null;
-    return .{ .only = only, .except = except, .reset = reset };
+    return .{ .only = only, .except = except, .reset = reset, .merge_intent = intent };
+}
+
+/// Accepts exactly `append` or `prepend`; a missing field means `append`.
+fn mergeIntent(req: *const router.Request) PartialError!MergeIntent {
+    const value = (req.getHeaderOne("X-Inertia-Infinite-Scroll-Merge-Intent") catch return error.DuplicatePartialHeader) orelse return .append;
+    return std.meta.stringToEnum(MergeIntent, value) orelse error.MalformedPartialHeader;
 }
 
 /// Accepts 1 to `max_partial_props` comma-separated names in at most
 /// `max_partial_bytes`. A name is one or more dot-separated non-empty
 /// segments of `[A-Za-z0-9_$-]`; spaces and empty items are malformed.
+/// Accepts 1-64 `[A-Za-z0-9_-]` bytes: a query parameter name the route
+/// can read back without decoding.
+fn checkPageName(name: []const u8) ScrollError!void {
+    if (name.len == 0 or name.len > 64) return error.InvalidScrollPageName;
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return error.InvalidScrollPageName;
+    }
+}
+
 fn partialList(req: *const router.Request, name: []const u8) PartialError!?[]const u8 {
     const value = (req.getHeaderOne(name) catch return error.DuplicatePartialHeader) orelse return null;
     if (value.len > max_partial_bytes) return error.PartialHeaderTooLarge;
@@ -570,7 +661,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
-        ) (error{OutOfMemory} || PropsError(SharedProps) || PropsError(@TypeOf(props)))![]u8 {
+        ) (error{OutOfMemory} || ScrollError || PropsError(SharedProps) || PropsError(@TypeOf(props)))![]u8 {
             const shared: ?SharedProps = switch (self.shared) {
                 .none => null,
                 .value => |value| value,
@@ -586,9 +677,9 @@ pub fn Inertia(comptime SharedProps: type) type {
             return out.toOwnedSlice();
         }
 
-        /// Writes the page. The writer allocates, so its only failure is
-        /// `OutOfMemory`; any other error came from an `optional` or
-        /// `deferred` prop.
+        /// Writes the page. The writer allocates, so its only failures are
+        /// `OutOfMemory` and an invalid scroll page name; any other error
+        /// came from an `optional` or `deferred` prop.
         fn writePage(
             json: *std.json.Stringify,
             arena: std.mem.Allocator,
@@ -598,7 +689,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
-        ) (error{OutOfMemory} || PropsError(SharedProps) || PropsError(@TypeOf(props)))!void {
+        ) (error{OutOfMemory} || ScrollError || PropsError(SharedProps) || PropsError(@TypeOf(props)))!void {
             const P = @TypeOf(props);
             json.beginObject() catch return error.OutOfMemory;
             try writeField(json, "component", component);
@@ -623,6 +714,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             try writeField(json, "url", url);
             try writeField(json, "version", version);
             try writeMerge(json, partial, shared != null, comptime mergeProps(P));
+            try writeScroll(json, partial, shared, props, comptime mergeProps(P));
             // Only full visits announce deferred props; a partial reload
             // either resolves them or leaves them to the client.
             if (partial == null) try writeDeferred(json, shared != null, comptime deferredProps(P));
@@ -674,6 +766,8 @@ pub fn Inertia(comptime SharedProps: type) type {
             match_on: []const []const u8,
             kind: PropKind,
             shared: bool,
+            /// A `scroll` prop, whose listing follows the merge intent.
+            scroll: bool,
         };
 
         /// The merge props of a page with route props `P`, shared ones
@@ -691,16 +785,33 @@ pub fn Inertia(comptime SharedProps: type) type {
                         .match_on = field.type.inertia_match_on,
                         .kind = propKind(field.type),
                         .shared = is_shared,
+                        .scroll = @hasDecl(field.type, "inertia_scroll"),
                     }};
                 }
             }
             return found;
         }
 
+        /// Whether the merge prop is in `props`.
+        fn sendsProp(partial: ?Partial, has_shared: bool, comptime prop: MergeProp) bool {
+            if (prop.shared and !has_shared) return false;
+            return Partial.wants(partial, prop.name, prop.kind);
+        }
+
         /// Whether the merge prop is in `props` and not reset.
         fn mergesProp(partial: ?Partial, has_shared: bool, comptime prop: MergeProp) bool {
-            if (prop.shared and !has_shared) return false;
-            return Partial.wants(partial, prop.name, prop.kind) and !Partial.resets(partial, prop.name);
+            return sendsProp(partial, has_shared, prop) and !Partial.resets(partial, prop.name);
+        }
+
+        /// The listing of a merge prop: its own mode, or for a scroll prop
+        /// the merge intent of a partial reload.
+        fn listedMode(partial: ?Partial, comptime prop: MergeProp) MergeMode {
+            if (!prop.scroll) return prop.mode;
+            const p = partial orelse return prop.mode;
+            return switch (p.merge_intent) {
+                .append => .append,
+                .prepend => .prepend,
+            };
         }
 
         /// Writes `mergeProps`, `prependProps`, `deepMergeProps`, and
@@ -716,14 +827,16 @@ pub fn Inertia(comptime SharedProps: type) type {
             inline for (lists) |list| {
                 var started = false;
                 inline for (props) |prop| {
+                    // A scroll prop may land in either list; `listedMode` picks.
                     const names: []const []const u8 = comptime if (list[0]) |mode|
-                        (if (prop.mode == mode) &.{prop.name} else &.{})
+                        (if (prop.mode == mode or (prop.scroll and mode != .deep)) &.{prop.name} else &.{})
                     else names: {
                         var keys: []const []const u8 = &.{};
                         for (prop.match_on) |key| keys = keys ++ .{prop.name ++ "." ++ key};
                         break :names keys;
                     };
-                    if (names.len != 0 and mergesProp(partial, has_shared, prop)) {
+                    const listed = if (list[0]) |mode| listedMode(partial, prop) == mode else true;
+                    if (names.len != 0 and listed and mergesProp(partial, has_shared, prop)) {
                         if (!started) {
                             json.objectField(list[1]) catch return error.OutOfMemory;
                             json.beginArray() catch return error.OutOfMemory;
@@ -734,6 +847,48 @@ pub fn Inertia(comptime SharedProps: type) type {
                 }
                 if (started) json.endArray() catch return error.OutOfMemory;
             }
+        }
+
+        /// Writes `scrollProps` as `{name: ScrollProp}` for the scroll props
+        /// this page sends, in declaration order, and leaves it out when
+        /// there are none. Every scroll prop's page name is checked first,
+        /// sent or not.
+        fn writeScroll(
+            json: *std.json.Stringify,
+            partial: ?Partial,
+            shared: ?SharedProps,
+            props: anytype,
+            comptime list: []const MergeProp,
+        ) (error{OutOfMemory} || ScrollError)!void {
+            inline for (list) |prop| {
+                if (comptime !prop.scroll) continue;
+                if (!prop.shared or shared != null) try checkPageName(scrollPage(shared, props, prop).page_name);
+            }
+            var started = false;
+            inline for (list) |prop| {
+                if (comptime !prop.scroll) continue;
+                if (sendsProp(partial, shared != null, prop)) {
+                    const page = scrollPage(shared, props, prop);
+                    if (!started) {
+                        json.objectField("scrollProps") catch return error.OutOfMemory;
+                        json.beginObject() catch return error.OutOfMemory;
+                        started = true;
+                    }
+                    // `ScrollProp` in @inertiajs/core 3.9.1.
+                    try writeField(json, prop.name, .{
+                        .pageName = page.page_name,
+                        .previousPage = page.previous,
+                        .nextPage = page.next,
+                        .currentPage = page.current,
+                        .reset = Partial.resets(partial, prop.name),
+                    });
+                }
+            }
+            if (started) json.endObject() catch return error.OutOfMemory;
+        }
+
+        fn scrollPage(shared: ?SharedProps, props: anytype, comptime prop: MergeProp) ScrollPage {
+            return if (prop.shared) @field(shared.?, prop.name).page else @field(props, prop.name).page;
         }
 
         /// Writes `deferredProps` as `{group: [names]}` in first-seen group
@@ -1591,9 +1746,14 @@ test "malformed, duplicate, and oversized partial headers fail without changing 
         .{ "X-Inertia-Reset", "todos filter", error.MalformedPartialHeader },
         .{ "X-Inertia-Reset", too_many, error.PartialHeaderTooLarge },
         .{ "X-Inertia-Reset", too_long, error.PartialHeaderTooLarge },
+        .{ "X-Inertia-Infinite-Scroll-Merge-Intent", "", error.MalformedPartialHeader },
+        .{ "X-Inertia-Infinite-Scroll-Merge-Intent", "Append", error.MalformedPartialHeader },
+        .{ "X-Inertia-Infinite-Scroll-Merge-Intent", "prepend ", error.MalformedPartialHeader },
+        .{ "X-Inertia-Infinite-Scroll-Merge-Intent", "append,prepend", error.MalformedPartialHeader },
+        .{ "X-Inertia-Infinite-Scroll-Merge-Intent", "merge", error.MalformedPartialHeader },
     };
     inline for (cases) |case| {
-        // Lists are validated even when another component is named.
+        // Headers are validated even when another component is named.
         inline for (.{ "Todos/Index", "Other" }) |component| {
             var res = response.Response.init(testing.allocator);
             defer res.deinit();
@@ -1619,6 +1779,10 @@ test "malformed, duplicate, and oversized partial headers fail without changing 
         partialHeaders("Todos/Index", &.{ .{ .name = "X-Inertia-Partial-Data", .value = "todos" }, .{ .name = "X-Inertia-Partial-Data", .value = "todos" } }),
         partialHeaders("Other", &.{ .{ .name = "X-Inertia-Partial-Except", .value = "a" }, .{ .name = "x-inertia-partial-except", .value = "b" } }),
         partialHeaders("Todos/Index", &.{ .{ .name = "X-Inertia-Reset", .value = "todos" }, .{ .name = "x-inertia-reset", .value = "todos" } }),
+        partialHeaders("Other", &.{
+            .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "append" },
+            .{ .name = "x-inertia-infinite-scroll-merge-intent", .value = "append" },
+        }),
     };
     inline for (duplicates) |headers| {
         var res = response.Response.init(testing.allocator);
@@ -2012,6 +2176,240 @@ test "optional merge props resolve only when sent and their errors propagate" {
     defer res.deinit();
     try res.text(201, "keep");
     try testing.expectError(error.FeedUnavailable, plugin.render(&failing, &res, "Feed", .{ .bad = merge(optional(&state, MergeTest.fail)) }));
+    try testing.expectEqual(@as(u16, 201), res.status_code);
+    try testing.expectEqualStrings("keep", res.body);
+    try testing.expectEqual(@as(usize, 0), res.header_count);
+}
+
+const ScrollTest = struct {
+    const Item = MergeTest.Item;
+    const pages = [_][]const Item{
+        &.{ .{ .id = 1, .text = "a" }, .{ .id = 2, .text = "b" } },
+        &.{ .{ .id = 3, .text = "c" }, .{ .id = 4, .text = "d" } },
+        &.{.{ .id = 5, .text = "e" }},
+    };
+
+    /// What a route does: read `?page=` itself and pass one page of items
+    /// with its neighbours.
+    fn render(plugin: anytype, target: []const u8, headers: []const router.Header, res: *response.Response) !void {
+        var req = testRequest(.get, target, headers);
+        // `testRequest` does not parse the query; these targets have at most `page`.
+        const query = [_]router.QueryPair{.{ .key = "page", .value = if (std.mem.indexOf(u8, target, "?page=")) |at| target[at + 6 ..] else "" }};
+        if (query[0].value.len != 0) req.query = &query;
+        const raw = (req.getOne("page") catch null) orelse "1";
+        const current = std.fmt.parseInt(u32, raw, 10) catch 1;
+        const index = @min(@max(current, 1), pages.len) - 1;
+        try plugin.render(&req, res, "Feed", .{
+            .title = "hi",
+            .items = scroll(pages[index], .{
+                .previous = if (index > 0) @intCast(index) else null,
+                .next = if (index + 1 < pages.len) @intCast(index + 2) else null,
+                .current = @intCast(index + 1),
+            }).matchOn("id"),
+        });
+    }
+};
+
+const scroll_plugin: TestInertia = .{ .layout = test_layout };
+
+fn expectScrollPage(comptime url: []const u8, comptime props: []const u8, comptime fields: []const u8, body: []const u8) !void {
+    try testing.expectEqualStrings(
+        "{\"component\":\"Feed\",\"props\":{" ++ props ++ "},\"url\":\"" ++ url ++ "\",\"version\":null" ++ fields ++ "}",
+        body,
+    );
+}
+
+/// What `<InfiniteScroll data="items">` sends to load a page.
+fn scrollHeaders(comptime intent: []const u8) []const router.Header {
+    return partialHeaders("Feed", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "items" },
+        .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = intent },
+    });
+}
+
+test "the first page of a scroll prop is merged and lists its pagination" {
+    var json = response.Response.init(testing.allocator);
+    defer json.deinit();
+    try ScrollTest.render(&scroll_plugin, "/feed", &inertia_headers, &json);
+    try expectScrollPage(
+        "/feed",
+        "\"title\":\"hi\",\"items\":[{\"id\":1,\"text\":\"a\"},{\"id\":2,\"text\":\"b\"}],\"errors\":{}",
+        ",\"mergeProps\":[\"items\"],\"matchPropsOn\":[\"items.id\"]," ++
+            "\"scrollProps\":{\"items\":{\"pageName\":\"page\",\"previousPage\":null,\"nextPage\":2,\"currentPage\":1,\"reset\":false}}",
+        json.body,
+    );
+
+    // The entry matches `ScrollProp` in @inertiajs/core 3.9.1.
+    const ScrollProp = struct { pageName: []const u8, previousPage: ?u32, nextPage: ?u32, currentPage: u32, reset: bool };
+    const Page = struct { scrollProps: struct { items: ScrollProp }, mergeProps: []const []const u8 };
+    const parsed = try std.json.parseFromSlice(Page, testing.allocator, json.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqualStrings("page", parsed.value.scrollProps.items.pageName);
+    try testing.expectEqual(@as(?u32, 2), parsed.value.scrollProps.items.nextPage);
+
+    // The HTML shell carries the same entry, and an intent header without
+    // a partial reload changes nothing.
+    var html = response.Response.init(testing.allocator);
+    defer html.deinit();
+    try ScrollTest.render(&scroll_plugin, "/feed", &.{.{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "prepend" }}, &html);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"mergeProps\":[\"items\"],\"matchPropsOn\":[\"items.id\"],\"scrollProps\":{\"items\":{") != null);
+    var full = response.Response.init(testing.allocator);
+    defer full.deinit();
+    try ScrollTest.render(&scroll_plugin, "/feed", &.{ .{ .name = "X-Inertia", .value = "true" }, .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "prepend" } }, &full);
+    try testing.expectEqualStrings(json.body, full.body);
+}
+
+test "next and previous pages follow the merge intent" {
+    var next = response.Response.init(testing.allocator);
+    defer next.deinit();
+    try ScrollTest.render(&scroll_plugin, "/feed?page=2", scrollHeaders("append"), &next);
+    try expectScrollPage(
+        "/feed?page=2",
+        "\"items\":[{\"id\":3,\"text\":\"c\"},{\"id\":4,\"text\":\"d\"}],\"errors\":{}",
+        ",\"mergeProps\":[\"items\"],\"matchPropsOn\":[\"items.id\"]," ++
+            "\"scrollProps\":{\"items\":{\"pageName\":\"page\",\"previousPage\":1,\"nextPage\":3,\"currentPage\":2,\"reset\":false}}",
+        next.body,
+    );
+
+    // A reload without the header appends, as the client's own default.
+    var unspecified = response.Response.init(testing.allocator);
+    defer unspecified.deinit();
+    try ScrollTest.render(&scroll_plugin, "/feed?page=2", partialHeaders("Feed", &.{.{ .name = "X-Inertia-Partial-Data", .value = "items" }}), &unspecified);
+    try testing.expectEqualStrings(next.body, unspecified.body);
+
+    // Scrolling up from a page opened at ?page=3 loads page 2 before it.
+    var previous = response.Response.init(testing.allocator);
+    defer previous.deinit();
+    try ScrollTest.render(&scroll_plugin, "/feed?page=2", scrollHeaders("prepend"), &previous);
+    try expectScrollPage(
+        "/feed?page=2",
+        "\"items\":[{\"id\":3,\"text\":\"c\"},{\"id\":4,\"text\":\"d\"}],\"errors\":{}",
+        ",\"prependProps\":[\"items\"],\"matchPropsOn\":[\"items.id\"]," ++
+            "\"scrollProps\":{\"items\":{\"pageName\":\"page\",\"previousPage\":1,\"nextPage\":3,\"currentPage\":2,\"reset\":false}}",
+        previous.body,
+    );
+
+    var last = response.Response.init(testing.allocator);
+    defer last.deinit();
+    try ScrollTest.render(&scroll_plugin, "/feed?page=3", scrollHeaders("append"), &last);
+    try testing.expect(std.mem.indexOf(u8, last.body, "{\"pageName\":\"page\",\"previousPage\":2,\"nextPage\":null,\"currentPage\":3,\"reset\":false}") != null);
+
+    // The intent of a reload for another component is checked but unused.
+    var other = response.Response.init(testing.allocator);
+    defer other.deinit();
+    try ScrollTest.render(&scroll_plugin, "/feed", partialHeaders("Other", &.{.{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "prepend" }}), &other);
+    try testing.expect(std.mem.indexOf(u8, other.body, "\"title\":\"hi\"") != null);
+    try testing.expect(std.mem.indexOf(u8, other.body, "\"mergeProps\":[\"items\"]") != null);
+}
+
+test "reset scroll props are replaced and marked reset, and filtered ones are not listed" {
+    // What `router.reload({ only: ['items'], reset: ['items'] })` sends.
+    var reset = response.Response.init(testing.allocator);
+    defer reset.deinit();
+    try ScrollTest.render(&scroll_plugin, "/feed", partialHeaders("Feed", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "items" },
+        .{ .name = "X-Inertia-Reset", .value = "items" },
+    }), &reset);
+    try expectScrollPage(
+        "/feed",
+        "\"items\":[{\"id\":1,\"text\":\"a\"},{\"id\":2,\"text\":\"b\"}],\"errors\":{}",
+        ",\"scrollProps\":{\"items\":{\"pageName\":\"page\",\"previousPage\":null,\"nextPage\":2,\"currentPage\":1,\"reset\":true}}",
+        reset.body,
+    );
+
+    inline for (.{
+        .{ "X-Inertia-Partial-Data", "title" },
+        .{ "X-Inertia-Partial-Except", "items" },
+    }) |list| {
+        var filtered = response.Response.init(testing.allocator);
+        defer filtered.deinit();
+        try ScrollTest.render(&scroll_plugin, "/feed", partialHeaders("Feed", &.{
+            .{ .name = list[0], .value = list[1] },
+            .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "prepend" },
+        }), &filtered);
+        try expectScrollPage("/feed", "\"title\":\"hi\",\"errors\":{}", "", filtered.body);
+    }
+}
+
+test "invalid scroll page names fail without changing the response" {
+    const long = "p" ** 65;
+    inline for (.{ "", "a b", "page&x=1", "users[page]", long }) |name| {
+        // Checked even when the prop is not sent.
+        inline for (.{ &inertia_headers, partialHeaders("Feed", &.{.{ .name = "X-Inertia-Partial-Data", .value = "title" }}) }) |headers| {
+            const req = testRequest(.get, "/feed", headers);
+            var res = response.Response.init(testing.allocator);
+            defer res.deinit();
+            try res.text(201, "keep");
+            try testing.expectError(error.InvalidScrollPageName, scroll_plugin.render(&req, &res, "Feed", .{
+                .title = "hi",
+                .items = scroll(@as([]const u32, &.{1}), .{ .page_name = name, .current = 1 }),
+            }));
+            try testing.expectEqual(@as(u16, 201), res.status_code);
+            try testing.expectEqualStrings("keep", res.body);
+            try testing.expectEqual(@as(usize, 0), res.header_count);
+        }
+    }
+
+    const req = testRequest(.get, "/feed", &inertia_headers);
+    var ok = response.Response.init(testing.allocator);
+    defer ok.deinit();
+    try scroll_plugin.render(&req, &ok, "Feed", .{ .items = scroll(@as([]const u32, &.{1}), .{ .page_name = "p" ** 64, .current = 1 }) });
+    try testing.expect(std.mem.indexOf(u8, ok.body, "\"pageName\":\"" ++ "p" ** 64 ++ "\"") != null);
+}
+
+const ScrollShared = struct {
+    app_name: []const u8,
+    notices: Scroll([]const u32),
+};
+
+test "shared and optional scroll props are listed only when sent and their errors propagate" {
+    var state: MergeTest = .{};
+    const Later = struct {
+        fn items(_: void, _: std.mem.Allocator) []const u32 {
+            return &.{ 7, 8 };
+        }
+    };
+    const shared: Inertia(ScrollShared) = .{
+        .layout = test_layout,
+        .shared = .{ .value = .{ .app_name = "zoda", .notices = scroll(@as([]const u32, &.{1}), .{ .page_name = "notices_page", .next = 2, .current = 1 }) } },
+    };
+    const full = testRequest(.get, "/feed", &inertia_headers);
+    var page = response.Response.init(testing.allocator);
+    defer page.deinit();
+    try shared.render(&full, &page, "Feed", .{ .items = scroll(optional({}, Later.items), .{ .current = 1, .next = 2 }) });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Feed\",\"props\":{\"app_name\":\"zoda\",\"notices\":[1],\"errors\":{}},\"url\":\"/feed\",\"version\":null," ++
+            "\"mergeProps\":[\"notices\"],\"scrollProps\":{\"notices\":{\"pageName\":\"notices_page\",\"previousPage\":null,\"nextPage\":2,\"currentPage\":1,\"reset\":false}}," ++
+            "\"sharedProps\":[\"app_name\",\"notices\"]}",
+        page.body,
+    );
+
+    const prepend_items = testRequest(.get, "/feed", partialHeaders("Feed", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "items" },
+        .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "prepend" },
+    }));
+    var loaded = response.Response.init(testing.allocator);
+    defer loaded.deinit();
+    try shared.render(&prepend_items, &loaded, "Feed", .{ .items = scroll(optional({}, Later.items), .{ .current = 1, .next = 2 }) });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Feed\",\"props\":{\"items\":[7,8],\"errors\":{}},\"url\":\"/feed\",\"version\":null," ++
+            "\"prependProps\":[\"items\"],\"scrollProps\":{\"items\":{\"pageName\":\"page\",\"previousPage\":null,\"nextPage\":2,\"currentPage\":1,\"reset\":false}}," ++
+            "\"sharedProps\":[\"app_name\",\"notices\"]}",
+        loaded.body,
+    );
+
+    // Unset shared values list nothing.
+    const unset: Inertia(ScrollShared) = .{ .layout = test_layout };
+    var bare = response.Response.init(testing.allocator);
+    defer bare.deinit();
+    try unset.render(&full, &bare, "Feed", .{});
+    try testing.expectEqualStrings("{\"component\":\"Feed\",\"props\":{\"errors\":{}},\"url\":\"/feed\",\"version\":null}", bare.body);
+
+    const failing = testRequest(.get, "/feed", scrollHeaders("append"));
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try res.text(201, "keep");
+    try testing.expectError(error.FeedUnavailable, scroll_plugin.render(&failing, &res, "Feed", .{ .items = scroll(optional(&state, MergeTest.fail), .{ .current = 1 }) }));
     try testing.expectEqual(@as(u16, 201), res.status_code);
     try testing.expectEqualStrings("keep", res.body);
     try testing.expectEqual(@as(usize, 0), res.header_count);

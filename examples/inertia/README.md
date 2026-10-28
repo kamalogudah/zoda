@@ -12,7 +12,8 @@ frontend:
 
 All three render the same props, share [one stylesheet](shared/style.css),
 and use the same [Vite build settings](shared/build.mjs). Todos live in
-memory and disappear when the server stops.
+memory and disappear when the server stops. The server starts with 25
+sample todos so there is something to page through.
 
 ## Run it
 
@@ -37,7 +38,7 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
 | Request | Route | Response |
 | --- | --- | --- |
 | `GET /` | redirect | 302 to `/todos` |
-| `GET /todos[?filter=active\|done]` | `render("Todos/Index", …)` | HTML shell on the first visit, the page JSON on Inertia visits |
+| `GET /todos[?filter=active\|done][&page=n]` | `render("Todos/Index", …)` | HTML shell on the first visit, the page JSON on Inertia visits; 10 todos per page, newest first |
 | `POST /todos` with `{"text": "…"}` | add | back to the current filter at `#todo-<id>`, or the page again with `errors.text` |
 | `PATCH /todos/:id` | toggle | 303 back |
 | `DELETE /todos/:id` | delete | 303 back, or 404 |
@@ -73,6 +74,21 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   then requests it with `X-Inertia-Partial-Data: stats` and the page's
   `<Deferred data="stats">` shows "counting…" until it arrives. The counts
   are cheap here; a real app would defer a slow query.
+- **Infinite scroll.** `todos` is a `zoda.plugins.inertia.scroll` prop:
+  the route reads `?page=`, sends that page of ten (newest first, so a new
+  todo is on page 1), and says which pages are before and after it. The
+  page's `<InfiniteScroll data="todos" manual>` shows "Show more", which
+  reloads only `todos` with `?page=2` and
+  `X-Inertia-Infinite-Scroll-Merge-Intent: append`. The answer is listed in
+  `mergeProps`, so the client appends it and moves on to the next
+  `scrollProps.todos.nextPage`. As you read further down, the client writes
+  `?page=` into the address bar. Reload the page there and it opens on that
+  page with "Show earlier", which sends `prepend` and puts the earlier page
+  above. Mutations keep the page component mounted, so they send
+  `only: ['todos', 'remaining', 'stats']` and `reset: ['todos']`; the reply
+  has `scrollProps.todos.reset: true`, and the list starts again at page 1.
+  Filter links are plain GET visits, which remount the page, so they need
+  no reset. Drop `manual` to load pages as you scroll instead.
 - **Asset version.** At startup the server hashes `app.js` into the Inertia
   version. After you rebuild the frontend and restart the server, an open tab
   that sends the old version gets 409 and `X-Inertia-Location` and does a full
@@ -91,5 +107,6 @@ relates to Zoda's CSRF helpers.
 `zig build test` (and `zig build test-examples`) runs the server tests in
 `server.zig`, which dispatch requests without a browser or a built frontend.
 They cover the HTML shell, the JSON page, add, toggle, filter, and delete,
-validation errors, the version conflict, a partial reload of `todos`, and
-loading the deferred `stats`.
+validation errors, the version conflict, a partial reload of `todos`,
+loading the deferred `stats`, and paging `todos` forward, backward, and
+after a reset.

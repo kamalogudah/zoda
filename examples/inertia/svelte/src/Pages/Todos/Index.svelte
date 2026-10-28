@@ -1,5 +1,5 @@
 <script>
-  import { Deferred, Link, router, useForm } from '@inertiajs/svelte'
+  import { Deferred, InfiniteScroll, Link, router, useForm } from '@inertiajs/svelte'
 
   let { app, framework, todos, filter, remaining, stats } = $props()
 
@@ -9,7 +9,9 @@
     ['done', 'Done'],
   ]
   const form = useForm({ text: '' })
-  const options = { preserveScroll: true }
+  // Mutations keep this component mounted, so they reset `todos`: the list
+  // starts again at page 1 instead of merging into the pages loaded so far.
+  const options = { preserveScroll: true, only: ['todos', 'remaining', 'stats'], reset: ['todos'] }
   // Mutations carry the filter so the server's 303 lands on the same view.
   let query = $derived(filter === 'all' ? '' : `?filter=${filter}`)
 
@@ -39,7 +41,13 @@
     {/each}
   </nav>
 
-  <ul>
+  <!-- Each page of `todos` is a scroll prop; the buttons load the next or previous one. -->
+  <InfiniteScroll data="todos" as="ul" manual>
+    {#snippet previous({ hasMore, loading, fetch })}
+      {#if hasMore}
+        <button class="more" disabled={loading} onclick={fetch}>{loading ? 'Loading…' : 'Show earlier'}</button>
+      {/if}
+    {/snippet}
     {#each todos as todo (todo.id)}
       <li id={`todo-${todo.id}`} class:done={todo.done}>
         <label>
@@ -57,7 +65,12 @@
     {:else}
       <li class="empty">Nothing here yet.</li>
     {/each}
-  </ul>
+    {#snippet next({ hasMore, loading, fetch })}
+      {#if hasMore}
+        <button class="more" disabled={loading} onclick={fetch}>{loading ? 'Loading…' : 'Show more'}</button>
+      {/if}
+    {/snippet}
+  </InfiniteScroll>
 
   <footer>
     {remaining} {remaining === 1 ? 'item' : 'items'} left

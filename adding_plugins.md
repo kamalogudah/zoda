@@ -75,8 +75,9 @@ with a configured layout containing one `@inertia` marker, `render`,
 `redirect`, and `location` methods, and a same-origin relative URL policy.
 Partial reloads with `optional` and `always` props followed
 ([#69](https://github.com/kamalogudah/zoda/issues/69)), then deferred props
-([#70](https://github.com/kamalogudah/zoda/issues/70)) and merge props with
-reset ([#71](https://github.com/kamalogudah/zoda/issues/71)); the remaining
+([#70](https://github.com/kamalogudah/zoda/issues/70)), merge props with
+reset ([#71](https://github.com/kamalogudah/zoda/issues/71)), and scroll
+props ([#72](https://github.com/kamalogudah/zoda/issues/72)); the remaining
 deferred features are listed in
 [PLUGINS.md](PLUGINS.md#supported-protocol-features).
 

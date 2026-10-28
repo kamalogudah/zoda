@@ -1,4 +1,4 @@
-import { Deferred, Link, router, useForm } from '@inertiajs/react'
+import { Deferred, InfiniteScroll, Link, router, useForm } from '@inertiajs/react'
 
 const filters = [
   ['all', 'All'],
@@ -10,7 +10,9 @@ export default function Index({ app, framework, todos, filter, remaining, stats 
   const form = useForm({ text: '' })
   // Mutations carry the filter so the server's 303 lands on the same view.
   const query = filter === 'all' ? '' : `?filter=${filter}`
-  const options = { preserveScroll: true }
+  // They also keep this component mounted, so reset `todos`: the list
+  // starts again at page 1 instead of merging into the pages loaded so far.
+  const options = { preserveScroll: true, only: ['todos', 'remaining', 'stats'], reset: ['todos'] }
 
   function add(event) {
     event.preventDefault()
@@ -48,13 +50,18 @@ export default function Index({ app, framework, todos, filter, remaining, stats 
         ))}
       </nav>
 
-      {todos.length === 0 ? (
-        <ul>
+      {/* Each page of `todos` is a scroll prop; the buttons load the next or previous one. */}
+      <InfiniteScroll
+        data="todos"
+        as="ul"
+        manual
+        previous={(scroll) => <More {...scroll} label="Show earlier" />}
+        next={(scroll) => <More {...scroll} label="Show more" />}
+      >
+        {todos.length === 0 ? (
           <li className="empty">Nothing here yet.</li>
-        </ul>
-      ) : (
-        <ul>
-          {todos.map((todo) => (
+        ) : (
+          todos.map((todo) => (
             <li key={todo.id} id={`todo-${todo.id}`} className={todo.done ? 'done' : ''}>
               <label>
                 <input
@@ -71,9 +78,9 @@ export default function Index({ app, framework, todos, filter, remaining, stats 
                 ×
               </button>
             </li>
-          ))}
-        </ul>
-      )}
+          ))
+        )}
+      </InfiniteScroll>
 
       <footer>
         {remaining} {remaining === 1 ? 'item' : 'items'} left
@@ -88,5 +95,14 @@ export default function Index({ app, framework, todos, filter, remaining, stats 
         </Deferred>
       </footer>
     </main>
+  )
+}
+
+function More({ hasMore, loading, fetch, label }) {
+  if (!hasMore) return null
+  return (
+    <button className="more" onClick={fetch} disabled={loading}>
+      {loading ? 'Loading…' : label}
+    </button>
   )
 }

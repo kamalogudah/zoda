@@ -3,10 +3,11 @@
 //!     (cd examples/inertia/react && npm install && npm run build)
 //!     zig build run-inertia -- react        # or svelte, vue
 //!
-//! then open http://localhost:8080. Todos live in memory. The server serves
-//! the chosen frontend's built `dist/assets` and renders every page through
-//! `zoda.Inertia`; mutations redirect back with 303 so the client re-fetches
-//! the page as JSON.
+//! then open http://localhost:8080. Todos live in memory, starting with a few
+//! dozen samples, and are shown newest first, a page at a time, through
+//! `<InfiniteScroll>`. The server serves the chosen frontend's built
+//! `dist/assets` and renders every page through `zoda.Inertia`; mutations
+//! redirect back with 303 so the client re-fetches the page as JSON.
 const std = @import("std");
 const zoda = @import("zoda");
 
@@ -19,6 +20,9 @@ pub const Todo = struct {
 pub const Filter = enum { all, active, done };
 
 pub const max_text_bytes = 200;
+pub const per_page = 10;
+/// Sample todos `main` adds, enough for a few pages.
+pub const sample_count = 25;
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -152,6 +156,7 @@ fn renderIndex(
     filter: Filter,
     text_error: ?[]const u8,
 ) !void {
+    const requested = parsePage(req);
     const store = ctx.plugins.store.value;
     store.mutex.lockUncancelable(store.io);
     defer store.mutex.unlock(store.io);
@@ -159,7 +164,11 @@ fn renderIndex(
     var shown: std.ArrayList(Todo) = .empty;
     defer shown.deinit(res.allocator);
     var remaining: usize = 0;
-    for (store.items.items) |todo| {
+    // Newest first, so a new todo is on the first page.
+    var i = store.items.items.len;
+    while (i > 0) {
+        i -= 1;
+        const todo = store.items.items[i];
         if (!todo.done) remaining += 1;
         const keep = switch (filter) {
             .all => true,
@@ -168,12 +177,24 @@ fn renderIndex(
         };
         if (keep) try shown.append(res.allocator, todo);
     }
+    // Zoda does not paginate: the route picks the page `<InfiniteScroll>`
+    // asked for with `?page=` and says which pages exist around it. A page
+    // past the end (an old link after deletes) shows the last one.
+    const last: u32 = @intCast(@max(1, (shown.items.len + per_page - 1) / per_page));
+    const page = @min(requested, last);
+    const start = (page - 1) * per_page;
     // `render` copies everything into the response, so the borrowed todo
     // text only has to live while the lock is held. Without an `errors`
     // prop, the plugin sends `errors: {}`. `stats` is left out of the page
     // and computed when the client asks for it right after.
     const props = .{
-        .todos = shown.items,
+        // Matching on `id` drops a duplicate when a todo added meanwhile
+        // shifts an item onto the next page.
+        .todos = zoda.plugins.inertia.scroll(shown.items[start..@min(start + per_page, shown.items.len)], .{
+            .previous = if (page > 1) page - 1 else null,
+            .next = if (page < last) page + 1 else null,
+            .current = page,
+        }).matchOn("id"),
         .filter = filter,
         .remaining = remaining,
         .stats = zoda.plugins.inertia.deferred(store, Stats.compute),
@@ -189,6 +210,14 @@ fn renderIndex(
         });
     }
     return inertia.render(req, res, "Todos/Index", props);
+}
+
+/// The `?page=` that `<InfiniteScroll>` sends; anything but a positive
+/// number means the first page.
+fn parsePage(req: *const zoda.router.Request) u32 {
+    const value = (req.getOne("page") catch null) orelse return 1;
+    const page = std.fmt.parseInt(u32, value, 10) catch return 1;
+    return @max(page, 1);
 }
 
 fn parseFilter(req: *const zoda.router.Request) Filter {
@@ -239,6 +268,10 @@ pub fn main(init: std.process.Init) !void {
 
     var store = Store{ .allocator = allocator, .io = io };
     defer store.deinit();
+    for (1..sample_count + 1) |n| {
+        var text: [32]u8 = undefined;
+        _ = try store.add(try std.fmt.bufPrint(&text, "Sample todo {d}", .{n}));
+    }
     const static_config: zoda.static.Config = .{
         .root = assets,
         .prefix = &.{"assets"},
@@ -314,7 +347,7 @@ test "first visit renders the HTML shell with the page object" {
     try std.testing.expectEqual(@as(u16, 200), page.status_code);
     try std.testing.expect(std.mem.indexOf(u8, page.body, "<script type=\"module\" src=\"/assets/app.js\"></script>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page.body,
-        \\<script data-page="app" type="application/json">{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[],"filter":"all","remaining":0,"errors":{}},"url":"/todos","version":"v1","deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}</script><div id="app"></div>
+        \\<script data-page="app" type="application/json">{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[],"filter":"all","remaining":0,"errors":{}},"url":"/todos","version":"v1","mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}</script><div id="app"></div>
     ) != null);
 }
 
@@ -341,7 +374,7 @@ test "Inertia visits add, toggle, filter, and delete todos" {
     defer active.deinit();
     try std.testing.expectEqualStrings("true", (try active.getHeaderOne("X-Inertia")).?);
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[{"id":2,"text":"Walk <dog>","done":false}],"filter":"active","remaining":1,"errors":{}},"url":"/todos?filter=active","version":"v1","deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[{"id":2,"text":"Walk <dog>","done":false}],"filter":"active","remaining":1,"errors":{}},"url":"/todos?filter=active","version":"v1","mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}
     , active.body);
 
     var deleted = try visit(&app, .delete, "/todos/2", &inertia_json, "");
@@ -396,7 +429,7 @@ test "router.reload({ only: ['todos'] }) returns only todos and errors" {
     var partial = try visit(&app, .get, "/todos", &reload, "");
     defer partial.deinit();
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"todos":[{"id":1,"text":"Buy milk","done":false}],"errors":{}},"url":"/todos","version":"v1","sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"todos":[{"id":1,"text":"Buy milk","done":false}],"errors":{}},"url":"/todos","version":"v1","mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"sharedProps":["app","framework"]}
     , partial.body);
 
     const bad = [_]zoda.request.Header{
@@ -434,4 +467,67 @@ test "the client loads deferred stats with a partial reload" {
     try std.testing.expectEqualStrings(
         \\{"component":"Todos/Index","props":{"stats":{"total":2,"done":1},"errors":{}},"url":"/todos?filter=active","version":"v1","sharedProps":["app","framework"]}
     , stats.body);
+}
+
+test "<InfiniteScroll> pages through todos newest first and resets after a change" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+    for (0..per_page + 2) |_| _ = try store.add("x");
+
+    var first = try visit(&app, .get, "/todos", &inertia_get, "");
+    defer first.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, first.body, "\"todos\":[{\"id\":12,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.body,
+        \\"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":2,"currentPage":1,"reset":false}}
+    ) != null);
+
+    // What the "Show more" button sends.
+    const more = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "todos" },
+        .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "append" },
+    };
+    var second = try visit(&app, .get, "/todos?page=2", &more, "");
+    defer second.deinit();
+    try std.testing.expectEqualStrings(
+        \\{"component":"Todos/Index","props":{"todos":[{"id":2,"text":"x","done":false},{"id":1,"text":"x","done":false}],"errors":{}},"url":"/todos?page=2","version":"v1","mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":1,"nextPage":null,"currentPage":2,"reset":false}},"sharedProps":["app","framework"]}
+    , second.body);
+
+    // Opening `?page=2` directly, then "Show earlier", prepends page 1. A
+    // page past the end shows the last one.
+    const earlier = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "todos" },
+        .{ .name = "X-Inertia-Infinite-Scroll-Merge-Intent", .value = "prepend" },
+    };
+    var before = try visit(&app, .get, "/todos", &earlier, "");
+    defer before.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, before.body, "\"prependProps\":[\"todos\"]") != null);
+    var past = try visit(&app, .get, "/todos?page=9", &inertia_get, "");
+    defer past.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, past.body, "\"previousPage\":1,\"nextPage\":null,\"currentPage\":2") != null);
+
+    // A toggle sent with `only` and `reset: ['todos']`: XHR repeats the
+    // headers on the 303's GET, which replaces the list and resets paging.
+    const reset = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "todos,remaining,stats,todos" },
+        .{ .name = "X-Inertia-Reset", .value = "todos" },
+    };
+    var toggled = try visit(&app, .patch, "/todos/12", &reset, "");
+    defer toggled.deinit();
+    try std.testing.expectEqualStrings("/todos", (try toggled.getHeaderOne("Location")).?);
+    var back = try visit(&app, .get, "/todos", &reset, "");
+    defer back.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, back.body, "\"remaining\":11,\"stats\":{\"total\":12,\"done\":1},\"errors\":{}},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, back.body, "\"mergeProps\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, back.body, "\"nextPage\":2,\"currentPage\":1,\"reset\":true") != null);
 }

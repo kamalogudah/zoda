@@ -665,6 +665,8 @@ layout or root id before the first request; `render` checks again.
   - Props wrapped in `merge`, `prepend`, or `deepMerge` are listed in
     `mergeProps`, `prependProps`, or `deepMergeProps` so a partial reload
     adds to them; see [Merge props](#merge-props).
+  - Props wrapped in `scroll` are merge props with pagination state in
+    `scrollProps`, for `<InfiniteScroll>`; see [Scroll props](#scroll-props).
   - Nested empty values need a named type: in Zig an empty `.{}` literal is
     a tuple and serializes as `[]`. Pass a named empty struct such as
     `struct {}{}` for an empty nested object. Tuples with values are a
@@ -752,9 +754,11 @@ return ctx.plugins.inertia.render(req, res, "Reports/Index", .{
   lists return `error.PartialHeaderTooLarge`. A name is one or more
   non-empty `.`-separated segments of `[A-Za-z0-9_$-]`; an empty item,
   whitespace, or any other byte returns `error.MalformedPartialHeader`.
-  A repeated `X-Inertia-Partial-*` or `X-Inertia-Reset` field returns
-  `error.DuplicatePartialHeader`. On Inertia visits all four are checked
-  even when the component does not match. These failures leave the response
+  A repeated `X-Inertia-Partial-*`, `X-Inertia-Reset`, or
+  `X-Inertia-Infinite-Scroll-Merge-Intent` field returns
+  `error.DuplicatePartialHeader`. On Inertia visits all five are checked
+  even when the component does not match (the merge intent rules are under
+  [Scroll props](#scroll-props)). These failures leave the response
   unchanged.
 - **Caching.** Partial and full responses share `Vary: X-Inertia`; no
   `Vary` is added for the partial headers, so do not let a shared cache
@@ -874,6 +878,91 @@ router.reload({ only: ['messages'], reset: ['messages'] }) // start over
   and only `deepMerge` keys may contain `.`. Merge wrappers do not nest and
   do not take `always(...)`, and `always` does not take a merge prop.
 
+### Scroll props
+
+A scroll prop is one page of items for v3's `<InfiniteScroll>` component,
+which loads the previous or next page as the user scrolls and merges it
+into the list. `scroll(prop, page)` wraps the items and states where they
+sit; the route does the paging itself:
+
+```zig
+fn usersRoute(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.onLiteral("users") and req.isRoot() and req.isGet()) {
+        const per_page = 2;
+        const users = &all_users;
+        const last: u32 = @max(1, (users.len + per_page - 1) / per_page);
+        // The route owns pagination: `<InfiniteScroll>` only sets `?page=`.
+        const raw = (req.getOne("page") catch null) orelse "1";
+        const page = std.fmt.parseInt(u32, raw, 10) catch 0;
+        if (page < 1 or page > last) return res.text(404, "No such page");
+        const start = (page - 1) * per_page;
+        const inertia = zoda.plugins.inertia;
+        return ctx.plugins.inertia.render(req, res, "Users/Index", .{
+            .users = inertia.scroll(users[start..@min(start + per_page, users.len)], .{
+                .previous = if (page > 1) page - 1 else null,
+                .next = if (page < last) page + 1 else null,
+                .current = page,
+            }).matchOn("id"),
+        });
+    }
+}
+```
+
+```jsx
+<InfiniteScroll data="users" as="ul">
+  {users.map((user) => <li key={user.id}>{user.name}</li>)}
+</InfiniteScroll>
+```
+
+- **Pagination is the route's job.** `render` never slices or counts
+  anything. The route reads the page number from the query parameter named
+  by `page_name` (default `"page"`), picks that page of its data, and
+  passes `previous`, `next`, and `current`. `previous` or `next` is null
+  when there is no such page. The client sends the number it was given
+  back as `?page=<n>` and also writes it into the address bar as the user
+  scrolls (unless `preserveUrl`), so a reload or shared link can open on a
+  later page; that page's `previous` is then loaded when the user scrolls
+  up. Decide how to answer an out-of-range or malformed page yourself, as
+  the route above does with 404.
+- **Page fields.** Every response that sends the prop adds
+  `"scrollProps": {"users": {"pageName": "page", "previousPage": null,
+  "nextPage": 2, "currentPage": 1, "reset": false}}` after the merge
+  fields. This is `ScrollProp` in `@inertiajs/core` 3.9.1. The prop is also
+  a merge prop, listed in `mergeProps` (and `.matchOn(key)` in
+  `matchPropsOn`, under the `merge` rules), so a loaded page is added to
+  the client's list. Props the partial-reload lists leave out get no
+  entry, and the field is left out when there are none.
+- **Merge intent.** `<InfiniteScroll>` loads a page with a partial reload
+  of the prop that sends `X-Inertia-Infinite-Scroll-Merge-Intent: append`
+  for the next page or `prepend` for the previous one. On a partial reload
+  of the rendered component, `prepend` lists the prop in `prependProps`
+  instead of `mergeProps`, so the page goes before the current items. A
+  missing header means `append`. Only those two exact lowercase values are
+  accepted; anything else returns `error.MalformedPartialHeader`, and a
+  repeated field `error.DuplicatePartialHeader`, on every Inertia visit,
+  leaving the response unchanged. On full visits and reloads for another
+  component the header is checked but unused. Ordinary HTML visits ignore
+  it.
+- **Reset.** When `X-Inertia-Reset` names the prop on a partial reload of
+  the rendered component, it is sent without its merge listing, so the
+  client replaces the list, and its entry has `"reset": true`, which makes
+  `<InfiniteScroll>` start over from the new `previousPage` and
+  `nextPage`. Send `reset` with any visit that keeps the page component
+  mounted, such as a form post or `router.patch`, otherwise the component
+  keeps paging from where it was. Plain GET link visits remount the page
+  and need no reset.
+- **Wrapping.** `prop` is a plain value, an `optional(...)`, or a
+  `deferred(...)` prop, with their usual rules; an optional or deferred
+  scroll prop has a `scrollProps` entry only on the responses that send
+  it, and `<InfiniteScroll>` throws if it mounts before one arrives. The
+  type is `Scroll(T)`, or `Scrollable(T, match_on)` with match keys, for
+  `SharedProps` fields. The merge prop compile-time rules apply, and
+  `scroll` does not take or go inside another merge wrapper or `always`.
+- **Page names.** `page_name` is 1-64 `[A-Za-z0-9_-]` bytes, so the route
+  can read it back without decoding. Another value returns
+  `error.InvalidScrollPageName` before the response changes, whether or
+  not the prop is sent.
+
 ### URL and origin policy
 
 The page `url` and the conflict's `X-Inertia-Location` are the raw
@@ -932,8 +1021,9 @@ Checked against `@inertiajs/core`, `@inertiajs/react`, `@inertiajs/svelte`,
 and `@inertiajs/vue3` 3.9.1. The three frontends in
 [examples/inertia](examples/inertia/README.md) were driven in headless Chrome
 through the script-element page, JSON visits, shared props, `errors`, 303
-and fragment redirects, filter links, and the deferred `stats` prop that
-each renders with `<Deferred>`. The other rows are covered by the plugin's
+and fragment redirects, filter links, the deferred `stats` prop that each
+renders with `<Deferred>`, and the `todos` scroll prop paged forward and
+backward with `<InfiniteScroll>` and reset after a toggle. The other rows are covered by the plugin's
 unit tests only.
 
 The features not yet implemented are tracked in
@@ -957,7 +1047,8 @@ The features not yet implemented are tracked in
 | Deferred props (`deferred`, `deferredGroup`, `deferredProps`) | Implemented, including groups and shared deferred props |
 | Merge props (`merge`, `prepend`, `deepMerge`, `matchOn`; `mergeProps`, `prependProps`, `deepMergeProps`, `matchPropsOn`) | Implemented, including optional, deferred, and shared merge props |
 | Reset (`X-Inertia-Reset`) | Implemented: listed props are sent without merge metadata on partial reloads of the rendered component |
-| Once and scroll props | Not implemented |
+| Scroll props (`scroll`; `scrollProps`, `X-Inertia-Infinite-Scroll-Merge-Intent`) | Implemented: one page of items per response with route-supplied page numbers; the intent picks `mergeProps` or `prependProps`, and `X-Inertia-Reset` sets `reset`. Driven in a browser through the example's paged todo list. |
+| Once props | Not implemented |
 | Error bags (`X-Inertia-Error-Bag`) | Not implemented: the header is ignored |
 | History encryption (`encryptHistory`, `clearHistory`) | Not implemented: never sent, so off |
 | Precognition validation | Not implemented |
