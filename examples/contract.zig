@@ -377,3 +377,53 @@ test "PLUGINS status and error handlers example" {
         try std.testing.expectEqualStrings(case.body, res.body);
     }
 }
+
+// PLUGINS "Security response policies": the registration and HTTPS gating
+// shown there compile and run here.
+const security_policy = zoda.plugins.security_policy;
+const SecureApp = zoda.app.App(struct {});
+
+fn secureRoute(_: *SecureApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.isRoot() and req.isGet()) return res.text(200, "home");
+}
+
+/// This app listens only on a loopback port that the TLS terminator reaches,
+/// so every request it receives arrived over HTTPS.
+fn behindTlsTerminator(_: *SecureApp.Context, _: *const zoda.router.Request) bool {
+    return true;
+}
+
+const policies = security_policy.Config(SecureApp){
+    .content_security_policy = .{ .value = "default-src 'self'; frame-ancestors 'none'" },
+    .permissions_policy = .{ .value = "camera=(), geolocation=(), microphone=()" },
+    .hsts = .{ .max_age = 31536000, .include_subdomains = true, .https = behindTlsTerminator },
+};
+const extra_defaults = zoda.default_headers.Config{ .headers = &.{
+    .{ .name = "X-Frame-Options", .value = "DENY" },
+    .{ .name = "Referrer-Policy", .value = "no-referrer" },
+} };
+
+test "PLUGINS security response policies example" {
+    var app = try SecureApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{},
+        .route_fn = secureRoute,
+        .middleware = &.{
+            try security_policy.middleware(SecureApp, &policies), // validates the config
+            try zoda.default_headers.middleware(SecureApp, &extra_defaults),
+        },
+    });
+    defer app.deinit();
+
+    for ([_][]const u8{ "/", "/missing" }) |target| {
+        var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
+        defer arena.deinit();
+        var req = arena.requestView(.get);
+        var res = try app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqualStrings("default-src 'self'; frame-ancestors 'none'", (try res.getHeaderOne("Content-Security-Policy")).?);
+        try std.testing.expectEqualStrings("camera=(), geolocation=(), microphone=()", (try res.getHeaderOne("Permissions-Policy")).?);
+        try std.testing.expectEqualStrings("max-age=31536000; includeSubDomains", (try res.getHeaderOne("Strict-Transport-Security")).?);
+        try std.testing.expectEqualStrings("DENY", (try res.getHeaderOne("X-Frame-Options")).?);
+    }
+}

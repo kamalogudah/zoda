@@ -68,6 +68,8 @@ pub const plugins = struct {
     pub const status_handler = @import("plugins/status_handler.zig");
     /// Recovery middleware that clears partial responses before replacement.
     pub const error_handler = @import("plugins/error_handler.zig");
+    /// Validated Content-Security-Policy, Permissions-Policy, and gated HSTS.
+    pub const security_policy = @import("plugins/security_policy.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
@@ -107,6 +109,7 @@ comptime {
     std.testing.refAllDecls(plugins.http_cache);
     std.testing.refAllDecls(plugins.status_handler);
     std.testing.refAllDecls(plugins.error_handler);
+    std.testing.refAllDecls(plugins.security_policy);
 }
 
 test {

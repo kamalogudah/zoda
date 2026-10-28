@@ -17,6 +17,7 @@ documented beside its code in `src/plugins/`, and its support status is in
 | HTTP caching | `zoda.plugins.http_cache` functions | Explicit response helpers | [HTTP caching](#http-caching) |
 | Request IDs and access logs | `trace: zoda.RequestTrace` + middleware entry | Registered instance with request state and middleware | [Request IDs and access logs](#request-ids-and-access-logs) |
 | Status and error handlers | `zoda.plugins.status_handler` / `error_handler` middleware entries | Middleware | [Status and error handlers](#status-and-error-handlers) |
+| Security response policies | `zoda.plugins.security_policy` middleware entry | Middleware | [Security response policies](#security-response-policies) |
 
 Core middleware that is not a plugin (host authorization, default response
 headers, response timing, and static files) is documented in the
@@ -476,3 +477,101 @@ registration and checks each outcome below.
 - **Other middleware.** Register `RequestTrace` and timing before both entries
   so they record the final response. Register `default_headers` before them so
   replacement pages also get the default headers.
+
+## Security response policies
+
+`zoda.plugins.security_policy` adds `Content-Security-Policy`,
+`Content-Security-Policy-Report-Only`, `Permissions-Policy`, and
+`Strict-Transport-Security` to responses. Nothing is sent unless you configure
+it, and every policy is validated when the middleware entry is created.
+
+```zig
+const security_policy = zoda.plugins.security_policy;
+
+/// This app listens only on a loopback port that the TLS terminator reaches,
+/// so every request it receives arrived over HTTPS.
+fn behindTlsTerminator(_: *App.Context, _: *const zoda.router.Request) bool {
+    return true;
+}
+
+// Borrowed with its strings; must outlive the app.
+const policies = security_policy.Config(App){
+    .content_security_policy = .{ .value = "default-src 'self'; frame-ancestors 'none'" },
+    .permissions_policy = .{ .value = "camera=(), geolocation=(), microphone=()" },
+    .hsts = .{ .max_age = 31536000, .include_subdomains = true, .https = behindTlsTerminator },
+};
+
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{},
+    .route_fn = route,
+    .middleware = &.{
+        try security_policy.middleware(App, &policies), // validates the config
+        try zoda.default_headers.middleware(App, &defaults),
+        try status_handler.middleware(App, &pages),
+        error_handler.middleware(App, &recovery),
+        zoda.static.middleware(App, &static_config),
+    },
+});
+```
+
+The [compiling contract example](examples/contract.zig) uses the same
+policies and checks the headers on a route and on the default 404.
+
+- **Validation.** `middleware` returns a `ConfigError` instead of an entry
+  when the configuration is wrong:
+  - `content_security_policy` and `content_security_policy_report_only` take
+    one serialized CSP policy: `;`-separated directives whose names are
+    letters, digits, and `-`, and whose values are printable ASCII. A `,`
+    (a policy list), control bytes, non-ASCII bytes, no directive at all, or a
+    repeated directive name is rejected. Both fields may be set together, to
+    enforce one policy and trial a stricter one.
+  - `permissions_policy` takes a structured-field dictionary of lowercase
+    `feature=allowlist` members, where the allowlist is `*`, `self`, a quoted
+    origin, or a list of those in parentheses, such as
+    `geolocation=(self "https://maps.example")`. A bare `feature`, malformed
+    syntax, or a repeated feature is rejected.
+  - `hsts.preload` requires `include_subdomains` and a `max_age` of at least
+    one year (`min_preload_max_age`). `max_age = 0` is allowed, to tell
+    browsers to forget an earlier policy.
+  - A configuration with no policy, or a policy whose `classes` select no
+    responses, is rejected.
+  - The configured fields together must fit `limits` (`response.Limits`, the
+    default used by `App.dispatch`), or `TooManyHeaders` or
+    `HeaderBytesExceeded` is returned.
+- **Response classes.** Each policy has `classes`, a `ResponseClasses` with
+  `success` (1xx–2xx, including static-file hits), `redirection` (3xx,
+  including 304), `client_error` (4xx, including the default 404), and
+  `server_error` (5xx, including the recovery 500). All four are on by
+  default. A response left unhandled by a middleware short circuit counts as
+  a client error, because dispatch turns it into the default 404.
+- **HSTS needs an HTTPS signal.** `hsts.https` is required and has no
+  default. The header is sent only when it returns true for the request. Zoda
+  does not terminate TLS, and this middleware never reads `X-Forwarded-Proto`
+  or `Forwarded`, because a client can send them. Return true only when you
+  can trust the answer: for example, when the listener is reachable only
+  through your TLS terminator, or when the terminator adds a secret header
+  that it strips from client requests and the signal checks it. Browsers
+  ignore HSTS received over plain HTTP, so an HTTP-to-HTTPS redirect needs no
+  HSTS.
+- **Existing fields win.** A field the response already has, set by the route
+  or by an inner middleware entry, is kept and not repeated. The check uses
+  the exact field name, so a route's `Content-Security-Policy` does not stop
+  the report-only header.
+- **Limits.** Before adding anything, the entry checks that every selected
+  field fits the response's header count and byte limits. If they do not, it
+  adds none of them and returns `error.TooManyHeaders` or
+  `error.HeaderBytesExceeded`, which propagates like any other error.
+- **Middleware order.** The entry adds headers after downstream succeeds, so
+  it covers only entries registered after it. Register it before
+  `zoda.static`, `error_handler`, and `status_handler` so static files,
+  recovered errors, and error pages get the policies, as above. An error that
+  propagates past it (for example with no `error_handler` inside it) gets no
+  policy headers.
+- **With `default_headers`.** Both entries keep existing fields, so when both
+  configure the same field, the inner entry's value wins. Configure each field
+  in one place. Use `default_headers` for fields this middleware does not
+  manage, such as `X-Frame-Options` or `Referrer-Policy`.
+- **Sessions and caching.** The policies do not depend on the request, except
+  for the HSTS signal, and do not touch `Set-Cookie`, `Cache-Control`, or
+  `Vary`.

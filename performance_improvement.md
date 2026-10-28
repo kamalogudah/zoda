@@ -11,7 +11,7 @@ Numbers here are local loopback measurements, not throughput guarantees.
 
 | | |
 |---|---|
-| Last measured | 2026-10-28, `09510bb` + status/error handlers (A/B within run-order noise; see log) |
+| Last measured | 2026-10-28, `1d0023e` + security policy middleware (opt-in, not in the todo app) |
 | Todo app, `GET /api/todos`, 128 connections | ~32–38k req/s (some socket read errors) |
 | Todo app, `GET /`, 128 connections | ~21–24k req/s |
 | Todo app, `GET /api/todos`, 400 connections | ~17–21k req/s, ~61k socket read errors |
@@ -145,6 +145,9 @@ measurement.
 
 | Date | Commit | Change | Target | Command | Req/s | Avg latency | Socket errors | Environment |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-28 | `1d0023e` + working tree | security response policy middleware (opt-in, not in todo app; request path unchanged) | todo `/api/todos` | `wrk -t8 -c128 -d10s` | 33,684 | 4.08 ms | read 69 | A |
+| 2026-10-28 | `1d0023e` + working tree | security response policy middleware (opt-in, not in todo app; request path unchanged) | todo `/` | `wrk -t8 -c128 -d10s` | 26,223 | 4.28 ms | read 22 | A |
+| 2026-10-28 | `1d0023e` + working tree | security response policy middleware (opt-in, not in todo app; request path unchanged) | todo `/api/todos` | `wrk -t8 -c400 -d10s` | 17,960 | 3.88 ms | read 125,062 | A |
 | 2026-10-28 | `09510bb` + working tree | status/error handler middleware (opt-in, not in todo app); `Response.generated` flag. A/B vs `09510bb` on the same machine: change −19%/−23%/−12% when run second, +3%/−9%/−16% when run first; order-dependent, not a confirmed regression | todo `/api/todos` | `wrk -t8 -c128 -d10s` | 30,331 | 4.52 ms | read 84 | A |
 | 2026-10-28 | `09510bb` + working tree | status/error handler middleware (opt-in, not in todo app); `Response.generated` flag. A/B vs `09510bb` on the same machine: change −19%/−23%/−12% when run second, +3%/−9%/−16% when run first; order-dependent, not a confirmed regression | todo `/` | `wrk -t8 -c128 -d10s` | 19,211 | 5.77 ms | read 8 | A |
 | 2026-10-28 | `09510bb` + working tree | status/error handler middleware (opt-in, not in todo app); `Response.generated` flag. A/B vs `09510bb` on the same machine: change −19%/−23%/−12% when run second, +3%/−9%/−16% when run first; order-dependent, not a confirmed regression | todo `/api/todos` | `wrk -t8 -c400 -d10s` | 16,578 | 4.99 ms | read 55,494 | A |

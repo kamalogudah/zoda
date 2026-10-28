@@ -380,6 +380,7 @@ Built-in plugins:
 | `zoda.plugins.http_cache` | Explicit `Cache-Control`, `ETag`, `Vary`, and conditional GET |
 | `zoda.RequestTrace` | Request IDs and one access record per request |
 | `zoda.plugins.status_handler`, `zoda.plugins.error_handler` | Configured error pages and error recovery middleware |
+| `zoda.plugins.security_policy` | Validated CSP, Permissions-Policy, and HTTPS-gated HSTS headers |
 
 **See [PLUGINS.md](PLUGINS.md) for detailed usage and examples of every
 plugin.**
@@ -566,6 +567,9 @@ be configured as defaults. Response header count and byte limits still apply.
 The configuration and its nested strings must remain immutable and valid until
 `app.deinit()`. The [compiling contract example](examples/contract.zig) includes
 this middleware.
+For `Content-Security-Policy`, `Permissions-Policy`, and HSTS, use
+[`zoda.plugins.security_policy`](PLUGINS.md#security-response-policies)
+instead: it validates the policy syntax and sends HSTS only over HTTPS.
 
 ### Response timing
 

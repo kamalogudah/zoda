@@ -111,6 +111,16 @@ runs inside `zig build test`.
   `OutOfMemory`, `Canceled`, and transport I/O errors propagate unless
   `passthrough` is overridden. Both cover only entries registered after them.
   See [PLUGINS.md](PLUGINS.md#status-and-error-handlers).
+- `zoda.plugins.security_policy` is opt-in middleware.
+  `security_policy.middleware(App, &config)` validates CSP (enforced and
+  report-only), Permissions-Policy, and HSTS settings and the configured
+  header budget at setup. After downstream succeeds, it adds each configured
+  field on the selected `ResponseClasses` (all by default) unless the response
+  already has that field, and adds either every selected field or none when
+  response header limits would be exceeded. HSTS is sent only when the
+  required `hsts.https` signal returns true; forwarded scheme headers are
+  never read. It covers only entries registered after it.
+  See [PLUGINS.md](PLUGINS.md#security-response-policies).
 - `BearerToken.guard_routes = true` adds a wrapper through `App.composeRoute`.
   It sends 401, `WWW-Authenticate: Bearer`, and a fixed body before the inner
   route on failure. The default is false. With `NotFound` registered,
