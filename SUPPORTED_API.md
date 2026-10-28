@@ -194,6 +194,13 @@ Run `static.checkSupport` at startup. On Linux 5.6+, `openat2` confines opens
 beneath that handle without following symlinks; unsupported kernels or blocked
 syscalls fail closed. Dotfiles are hidden by default. Static files are buffered
 and bounded; keep the document root read-only to the server process.
+`static.Config.cache_control` (an `http_cache.Policy`) and `etag` apply to
+hits only and are off by default. `static.sendFile(req, res, root, path,
+options)` sends one file from a route through the same confined open: `path`
+is relative, `/`-separated, and checked per segment like a request path. It
+returns `false` with the response untouched for missing or refused files and
+fails with `error.BodyTooLarge` above `min(max_file_bytes, max_body_bytes)`.
+Content-Disposition, ranges, and an asset pipeline are not supported.
 
 Session keys and their bytes must outlive the app. Use at least 32 random
 bytes per key, unique IDs, a trusted UTC clock, and HTTPS for the `__Host-`

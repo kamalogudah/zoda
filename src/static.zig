@@ -45,6 +45,21 @@
 //! ordinary file to the kernel and is served. Creating one needs write access
 //! to the root, so keep the document root read-only to the server.
 //!
+//! Route helper. `sendFile(req, res, root, path, options)` serves one file
+//! from a route through the same open, `statx`, and read path as the
+//! middleware, so every guarantee above holds for it. `path` is relative,
+//! `/`-separated, and checked segment by segment like a request path; a
+//! rejected or missing path returns `false` with the response untouched, and
+//! the route decides what to send instead.
+//!
+//! Cache headers. Neither the middleware nor `sendFile` sets `Cache-Control`
+//! or `ETag` unless configured. `cache_control` takes an `http_cache.Policy`
+//! and applies it with `http_cache.setCacheControl`, including its refusal of
+//! `public` on requests with `Authorization` or `Cookie`. `etag = true` adds a
+//! strong body `ETag` and answers a matching `If-None-Match` with 304. A
+//! policy or validator error propagates after the body is written; the
+//! response is then partial, as with any route error.
+//!
 //! Reads are blocking syscalls on the request's task, like the rest of
 //! dispatch.
 const std = @import("std");
@@ -52,6 +67,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const router = @import("router.zig");
 const response = @import("response.zig");
+const http_cache = @import("plugins/http_cache.zig");
 
 /// True where confinement is implemented. Elsewhere every request that would
 /// open a file fails with `error.ConfinementUnavailable`.
@@ -76,6 +92,24 @@ pub const Config = struct {
     /// Upper bound on a served file. The response's `max_body_bytes` also
     /// applies; the smaller one wins.
     max_file_bytes: usize = std.math.maxInt(usize),
+    /// `Cache-Control` for every hit; null sends none. Misses are untouched.
+    cache_control: ?http_cache.Policy = null,
+    /// Add a strong body `ETag` to hits and answer a matching
+    /// `If-None-Match` with 304.
+    etag: bool = false,
+};
+
+/// Options for `sendFile`. The defaults match `Config`.
+pub const SendOptions = struct {
+    allow_dotfiles: bool = false,
+    /// Upper bound on the file. The response's `max_body_bytes` also
+    /// applies; the smaller one wins.
+    max_file_bytes: usize = std.math.maxInt(usize),
+    /// Overrides the extension-based content type. Must not contain CR, LF,
+    /// or NUL.
+    content_type: ?[]const u8 = null,
+    cache_control: ?http_cache.Policy = null,
+    etag: bool = false,
 };
 
 /// Confinement and I/O failures. Misses are not errors; they call `next`.
@@ -161,14 +195,51 @@ pub fn serve(config: *const Config, req: *const router.Request, res: *response.R
 
     var path_buffer: [max_path_bytes + 1]u8 = undefined;
     const path = relativePath(&path_buffer, remaining[config.prefix.len..], config.allow_dotfiles) orelse return false;
-    const fd = switch (try openBeneath(config.root, path)) {
+    return serveFile(config.root, path, .{
+        .allow_dotfiles = config.allow_dotfiles,
+        .max_file_bytes = config.max_file_bytes,
+        .cache_control = config.cache_control,
+        .etag = config.etag,
+    }, req, res);
+}
+
+/// Writes the regular file at `path` beneath `root` as a 200 response from a
+/// route. `path` is relative and `/`-separated (`"reports/q3.pdf"`); each
+/// segment is checked like a request segment, so `..`, `.`, empty segments,
+/// a leading `/`, `\`, NUL, and (unless allowed) dotfiles are refused before
+/// the kernel sees the path. Returns `true` when the file was sent and
+/// `false` when it is missing, rejected, a symlink, a directory, or a special
+/// file; the response is then untouched. The method is not checked; the
+/// route decides which methods send files. A file over the size limit fails
+/// with `error.BodyTooLarge`.
+pub fn sendFile(
+    req: *const router.Request,
+    res: *response.Response,
+    root: Io.Dir,
+    path: []const u8,
+    options: SendOptions,
+) !bool {
+    var path_buffer: [max_path_bytes + 1]u8 = undefined;
+    const checked = checkedPath(&path_buffer, path, options.allow_dotfiles) orelse return false;
+    return serveFile(root, checked, options, req, res);
+}
+
+/// The single open-and-read path shared by `serve` and `sendFile`.
+fn serveFile(
+    root: Io.Dir,
+    path: [:0]const u8,
+    options: SendOptions,
+    req: *const router.Request,
+    res: *response.Response,
+) !bool {
+    const fd = switch (try openBeneath(root, path)) {
         .file => |fd| fd,
         .miss => return false,
     };
     defer _ = std.os.linux.close(fd);
 
     const size = (try regularFileSize(fd)) orelse return false;
-    const limit = @min(config.max_file_bytes, res.limits.max_body_bytes);
+    const limit = @min(options.max_file_bytes, res.limits.max_body_bytes);
     if (size > limit) return error.BodyTooLarge;
 
     var body = try res.allocator.alloc(u8, @intCast(size));
@@ -177,10 +248,27 @@ pub fn serve(config: *const Config, req: *const router.Request, res: *response.R
     const len = try readAll(fd, body);
     if (len < body.len) body = try res.allocator.realloc(body, len);
 
-    try res.replaceOwnedBody(200, contentType(path), body);
+    try res.replaceOwnedBody(200, options.content_type orelse contentType(path), body);
     owned = false;
     try res.setHeader("X-Content-Type-Options", "nosniff");
+    if (options.cache_control) |policy| try http_cache.setCacheControl(req, res, policy);
+    if (options.etag) {
+        try http_cache.setBodyETag(res);
+        _ = try http_cache.evaluate(req, res);
+    }
     return true;
+}
+
+/// Copies `path` into `buffer` when every `/`-separated segment is allowed.
+fn checkedPath(buffer: *[max_path_bytes + 1]u8, path: []const u8, allow_dotfiles: bool) ?[:0]const u8 {
+    if (path.len == 0 or path.len > max_path_bytes) return null;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |segment| {
+        if (!segmentAllowed(segment, allow_dotfiles)) return null;
+    }
+    @memcpy(buffer[0..path.len], path);
+    buffer[path.len] = 0;
+    return buffer[0..path.len :0];
 }
 
 /// Joins validated segments with `/` into `buffer`. Returns null when there
@@ -736,6 +824,15 @@ test "descriptors and buffers are released on hits, misses, and errors" {
             res.deinit();
         }
         try testing.expectError(error.BodyTooLarge, dispatchTarget(&app, .get, "/page.html"));
+        const req: router.Request = .{ .method = .get, .segments = &.{} };
+        inline for (.{ "hello.txt", "missing", "sub", "link_inside", "fifo" }) |path| {
+            var res = response.Response.init(testing.allocator);
+            defer res.deinit();
+            _ = try sendFile(&req, &res, tree.root, path, .{ .max_file_bytes = 5 });
+        }
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try testing.expectError(error.BodyTooLarge, sendFile(&req, &res, tree.root, "page.html", .{ .max_file_bytes = 5 }));
     }
     try testing.expectEqual(before, try lowestFreeFd());
     // `testing.allocator` checks the response buffers at the end of the test.
@@ -792,6 +889,14 @@ test "a concurrent symlink swap never redirects an open outside the root" {
             try testing.expectEqualStrings("inside", res.body);
             served += 1;
         }
+        // The route helper goes through the same confined open.
+        const req: router.Request = .{ .method = .get, .segments = &.{} };
+        var sent = response.Response.init(testing.allocator);
+        defer sent.deinit();
+        if (try sendFile(&req, &sent, tree.root, target[1..], .{})) {
+            try testing.expectEqualStrings("inside", sent.body);
+            served += 1;
+        }
     }
     swapper.stop.store(true, .release);
     thread.join();
@@ -815,6 +920,221 @@ test "content types fall back to octet-stream" {
     try testing.expectEqualStrings("text/html; charset=utf-8", contentType("a/B.HTML"));
     try testing.expectEqualStrings("application/octet-stream", contentType("README"));
     try testing.expectEqualStrings("application/octet-stream", contentType("x.exe"));
+}
+
+/// A route that sends `/files/<name>` with `sendFile` and answers 404 itself
+/// when the file is not sent.
+const send_route = struct {
+    var root: Io.Dir = undefined;
+    var options: SendOptions = .{};
+    var sent: ?bool = null;
+
+    fn run(_: *TestApp.Context, req: *router.Request, res: *response.Response) !void {
+        if (!req.isGet() or !req.onLiteral("files")) return;
+        var buffer: [max_path_bytes + 1]u8 = undefined;
+        const rest = req.segments[req.cursor..];
+        const path = relativePath(&buffer, rest, true) orelse "";
+        sent = try sendFile(req, res, root, path, options);
+        if (!sent.?) try res.text(404, "no such file");
+    }
+};
+
+fn initSendApp(tree: *const Tree, options: SendOptions) !TestApp {
+    send_route.root = tree.root;
+    send_route.options = options;
+    send_route.sent = null;
+    return TestApp.init(testing.allocator, .{
+        .response_allocator = testing.allocator,
+        .config = .{},
+        .plugins = .{},
+        .route_fn = send_route.run,
+        .middleware = &.{},
+    });
+}
+
+test "sendFile serves files from a route with content types" {
+    if (!supported) return error.SkipZigTest;
+    var tree = try Tree.init();
+    defer tree.deinit();
+    var app = try initSendApp(&tree, .{});
+    defer app.deinit();
+
+    inline for (.{
+        .{ "/files/hello.txt", "hello", "text/plain; charset=utf-8" },
+        .{ "/files/page.html", "<p>hi</p>", "text/html; charset=utf-8" },
+        .{ "/files/blob.bin", "\x00\x01", "application/octet-stream" },
+        .{ "/files/empty.txt", "", "text/plain; charset=utf-8" },
+        .{ "/files/sub/nested.json", "{}", "application/json" },
+    }) |case| {
+        var res = try dispatchTarget(&app, .get, case[0]);
+        defer res.deinit();
+        try testing.expect(send_route.sent.?);
+        try testing.expectEqual(@as(u16, 200), res.status_code);
+        try testing.expectEqualStrings(case[1], res.body);
+        try testing.expectEqualStrings(case[2], res.content_type);
+        try testing.expectEqualStrings("nosniff", (try res.getHeaderOne("x-content-type-options")).?);
+        try testing.expect((try res.getHeaderOne("cache-control")) == null);
+        try testing.expect((try res.getHeaderOne("etag")) == null);
+    }
+
+    // The content type can be overridden, but not with header-breaking bytes.
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    const req: router.Request = .{ .method = .get, .segments = &.{} };
+    try testing.expect(try sendFile(&req, &res, tree.root, "blob.bin", .{ .content_type = "application/x-demo" }));
+    try testing.expectEqualStrings("application/x-demo", res.content_type);
+    var bad = response.Response.init(testing.allocator);
+    defer bad.deinit();
+    try testing.expectError(error.InvalidContentType, sendFile(&req, &bad, tree.root, "blob.bin", .{ .content_type = "a\r\nb" }));
+    try testing.expect(!bad.handled);
+}
+
+test "sendFile misses leave the response to the route" {
+    if (!supported) return error.SkipZigTest;
+    var tree = try Tree.init();
+    defer tree.deinit();
+    var app = try initSendApp(&tree, .{});
+    defer app.deinit();
+
+    inline for (.{
+        "/files/missing.txt",
+        "/files/sub", // directory
+        "/files/hello.txt/x",
+        "/files/link_inside",
+        "/files/link_outside",
+        "/files/dir_outside/file.txt",
+        "/files/fifo",
+        "/files/.env", // dotfile, hidden by default
+    }) |target| {
+        var res = try dispatchTarget(&app, .get, target);
+        defer res.deinit();
+        try testing.expect(!send_route.sent.?);
+        try testing.expectEqual(@as(u16, 404), res.status_code);
+        try testing.expectEqualStrings("no such file", res.body);
+    }
+
+    // Paths are checked segment by segment before the kernel sees them, and
+    // a miss leaves an earlier response untouched.
+    const req: router.Request = .{ .method = .get, .segments = &.{} };
+    inline for (.{
+        "",
+        "/etc/passwd",
+        "../secret.txt",
+        "sub/../../secret.txt",
+        "sub/../hello.txt",
+        "./hello.txt",
+        "sub//nested.json",
+        "sub/",
+        "..\\secret.txt",
+        "hello.txt\x00",
+        ".hidden/a.txt",
+    }) |path| {
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try res.text(418, "kept");
+        try testing.expect(!try sendFile(&req, &res, tree.root, path, .{}));
+        try testing.expectEqual(@as(u16, 418), res.status_code);
+        try testing.expectEqualStrings("kept", res.body);
+    }
+    var long: [max_path_bytes + 1]u8 = undefined;
+    @memset(&long, 'a');
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try testing.expect(!try sendFile(&req, &res, tree.root, &long, .{}));
+    try testing.expect(try sendFile(&req, &res, tree.root, ".hidden/a.txt", .{ .allow_dotfiles = true }));
+    try testing.expectEqualStrings("dot", res.body);
+}
+
+test "sendFile enforces the file and response size limits" {
+    if (!supported) return error.SkipZigTest;
+    var tree = try Tree.init();
+    defer tree.deinit();
+    const req: router.Request = .{ .method = .get, .segments = &.{} };
+
+    var at_limit = response.Response.init(testing.allocator);
+    defer at_limit.deinit();
+    try testing.expect(try sendFile(&req, &at_limit, tree.root, "hello.txt", .{ .max_file_bytes = 5 }));
+    try testing.expectEqualStrings("hello", at_limit.body);
+
+    var over = response.Response.init(testing.allocator);
+    defer over.deinit();
+    try testing.expectError(error.BodyTooLarge, sendFile(&req, &over, tree.root, "page.html", .{ .max_file_bytes = 5 }));
+    try testing.expect(!over.handled);
+
+    // The response limit wins when it is smaller.
+    var small = response.Response.initWithLimits(testing.allocator, .{ .max_body_bytes = 4 });
+    defer small.deinit();
+    try testing.expectError(error.BodyTooLarge, sendFile(&req, &small, tree.root, "hello.txt", .{}));
+    try testing.expect(!small.handled);
+
+    // From a route, the error propagates out of dispatch.
+    var app = try initSendApp(&tree, .{ .max_file_bytes = 5 });
+    defer app.deinit();
+    try testing.expectError(error.BodyTooLarge, dispatchTarget(&app, .get, "/files/page.html"));
+}
+
+test "configured cache headers apply to hits only" {
+    if (!supported) return error.SkipZigTest;
+    var tree = try Tree.init();
+    defer tree.deinit();
+    const config: Config = .{
+        .root = tree.root,
+        .cache_control = .{ .public = .{ .max_age = 31536000, .immutable = true } },
+        .etag = true,
+    };
+    var app = try initApp(&.{middleware(TestApp, &config)}, .{});
+    defer app.deinit();
+
+    probe_route.reset();
+    var hit = try dispatchTarget(&app, .get, "/hello.txt");
+    defer hit.deinit();
+    try testing.expectEqual(@as(u16, 200), hit.status_code);
+    try testing.expectEqualStrings("public, max-age=31536000, immutable", (try hit.getHeaderOne("cache-control")).?);
+    const etag = (try hit.getHeaderOne("etag")).?;
+    try testing.expect(etag.len == 34 and etag[0] == '"');
+
+    // A miss reaches the route without cache headers.
+    probe_route.reset();
+    var miss = try dispatchTarget(&app, .get, "/missing.txt");
+    defer miss.deinit();
+    try testing.expectEqual(@as(u16, 404), miss.status_code);
+    try testing.expect((try miss.getHeaderOne("cache-control")) == null);
+    try testing.expect((try miss.getHeaderOne("etag")) == null);
+
+    // A matching validator becomes 304 with the headers kept; HEAD too.
+    inline for (.{ router.Method.get, .head }) |method| {
+        const headers = [_]router.Header{.{ .name = "If-None-Match", .value = etag }};
+        var req: router.Request = .{ .method = method, .segments = &.{"hello.txt"}, .headers = &headers };
+        var res = try app.dispatch(&req);
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 304), res.status_code);
+        try testing.expectEqualStrings("", res.body);
+        try testing.expectEqualStrings(etag, (try res.getHeaderOne("etag")).?);
+        try testing.expect((try res.getHeaderOne("cache-control")) != null);
+    }
+    // A stale validator gets the full file.
+    {
+        const headers = [_]router.Header{.{ .name = "If-None-Match", .value = "\"stale\"" }};
+        var req: router.Request = .{ .method = .get, .segments = &.{"hello.txt"}, .headers = &headers };
+        var res = try app.dispatch(&req);
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status_code);
+        try testing.expectEqualStrings("hello", res.body);
+    }
+    // `public` keeps http_cache's credential rule.
+    {
+        const headers = [_]router.Header{.{ .name = "Cookie", .value = "sid=1" }};
+        var req: router.Request = .{ .method = .get, .segments = &.{"hello.txt"}, .headers = &headers };
+        try testing.expectError(error.SharedCacheWithCredentials, app.dispatch(&req));
+    }
+
+    // sendFile takes the same options.
+    const req: router.Request = .{ .method = .get, .segments = &.{} };
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try testing.expect(try sendFile(&req, &res, tree.root, "hello.txt", .{ .cache_control = .no_store, .etag = true }));
+    try testing.expectEqualStrings("no-store", (try res.getHeaderOne("cache-control")).?);
+    try testing.expectEqualStrings(etag, (try res.getHeaderOne("etag")).?);
 }
 
 /// Advances 3 ms on every read.

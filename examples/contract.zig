@@ -427,3 +427,41 @@ test "PLUGINS security response policies example" {
         try std.testing.expectEqualStrings("DENY", (try res.getHeaderOne("X-Frame-Options")).?);
     }
 }
+
+// README "Sending files from routes": a route sends one confined file and
+// answers 404 itself when the file is missing.
+const FilesApp = zoda.app.App(struct {});
+var reports_root: std.Io.Dir = undefined;
+
+fn reportRoute(_: *FilesApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.isGet() and req.onLiteral("reports")) {
+        const name = req.onSegment() orelse return;
+        if (!req.isRoot()) return;
+        var buffer: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&buffer, "reports/{s}.txt", .{name}) catch return res.text(404, "no such report");
+        const sent = try zoda.static.sendFile(req, res, reports_root, path, .{
+            .cache_control = .{ .private = .{ .no_cache = true } },
+            .etag = true,
+        });
+        if (!sent) return res.text(404, "no such report");
+    }
+}
+
+test "routes send confined files with sendFile" {
+    if (!zoda.static.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "reports");
+    try tmp.dir.writeFile(io, .{ .sub_path = "reports/q3.txt", .data = "q3 numbers" });
+    reports_root = tmp.dir;
+
+    const files_app: FilesApp = .{ .response_allocator = std.testing.allocator, .config = .{}, .plugins = .{}, .route_fn = reportRoute };
+    inline for (.{ .{ "q3", 200, "q3 numbers" }, .{ "q4", 404, "no such report" } }) |case| {
+        var req: zoda.router.Request = .{ .method = .get, .segments = &.{ "reports", case[0] } };
+        var res = try files_app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqual(@as(u16, case[1]), res.status_code);
+        try std.testing.expectEqualStrings(case[2], res.body);
+    }
+}

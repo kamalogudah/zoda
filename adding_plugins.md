@@ -58,7 +58,7 @@ corresponding ideas in the [Roda catalog](https://roda.jeremyevans.net/rdoc/clas
 | 2 | JSON request parsing (`json_parser`) | Registered helper | Decode the already bounded request body into caller-owned typed data; handle invalid JSON and content type explicitly. |
 | 3 | Status and error handlers (`status_handler`, `error_handler`) — available as `zoda.plugins.status_handler` and `zoda.plugins.error_handler` | Middleware | Map selected errors/statuses to responses with clear precedence. Recovery must clear a partial response before replacement. |
 | 3 | Security response policies (`content_security_policy`, `hsts`, `permissions_policy`) — available as `zoda.plugins.security_policy` | Middleware | Validate configured policy values and emit headers on the selected response classes. HSTS requires a trustworthy HTTPS signal. |
-| 3 | Files and assets (`public`, `send_file`, `assets`) | Middleware/helpers | Extend the existing confined static-file code instead of duplicating path security. Asset pipelines need a separate build-time design. |
+| 3 | Files and assets (`public`, `send_file`, `assets`) — `public` and `send_file` available as `zoda.static` cache options and `zoda.static.sendFile` | Middleware/helpers | Extend the existing confined static-file code instead of duplicating path security. Asset pipelines need a separate build-time design; see [the asset contract](#asset-pipeline-contract-67). |
 | 3 | Inertia.js responses (`inertia`) | Registered helper with an explicit HTML shell | Render a component and typed props as an escaped initial HTML page or an Inertia JSON page response. Handle asset-version conflicts and Inertia redirects without changing normal route dispatch. |
 
 Start with a small public catalog rather than all of Roda's modules. Several
@@ -98,6 +98,35 @@ precedence so route props override shared props.
   destination validation, URL/query preservation, and normal request behavior.
   Document any deferred Inertia protocol features (for example partial reloads)
   explicitly instead of silently claiming full protocol support.
+
+### Asset pipeline contract ([#67](https://github.com/kamalogudah/zoda/issues/67))
+
+Not implemented. This is the contract to review before fingerprinting or
+preloading is built; split it into its own issue after that review.
+
+- **Build time only.** A `zig build` step reads a source directory and writes
+  fingerprinted copies (`app.css` -> `app.3f9a1c2e.css`, the first 64 bits of
+  SHA-256 in hex) plus `manifest.json` into an output directory. The server
+  never compiles, minifies, or hashes assets at request time. Processing
+  (bundling, minifying) is an optional, explicit build step, not a default.
+- **Manifest.** A JSON object mapping each logical path to its fingerprinted
+  path, both relative and `/`-separated, with no `..`, dotfile, or absolute
+  entries; the build step rejects them. It is embedded with `@embedFile` so a
+  running server cannot see a manifest that differs from its files, and a
+  missing logical path is a compile-time or startup error, not a runtime miss.
+- **Serving.** Fingerprinted files are served by the existing
+  `zoda.static.middleware` with a prefix such as `&.{"assets"}` and
+  `cache_control = .{ .public = .{ .max_age = 31536000, .immutable = true,
+  .allow_credentials = true } }`. No second open path is added.
+- **Templates.** A helper resolves a logical path to `/<prefix>/<fingerprinted>`
+  for templates and the Inertia asset version. Its output is a URL path, not
+  trusted HTML, so it goes through the existing escaping rules.
+- **Preloading.** `Link: <...>; rel=preload` headers are opt-in per route and
+  come only from manifest entries, so no request data reaches the header.
+- **Open questions for review:** whether the manifest also records a content
+  hash for the Inertia version, how stale fingerprinted files are pruned, and
+  whether the development server (`zig build watch`) serves unfingerprinted
+  paths.
 
 ## First implementation milestone
 

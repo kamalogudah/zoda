@@ -652,6 +652,54 @@ defer app.deinit();
   confinement. Run `checkSupport` at startup to find out early.
 - A hard link inside the root to a file outside it is served like any other
   file. Keep the document root read-only to the server process.
+- No `Cache-Control` or `ETag` is sent unless configured. `cache_control`
+  takes a [`zoda.plugins.http_cache`](PLUGINS.md#http-caching) policy and
+  applies it to hits only, with the same rules: `public` is refused (an
+  error) on requests carrying `Authorization` or `Cookie` unless
+  `allow_credentials = true`. `etag = true` adds a strong body `ETag` and
+  answers a matching `If-None-Match` with 304:
+
+  ```zig
+  const static_config: zoda.static.Config = .{
+      .root = public,
+      .prefix = &.{"assets"},
+      .cache_control = .{ .public = .{ .max_age = 3600, .allow_credentials = true } },
+      .etag = true,
+  };
+  ```
+
+#### Sending files from routes
+
+`zoda.static.sendFile(req, res, root, path, options)` serves one file from a
+route through the same confined open as the middleware. Use it when the route
+chooses the file, for example after an authorization check:
+
+```zig
+if (req.isGet() and req.onLiteral("reports")) {
+    const name = req.onSegment() orelse return;
+    var buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&buffer, "reports/{s}.txt", .{name}) catch
+        return res.text(404, "no such report");
+    if (!try zoda.static.sendFile(req, res, private_root, path, .{
+        .cache_control = .{ .private = .{ .no_cache = true } },
+        .etag = true,
+    })) return res.text(404, "no such report");
+}
+```
+
+- `path` is relative and `/`-separated. Each segment is checked like a
+  request segment: a leading `/`, empty segments, `.`, `..`, `\`, NUL, and
+  (unless `allow_dotfiles`) dotfiles are refused before the kernel sees the
+  path. The kernel then refuses escapes and symlinks as above.
+- Returns `true` when the file was sent as a 200 and `false` when it is
+  missing, refused, a directory, a symlink, or a special file. On `false` the
+  response is untouched and the route decides what to send.
+- The method is not checked; the route decides which methods send files.
+- `content_type` overrides the extension table. `max_file_bytes`,
+  `cache_control`, and `etag` behave as in `Config`. Larger files fail with
+  `error.BodyTooLarge`.
+- Download names (`Content-Disposition`), ranges, and streaming are not
+  supported.
 
 ### Dispatching without sockets
 
