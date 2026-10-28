@@ -63,6 +63,16 @@ runs inside `zig build test`.
   field with case-insensitive scheme, one SP separator, and RFC 6750 b64token
   syntax; it never reads query parameters. The default maximum is 4096 token
   bytes. The callback must not retain the borrowed token.
+- `zoda.RequestTrace` is an opt-in registered plugin. It creates an ID once
+  per dispatch in request-local state (`ctx.state.<name>.id()`). The ID comes
+  from 16 bytes of `IdSource` (`std.Io.randomSecure` or a thread-safe custom
+  fill), hex-encoded. With `incoming = .accept_valid`, it instead takes one
+  `X-Request-Id` value of 1–64 `[A-Za-z0-9_-]` bytes.
+  `request_trace.middleware(App, name)` sets `X-Request-Id` on completed
+  responses. It calls the sink once per dispatch with `Record{ id, method,
+  path, status, duration_ms, failed }`; errors give `status = null` and
+  `failed = true`. Records exclude headers, query strings, and bodies.
+  Register it outermost.
 - `BearerToken.guard_routes = true` adds a wrapper through `App.composeRoute`.
   It sends 401, `WWW-Authenticate: Bearer`, and a fixed body before the inner
   route on failure. The default is false. With `NotFound` registered,

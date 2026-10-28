@@ -117,3 +117,53 @@ test "ADR section 5 examples: routing, plugin state, ownership, timing" {
         try std.testing.expectEqualStrings("", res.body);
     }
 }
+
+// README "Request IDs and access logs": the same registration, compiled here.
+const TraceLog = struct {
+    count: usize = 0,
+    last_status: ?u16 = null,
+
+    fn write(raw: *anyopaque, record: zoda.plugins.request_trace.Record) void {
+        const self: *TraceLog = @ptrCast(@alignCast(raw));
+        // A real sink would emit a line such as:
+        // std.log.info("id={s} method={t} path={s} status={?d} ms={d} failed={}", .{
+        //     record.id, record.method, record.path, record.status, record.duration_ms, record.failed,
+        // });
+        self.count += 1;
+        self.last_status = record.status;
+    }
+};
+
+const TracePlugins = struct { trace: zoda.RequestTrace };
+const TraceApp = zoda.app.App(TracePlugins);
+
+fn traceRoute(ctx: *TraceApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.isRoot() and req.isGet()) return res.text(200, ctx.state.trace.id());
+}
+
+test "README request trace example" {
+    var log: TraceLog = .{};
+    var app = try TraceApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .config = .{ .clock = .monotonic(std.testing.io) },
+        .plugins = .{ .trace = .{
+            .source = .{ .io = std.testing.io },
+            .incoming = .accept_valid,
+            .clock = .monotonic(std.testing.io),
+            .sink = .{ .context = &log, .write = TraceLog.write },
+        } },
+        .route_fn = traceRoute,
+        // Outermost, so the record sees timing, static, and auth outcomes.
+        .middleware = &.{ zoda.plugins.request_trace.middleware(TraceApp, "trace"), zoda.timing.middleware(TraceApp) },
+    });
+    defer app.deinit();
+
+    var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, "/");
+    defer arena.deinit();
+    var req = arena.requestView(.get);
+    var res = try app.dispatch(&req);
+    defer res.deinit();
+    try std.testing.expectEqualStrings(res.body, (try res.getHeaderOne(zoda.plugins.request_trace.header_name)).?);
+    try std.testing.expectEqual(@as(usize, 1), log.count);
+    try std.testing.expectEqual(@as(?u16, 200), log.last_status);
+}

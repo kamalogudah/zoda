@@ -695,6 +695,65 @@ defer app.deinit();
   returns a `std.Io.Timestamp`. A clock read by concurrent requests must be
   thread-safe; `.monotonic(io)` is.
 
+### Request IDs and access logs
+
+Register `zoda.RequestTrace` as a plugin and add
+`zoda.plugins.request_trace.middleware(App, "trace")` as the first middleware
+entry. The second argument is the plugin's field name. Each request gets an ID
+before any middleware runs, stored in request-local state. Routes read it with
+`ctx.state.trace.id()`. Every completed response gets an `X-Request-Id` header,
+and the sink receives exactly one `Record` per dispatch.
+
+```zig
+fn writeAccess(_: *anyopaque, r: zoda.plugins.request_trace.Record) void {
+    std.log.info("id={s} method={t} path={s} status={?d} ms={d} failed={}", .{
+        r.id, r.method, r.path, r.status, r.duration_ms, r.failed,
+    });
+}
+
+const Plugins = struct { trace: zoda.RequestTrace };
+const App = zoda.app.App(Plugins);
+
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{ .trace = .{
+        .source = .{ .io = io }, // 16 bytes from std.Io.randomSecure, hex-encoded
+        .incoming = .accept_valid, // default .ignore always generates
+        .clock = .monotonic(io),
+        .sink = .{ .context = undefined, .write = writeAccess },
+    } },
+    .route_fn = route,
+    .middleware = &.{ zoda.plugins.request_trace.middleware(App, "trace"), zoda.timing.middleware(App) },
+});
+```
+
+The [compiling contract example](examples/contract.zig) uses the same
+registration.
+
+- **Incoming IDs.** With `.accept_valid`, the plugin accepts exactly one
+  `X-Request-Id` value of 1–64 bytes containing only `[A-Za-z0-9_-]`. A missing,
+  repeated, empty, oversized, or malformed value is discarded and a new ID is
+  generated. With `.ignore` (the default), the plugin always generates an ID.
+- **Record fields.** A `Record` has `id`, `method`, `path` (the target without
+  its query string), `status`, `duration_ms`, and `failed`. Its slices are valid
+  only during the sink call. Records never include headers, cookies, query
+  strings, or bodies, so bearer tokens and session values cannot be logged.
+- **Completion.** Timing is measured around everything downstream of the entry.
+  A route miss or a silent short circuit is recorded as the same 404 that
+  dispatch would send. A short circuit that writes a response is recorded with
+  its own status. If anything downstream returns an error, the record has
+  `status = null` and `failed = true`, the error propagates unchanged, and no
+  header is added.
+- **Ordering.** Register this entry before timing, static files, host or
+  bearer authorization, and any error-recovery middleware. It then sees their
+  final statuses, and recovered errors are logged as the response the recovery
+  middleware wrote. An entry placed before it never gets a record when it
+  short-circuits.
+- **Concurrency.** The ID lives in per-request state, with no shared mutable
+  data. A custom `IdSource.custom` and the sink are called from concurrent
+  requests, so both must be thread-safe. Sinks cannot fail; handle write errors
+  inside the callback.
+
 ### Static files
 
 `zoda.static.middleware(App, &config)` serves `GET` and `HEAD` requests for

@@ -56,6 +56,8 @@ pub const plugins = struct {
     pub const csrf = @import("plugins/csrf.zig");
     /// Application-validated Authorization Bearer credentials.
     pub const bearer_token = @import("plugins/bearer_token.zig");
+    /// Request IDs and access records across the dispatch chain.
+    pub const request_trace = @import("plugins/request_trace.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
@@ -65,6 +67,7 @@ pub const Json = plugins.json.Json;
 pub const NotFound = plugins.not_found.NotFound;
 pub const Sessions = plugins.sessions.Sessions;
 pub const BearerToken = plugins.bearer_token.BearerToken;
+pub const RequestTrace = plugins.request_trace.RequestTrace;
 
 comptime {
     // Collect the imported modules' test declarations into the library test
@@ -86,6 +89,7 @@ comptime {
     std.testing.refAllDecls(plugins.sessions);
     std.testing.refAllDecls(plugins.csrf);
     std.testing.refAllDecls(plugins.bearer_token);
+    std.testing.refAllDecls(plugins.request_trace);
 }
 
 test {
