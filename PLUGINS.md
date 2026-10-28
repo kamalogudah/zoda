@@ -1,0 +1,385 @@
+# Zoda plugins
+
+Detailed usage for every built-in plugin. For how the plugin system works
+(registration, request state, route wrappers, and middleware), see
+[Plugins in the README](README.md#plugins). Each plugin's full API is
+documented beside its code in `src/plugins/`, and its support status is in
+[SUPPORTED_API.md](SUPPORTED_API.md).
+
+| Plugin | Registration | Form | Section |
+| --- | --- | --- | --- |
+| JSON responses | `json: zoda.Json = .{}` | Registered instance | [JSON responses](#json-responses) |
+| Not-found fallback | `not_found: zoda.NotFound` + `App.composeRoute` | Route wrapper | [Not-found fallback](#not-found-fallback) |
+| Bearer tokens | `bearer: zoda.BearerToken` | Registered instance, optional route wrapper | [Bearer tokens](#bearer-tokens) |
+| Cookie sessions | `sessions: zoda.Sessions` | Registered instance with request state | [Cookie sessions](#cookie-sessions) |
+| CSRF helpers | `zoda.plugins.csrf` functions | Helpers over session state | [CSRF helpers](#csrf-helpers) |
+| Flash messages | `flash: zoda.Flash = .{}` next to `Sessions` | Registered instance over session state | [Flash messages](#flash-messages) |
+| HTTP caching | `zoda.plugins.http_cache` functions | Explicit response helpers | [HTTP caching](#http-caching) |
+| Request IDs and access logs | `trace: zoda.RequestTrace` + middleware entry | Registered instance with request state and middleware | [Request IDs and access logs](#request-ids-and-access-logs) |
+
+Core middleware that is not a plugin (host authorization, default response
+headers, response timing, and static files) is documented in the
+[README](README.md#middleware).
+
+## JSON responses
+
+`zoda.Json` is a stateless instance. `render` serializes a value with
+`std.json`, replaces the status (200), body, and content type
+(`application/json`), and marks the response handled. Serialization and
+allocation errors propagate; the configured body limit applies.
+
+```zig
+const User = struct { id: []const u8, name: []const u8 };
+const Plugins = struct { json: zoda.Json = .{} };
+const App = zoda.app.App(Plugins);
+
+fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.onLiteral("users")) {
+        if (req.onSegment()) |id| {
+            if (req.isRoot() and req.isGet()) {
+                return ctx.plugins.json.render(res, User, .{ .id = id, .name = "unknown" });
+            }
+        }
+    }
+}
+```
+
+For another status, call `res.replaceJson(status, T, value)` directly. The
+[compiling contract example](examples/contract.zig) uses this registration.
+
+## Not-found fallback
+
+For a configured text fallback, add the built-in `NotFound` plugin. It writes
+only when the inner route leaves the response unhandled; a middleware short
+circuit that never reaches the route still receives dispatch's default 404.
+
+```zig
+const Plugins = struct { not_found: zoda.NotFound };
+const App = zoda.app.App(Plugins);
+
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{ .not_found = .{ .body = "No route matched" } },
+    .route_fn = App.composeRoute(route),
+});
+defer app.deinit();
+```
+
+`NotFound` must be passed through `App.composeRoute`; see
+[Route wrappers](README.md#route-wrappers) for wrapper order. The body is
+borrowed and copied into each response.
+
+## Bearer tokens
+
+Register `zoda.BearerToken` with an application validator. The parser reads
+only one `Authorization: Bearer <token>` field. It accepts the RFC 6750
+`b64token` alphabet, rejects duplicate, malformed, and oversized credentials,
+and returns a slice borrowed from the request. The plugin does not store
+tokens or perform identity lookup.
+
+```zig
+const std = @import("std");
+const zoda = @import("zoda");
+
+fn validate(token: []const u8) bool {
+    // Replace with application-owned validation and identity lookup.
+    return std.mem.eql(u8, token, "example-token");
+}
+
+const Plugins = struct {
+    bearer: zoda.BearerToken = .{ .validate = validate, .guard_routes = true },
+    not_found: zoda.NotFound = .{ .body = "Not Found" },
+};
+const App = zoda.app.App(Plugins);
+
+fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    _ = ctx;
+    if (req.isLiteral("private") and req.isGet()) return res.text(200, "ok");
+}
+
+fn makeApp(gpa: std.mem.Allocator) !App {
+    return App.init(gpa, .{
+        .response_allocator = gpa,
+        .plugins = .{},
+        .route_fn = App.composeRoute(route),
+    });
+}
+
+// For a selected route, leave guard_routes false and check the registered
+// plugin directly before doing protected work.
+fn explicitRoute(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.isLiteral("private") and req.isGet()) {
+        if (!ctx.plugins.bearer.authorized(req)) return ctx.plugins.bearer.unauthorized(res);
+        return res.text(200, "ok");
+    }
+}
+
+fn makeExplicitApp(gpa: std.mem.Allocator) !App {
+    return App.init(gpa, .{
+        .response_allocator = gpa,
+        .plugins = .{ .bearer = .{ .validate = validate, .guard_routes = false } },
+        .route_fn = explicitRoute,
+    });
+}
+```
+
+`guard_routes` defaults to false. With `true`, the wrapper returns 401 with
+`WWW-Authenticate: Bearer` before calling the inner route on any failed
+credential. The fixed response contains no token. With `NotFound` registered,
+unauthenticated route misses receive 401 and authenticated misses
+receive 404. Call `ctx.plugins.bearer.token(req)` when a route needs the
+borrowed credential or a specific parse error. The validator must not retain
+the slice. Query strings are never searched for credentials.
+
+## Cookie sessions
+
+Register `zoda.Sessions` as a plugin instance. Supply a trusted UTC Unix-second
+clock, a lifetime from 1 second to 30 days, and one or more application-owned
+keys of at least 32 cryptographically random bytes. The first key signs new cookies; older keys remain
+available for verification during rotation. Key IDs must be unique.
+
+```zig
+const Plugins = struct { sessions: zoda.Sessions };
+
+// `unixSeconds` is the application's trusted wall-clock function. Keep the
+// secret bytes alive for the app lifetime; load them from secure configuration.
+const plugins = Plugins{ .sessions = .{
+    .keys = &.{.{ .id = 1, .secret = app_secret }},
+    .lifetime_seconds = 3600,
+    .now_seconds = unixSeconds,
+} };
+
+// Inside a route or middleware:
+try ctx.state.sessions.set("user=42");
+try ctx.plugins.sessions.save(&ctx.state.sessions, res); // before returning
+// Read with ctx.state.sessions.value(); call clear() and save() to delete.
+```
+
+The cookie is `__Host-zoda_session=v1.<key-id>.<expiry>.<base64url-payload>.<base64url-HMAC-SHA256>`
+until a CSRF token is issued. It then uses
+`v2.<key-id>.<expiry>.<base64url-payload>.<base64url-CSRF-secret>.<base64url-HMAC-SHA256>`.
+While flash messages are pending it uses
+`v3.<key-id>.<expiry>.<base64url-payload>.<base64url-CSRF-secret-or-empty>.<base64url-flash>.<base64url-HMAC-SHA256>`.
+The MAC covers every field before it. Invalid, expired,
+oversized, or duplicate session cookies load as an empty session. Payloads are
+limited to 2,048 bytes and cookie values to 4,096 bytes. Signing authenticates
+contents but **does not make them confidential**; do not put secrets in the
+payload. A copied cookie can be replayed until its expiry. Removing a key stops
+accepting cookies signed by that key.
+
+`save` appends a separate `Set-Cookie` field with `Path=/; Secure; HttpOnly;
+SameSite=Lax` and `Max-Age` set to the configured lifetime. The `__Host-`
+prefix requires HTTPS and prevents a Domain attribute. `clear` followed by
+`save` appends a deletion cookie. Unsaved changes are discarded when the request
+ends; cleanup is infallible and never writes a response. The route or
+middleware decides when to persist, including on short circuits. Configure
+CSRF protection before using cookie sessions for state-changing requests.
+If a route fails after `save`, a propagated error discards its partial response.
+Recovery middleware can call `res.clear()` and then explicitly `save` the
+recovered session; cleanup never creates or restores a cookie.
+
+## CSRF helpers
+
+Use `zoda.plugins.csrf` with a registered `zoda.Sessions` instance. On a GET
+that renders a form, issue a token from `ctx.state.sessions`, put it in the
+form, and explicitly save the session before returning the response. The first
+issue upgrades an existing v1 session to a v2 cookie containing a random
+32-byte CSRF secret. The opaque application payload stays separate. A cleared
+session invalidates its token. Existing v1 cookies still load normally.
+
+```zig
+const csrf = zoda.plugins.csrf;
+
+// GET /form, inside a route with registered `sessions` plugin:
+const issued = try csrf.token(io, &ctx.state.sessions);
+try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+try res.text(200, issued); // render as a hidden form field or pass to client code
+
+// POST /submit, before any protected action:
+if (!csrf.valid(req, &ctx.state.sessions)) return res.text(403, "forbidden");
+try performProtectedAction();
+```
+
+`io` is the application's `std.Io`; token creation uses
+`std.Io.randomSecure` and can fail if secure entropy is unavailable. For
+JavaScript submissions, send the token in one `X-CSRF-Token` header. For HTML
+forms, extract exactly one token field and call `csrf.validToken`; reject
+duplicate fields. Missing, malformed, duplicate-header, and cross-session
+tokens fail validation. The token is stable until the session is cleared; do
+not put it in a URL or log. Protect every state-changing route, including
+unsafe GET routes if the application has any. Keep the secure cookie and HTTPS
+policy above, and do not allow untrusted cross-origin requests to send the
+custom header through permissive CORS. The [compiling app dispatch example](src/plugins/csrf.zig)
+exercises explicit plugin access, session persistence, and rejection before
+the protected action.
+
+## Flash messages
+
+Register `zoda.Flash` next to `zoda.Sessions`. Messages live in the signed
+session cookie. Like other session changes, they persist only through an
+explicit `sessions.save`.
+
+```zig
+const Plugins = struct { sessions: zoda.Sessions, flash: zoda.Flash = .{} };
+
+// POST /items: queue a message for the next request, save, and redirect.
+try ctx.plugins.flash.add(&ctx.state.sessions, "notice", "Item created");
+try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+return res.redirectPath(.see_other, "/");
+
+// GET /: read what this request received, then save to consume it.
+var messages = ctx.plugins.flash.read(&ctx.state.sessions);
+while (messages.next()) |message| {
+    // message.kind and message.text are borrowed until the request ends;
+    // copy them into the response and escape them for HTML.
+}
+try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+```
+
+- **Read once.** `read` returns the messages loaded with this request, in the
+  order they were added, and marks them consumed. Calling it again in the same
+  request returns the same messages. The next saved cookie drops them. If the
+  request does not save, the browser keeps its old cookie and shows the
+  messages again. Reading an empty flash does not dirty the session.
+- **Next request.** `add` queues a message for the next request that loads the
+  saved cookie. A saved cookie holds unread received messages first, then
+  queued ones. A request that saves without calling `read` therefore keeps
+  pending messages for a later page.
+- **Limits.** Kinds are 1–32 bytes of ASCII letters, digits, `_`, or `-`.
+  Text is arbitrary bytes. A session holds at most 8 messages and 512 encoded
+  bytes (3 bytes of framing plus kind and text per message). Unread received
+  messages count toward both limits. `add` returns `error.InvalidFlashKind`,
+  `error.TooManyFlashMessages`, or `error.FlashTooLarge` and leaves the
+  session unchanged.
+- **Short circuits and errors.** An unsaved short circuit neither consumes
+  nor queues anything. A propagated error discards the response, including
+  any saved cookie. Request state is not rolled back, so recovery middleware
+  that saves would also persist the failed handler's flash changes. Call
+  `flash.reset` first to restore the received messages and drop queued ones:
+
+  ```zig
+  next.call(ctx, req, res) catch {
+      res.clear();
+      ctx.plugins.flash.reset(&ctx.state.sessions);
+      try ctx.plugins.flash.add(&ctx.state.sessions, "alert", "Something went wrong");
+      try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+      return res.text(503, "unavailable");
+  };
+  ```
+- **Clearing.** `clear` drops received and queued messages. `add` after `clear`
+  keeps a cookie with an empty payload, so a logout page can still show a
+  notice.
+- **Not confidential.** Flash contents are signed, not encrypted, so the
+  client can read them. Do not flash secrets. Tampered, expired, or malformed
+  cookies load an empty session with no messages. Cleanup never writes a
+  cookie.
+
+The [compiling example](examples/contract.zig) registers both plugins and
+round-trips a message through POST, redirect, and GET.
+
+## HTTP caching
+
+`zoda.plugins.http_cache` provides explicit helpers; nothing is registered and
+no policy is applied by default. A route without a `Cache-Control` call sends
+none. Build the full 2xx response, set its policy, validator, and `Vary`, save
+any session, then call `evaluate` last:
+
+```zig
+const http_cache = zoda.plugins.http_cache;
+
+if (req.isLiteral("report") and (req.isGet() or req.method == .head)) {
+    try res.text(200, report_text);
+    try http_cache.setCacheControl(req, res, .{ .private = .{ .no_cache = true } });
+    try http_cache.setBodyETag(res); // or .setETag(res, .strong("v42"))
+    try http_cache.addVary(res, "Accept-Encoding");
+    _ = try http_cache.evaluate(req, res); // .full or .not_modified
+    return;
+}
+```
+
+Policies are `.no_store`, `.private`, and `.public`, with optional `max_age`,
+`no_cache`, `must_revalidate`, and `immutable`; `public` also takes
+`s_maxage`. Lifetimes above 2147483648 seconds and a second `Cache-Control`
+are rejected. `public` is refused when the response already has `Set-Cookie`.
+It is also refused when the request carries `Authorization` or `Cookie`,
+unless the route sets `.allow_credentials = true` to state that the body does
+not depend on them. Choose `.private` or `.no_store` for session and other
+personalized pages. Call `setCacheControl` after `sessions.save` so the
+`Set-Cookie` check can see the cookie.
+
+`setETag` takes a strong or weak tag of at most 128 visible ASCII bytes
+without `"`. `setBodyETag` derives a strong tag from the content type and
+body. `addVary` adds one field name once, case-insensitively across repeated
+`Vary` fields, and refuses `*` (use `.no_store`).
+
+`evaluate` checks `If-None-Match` only on handled GET and HEAD 2xx responses.
+Comparison is weak, so `W/"v1"` and `"v1"` match. Repeated fields form one
+list, empty list elements are accepted, and `*` matches only as the sole
+member. A malformed request field voids the whole condition and sends the
+full response. When the condition matches, the response becomes `304 Not
+Modified`. It keeps every header (`ETag`, `Cache-Control`, `Vary`,
+`Set-Cookie`) and drops its body and content type. The transport sends a 304
+with no `Content-Length`, `Content-Type`, or body, and keeps the connection
+open. HEAD has no GET fallback, so answer it explicitly. A 200 HEAD response
+still reports the representation's `Content-Length`. Other methods are left
+unchanged; check their preconditions before acting. `If-Modified-Since`,
+`If-Match`, and ranges are not supported.
+
+## Request IDs and access logs
+
+Register `zoda.RequestTrace` as a plugin and add
+`zoda.plugins.request_trace.middleware(App, "trace")` as the first middleware
+entry. The second argument is the plugin's field name. Each request gets an ID
+before any middleware runs, stored in request-local state. Routes read it with
+`ctx.state.trace.id()`. Every completed response gets an `X-Request-Id` header,
+and the sink receives exactly one `Record` per dispatch.
+
+```zig
+fn writeAccess(_: *anyopaque, r: zoda.plugins.request_trace.Record) void {
+    std.log.info("id={s} method={t} path={s} status={?d} ms={d} failed={}", .{
+        r.id, r.method, r.path, r.status, r.duration_ms, r.failed,
+    });
+}
+
+const Plugins = struct { trace: zoda.RequestTrace };
+const App = zoda.app.App(Plugins);
+
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{ .trace = .{
+        .source = .{ .io = io }, // 16 bytes from std.Io.randomSecure, hex-encoded
+        .incoming = .accept_valid, // default .ignore always generates
+        .clock = .monotonic(io),
+        .sink = .{ .context = undefined, .write = writeAccess },
+    } },
+    .route_fn = route,
+    .middleware = &.{ zoda.plugins.request_trace.middleware(App, "trace"), zoda.timing.middleware(App) },
+});
+```
+
+The [compiling contract example](examples/contract.zig) uses the same
+registration.
+
+- **Incoming IDs.** With `.accept_valid`, the plugin accepts exactly one
+  `X-Request-Id` value of 1–64 bytes containing only `[A-Za-z0-9_-]`. A missing,
+  repeated, empty, oversized, or malformed value is discarded and a new ID is
+  generated. With `.ignore` (the default), the plugin always generates an ID.
+- **Record fields.** A `Record` has `id`, `method`, `path` (the target without
+  its query string), `status`, `duration_ms`, and `failed`. Its slices are valid
+  only during the sink call. Records never include headers, cookies, query
+  strings, or bodies, so bearer tokens and session values cannot be logged.
+- **Completion.** Timing is measured around everything downstream of the entry.
+  A route miss or a silent short circuit is recorded as the same 404 that
+  dispatch would send. A short circuit that writes a response is recorded with
+  its own status. If anything downstream returns an error, the record has
+  `status = null` and `failed = true`, the error propagates unchanged, and no
+  header is added.
+- **Ordering.** Register this entry before timing, static files, host or
+  bearer authorization, and any error-recovery middleware. It then sees their
+  final statuses, and recovered errors are logged as the response the recovery
+  middleware wrote. An entry placed before it never gets a record when it
+  short-circuits.
+- **Concurrency.** The ID lives in per-request state, with no shared mutable
+  data. A custom `IdSource.custom` and the sink are called from concurrent
+  requests, so both must be thread-safe. Sinks cannot fail; handle write errors
+  inside the callback.

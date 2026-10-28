@@ -45,7 +45,7 @@ runs inside `zig build test`.
   and owned `Response` return from `dispatch`.
 - Buffered text, JSON, and embedded HTML template responses; JSON and
   configured not-found plugins; host-authorization, default-header, timing, and static-file
-  middleware; signed cookie sessions and session-bound CSRF helpers; bounded
+  middleware; signed cookie sessions, session-bound CSRF helpers, and one-time flash messages; bounded
   cleartext HTTP/1.0 and HTTP/1.1 socket service.
 - `Response.redirectPath(status, path)` sets an explicit 302, 303, 307, or 308
   and a copied `Location` for a local path. It rejects external or ambiguous
@@ -169,8 +169,12 @@ Session keys and their bytes must outlive the app. Use at least 32 random
 bytes per key, unique IDs, a trusted UTC clock, and HTTPS for the `__Host-`
 cookie. The signed payload is **not encrypted**. Mutations and CSRF-token
 issuance require an explicit `sessions.save` before returning; cleanup never
-persists. Call `csrf.valid` before protected actions and reject duplicate form
-tokens before `validToken`. See the [README](README.md#cookie-sessions) for
+persists. `zoda.Flash` stores at most 8 messages / 512 encoded bytes in the
+same signed (not encrypted) cookie. `add` queues a message for the next
+request. `read` returns this request's messages and marks them consumed for
+the next `save`. Without a save, they are shown again. `reset` undoes this
+request's flash changes before a recovery save. Call `csrf.valid` before protected actions and reject duplicate form
+tokens before `validToken`. See the [README](PLUGINS.md#cookie-sessions) for
 rotation and cookie behavior.
 
 ## Defaults and unsupported capabilities

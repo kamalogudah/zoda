@@ -4,6 +4,7 @@
 const std = @import("std");
 const router = @import("../router.zig");
 const response = @import("../response.zig");
+const flash = @import("flash.zig");
 
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 const base64 = std.base64.url_safe_no_pad;
@@ -12,6 +13,16 @@ pub const cookie_name = "__Host-zoda_session";
 pub const max_payload_bytes: usize = 2048;
 pub const max_cookie_bytes: usize = 4096;
 pub const max_lifetime_seconds: u32 = 30 * 24 * 60 * 60;
+
+comptime {
+    // The largest v3 Set-Cookie value (u8 key ID, i64 expiry, u32 Max-Age)
+    // must fit the fixed header buffer in `save`.
+    const fields = base64.Encoder.calcSize(max_payload_bytes) + base64.Encoder.calcSize(32) +
+        base64.Encoder.calcSize(flash.max_bytes) + base64.Encoder.calcSize(Hmac.mac_length);
+    const framing = cookie_name.len + "=v3.255.9223372036854775807.....".len +
+        "; Max-Age=4294967295; Path=/; Secure; HttpOnly; SameSite=Lax".len;
+    std.debug.assert(fields + framing <= max_cookie_bytes);
+}
 
 /// The first key signs new cookies; all keys verify them. IDs must be unique.
 /// Key bytes are caller-owned and must remain valid for the app lifetime.
@@ -34,6 +45,8 @@ pub const Sessions = struct {
         csrf_secret: [32]u8 = undefined,
         csrf_present: bool = false,
         csrf_token: [base64.Encoder.calcSize(32)]u8 = undefined,
+        /// Managed by `zoda.plugins.flash.Flash`.
+        flash: flash.Store = .{},
 
         pub fn value(self: *const State) []const u8 {
             return self.bytes[0..self.len];
@@ -54,6 +67,7 @@ pub const Sessions = struct {
             self.dirty = true;
             self.clearing = true;
             self.csrf_present = false;
+            self.flash = .{};
         }
     };
 
@@ -80,12 +94,19 @@ pub const Sessions = struct {
             const expiry = std.math.add(i64, now, self.lifetime_seconds) catch return error.InvalidSessionTime;
             var encoded: [base64.Encoder.calcSize(max_payload_bytes)]u8 = undefined;
             const payload = base64.Encoder.encode(&encoded, state.value());
+            var encoded_csrf: [base64.Encoder.calcSize(32)]u8 = undefined;
+            const csrf = if (state.csrf_present) base64.Encoder.encode(&encoded_csrf, &state.csrf_secret) else "";
+            var flash_bytes: [flash.max_bytes]u8 = undefined;
+            const flash_raw = state.flash.persisted(&flash_bytes);
             var header: [max_cookie_bytes]u8 = undefined;
-            const prefix = if (state.csrf_present) blk: {
-                var encoded_csrf: [base64.Encoder.calcSize(32)]u8 = undefined;
-                const csrf = base64.Encoder.encode(&encoded_csrf, &state.csrf_secret);
-                break :blk std.fmt.bufPrint(&header, "{s}=v2.{d}.{d}.{s}.{s}", .{ cookie_name, self.keys[0].id, expiry, payload, csrf }) catch unreachable;
-            } else std.fmt.bufPrint(&header, "{s}=v1.{d}.{d}.{s}", .{ cookie_name, self.keys[0].id, expiry, payload }) catch unreachable;
+            const prefix = if (flash_raw.len > 0) blk: {
+                var encoded_flash: [base64.Encoder.calcSize(flash.max_bytes)]u8 = undefined;
+                const flash_text = base64.Encoder.encode(&encoded_flash, flash_raw);
+                break :blk std.fmt.bufPrint(&header, "{s}=v3.{d}.{d}.{s}.{s}.{s}", .{ cookie_name, self.keys[0].id, expiry, payload, csrf, flash_text }) catch unreachable;
+            } else if (state.csrf_present)
+                std.fmt.bufPrint(&header, "{s}=v2.{d}.{d}.{s}.{s}", .{ cookie_name, self.keys[0].id, expiry, payload, csrf }) catch unreachable
+            else
+                std.fmt.bufPrint(&header, "{s}=v1.{d}.{d}.{s}", .{ cookie_name, self.keys[0].id, expiry, payload }) catch unreachable;
             const signed = prefix[cookie_name.len + 1 ..];
             var mac: [Hmac.mac_length]u8 = undefined;
             Hmac.create(&mac, signed, self.keys[0].secret);
@@ -114,12 +135,15 @@ pub const Sessions = struct {
         if (value_bytes.len > max_cookie_bytes) return;
         var parts = std.mem.splitScalar(u8, value_bytes, '.');
         const version = parts.next() orelse return;
-        const has_csrf = std.mem.eql(u8, version, "v2");
+        // v2 adds a CSRF secret; v3 adds an optional CSRF secret and flash.
+        const has_flash = std.mem.eql(u8, version, "v3");
+        const has_csrf = has_flash or std.mem.eql(u8, version, "v2");
         if (!has_csrf and !std.mem.eql(u8, version, "v1")) return;
         const id_text = parts.next() orelse return;
         const expiry_text = parts.next() orelse return;
         const payload_text = parts.next() orelse return;
         const csrf_text = if (has_csrf) parts.next() orelse return else "";
+        const flash_text = if (has_flash) parts.next() orelse return else "";
         const mac_text = parts.next() orelse return;
         if (parts.next() != null) return;
         const id = std.fmt.parseInt(u8, id_text, 10) catch return;
@@ -139,11 +163,21 @@ pub const Sessions = struct {
         const payload_size = base64.Decoder.calcSizeForSlice(payload_text) catch return;
         if (payload_size > max_payload_bytes) return;
         base64.Decoder.decode(state.bytes[0..payload_size], payload_text) catch return;
-        if (has_csrf) {
+        // Commit nothing until every field decodes, so a rejected cookie
+        // leaves an empty session.
+        const csrf_present = has_csrf and !(has_flash and csrf_text.len == 0);
+        if (csrf_present) {
             if (csrf_text.len != base64.Encoder.calcSize(32)) return;
             base64.Decoder.decode(&state.csrf_secret, csrf_text) catch return;
-            state.csrf_present = true;
         }
+        if (has_flash) {
+            const flash_size = base64.Decoder.calcSizeForSlice(flash_text) catch return;
+            if (flash_size > flash.max_bytes) return;
+            var flash_bytes: [flash.max_bytes]u8 = undefined;
+            base64.Decoder.decode(flash_bytes[0..flash_size], flash_text) catch return;
+            if (!state.flash.load(flash_bytes[0..flash_size])) return;
+        }
+        state.csrf_present = csrf_present;
         state.len = payload_size;
     }
 };

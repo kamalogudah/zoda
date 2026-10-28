@@ -118,7 +118,7 @@ test "ADR section 5 examples: routing, plugin state, ownership, timing" {
     }
 }
 
-// README "Request IDs and access logs": the same registration, compiled here.
+// PLUGINS.md "Request IDs and access logs": the same registration, compiled here.
 const TraceLog = struct {
     count: usize = 0,
     last_status: ?u16 = null,
@@ -141,7 +141,7 @@ fn traceRoute(ctx: *TraceApp.Context, req: *zoda.router.Request, res: *zoda.resp
     if (req.isRoot() and req.isGet()) return res.text(200, ctx.state.trace.id());
 }
 
-test "README request trace example" {
+test "PLUGINS request trace example" {
     var log: TraceLog = .{};
     var app = try TraceApp.init(std.testing.allocator, .{
         .response_allocator = std.testing.allocator,
@@ -168,7 +168,7 @@ test "README request trace example" {
     try std.testing.expectEqual(@as(?u16, 200), log.last_status);
 }
 
-// README "HTTP caching": explicit policy, validator, and conditional GET.
+// PLUGINS.md "HTTP caching": explicit policy, validator, and conditional GET.
 const http_cache = zoda.plugins.http_cache;
 const CachePlugins = struct {};
 const CacheApp = zoda.app.App(CachePlugins);
@@ -185,7 +185,7 @@ fn cacheRoute(_: *CacheApp.Context, req: *zoda.router.Request, res: *zoda.respon
     if (req.isLiteral("plain") and req.isGet()) return res.text(200, "no policy");
 }
 
-test "README HTTP caching example" {
+test "PLUGINS HTTP caching example" {
     var app = try CacheApp.init(std.testing.allocator, .{
         .response_allocator = std.testing.allocator,
         .plugins = .{},
@@ -222,4 +222,71 @@ test "README HTTP caching example" {
     var plain = try app.dispatch(&plain_req);
     defer plain.deinit();
     try std.testing.expect((try plain.getHeaderOne("Cache-Control")) == null);
+}
+
+// PLUGINS.md "Flash messages": register Sessions and Flash, queue a message on
+// POST, and read it once on the redirected GET. Both responses save.
+const FlashPlugins = struct { sessions: zoda.Sessions, flash: zoda.Flash = .{} };
+const FlashApp = zoda.app.App(FlashPlugins);
+
+fn flashClock() i64 {
+    return 1_700_000_000;
+}
+
+fn flashRoute(ctx: *FlashApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    const session = &ctx.state.sessions;
+    if (req.isLiteral("items") and req.method == .post) {
+        try ctx.plugins.flash.add(session, "notice", "Item created");
+        try ctx.plugins.sessions.save(session, res);
+        return res.redirectPath(.see_other, "/");
+    }
+    if (req.isRoot() and req.isGet()) {
+        var body: [zoda.plugins.flash.max_bytes]u8 = undefined;
+        var len: usize = 0;
+        var messages = ctx.plugins.flash.read(session);
+        while (messages.next()) |message| {
+            len += (try std.fmt.bufPrint(body[len..], "{s}: {s}\n", .{ message.kind, message.text })).len;
+        }
+        try ctx.plugins.sessions.save(session, res); // consume what was shown
+        return res.text(200, body[0..len]);
+    }
+}
+
+fn flashVisit(app: *const FlashApp, method: zoda.router.Method, target: []const u8, cookie: []const u8, cookie_out: []u8) !struct { zoda.response.Response, ?[]const u8 } {
+    var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
+    defer arena.deinit();
+    if (cookie.len > 0) try arena.copyHeaders(&.{.{ .name = "Cookie", .value = cookie }});
+    var req = arena.requestView(method);
+    const res = try app.dispatch(&req);
+    const set_cookie = (try res.getHeaderOne("Set-Cookie")) orelse return .{ res, null };
+    const value = set_cookie[0..std.mem.indexOfScalar(u8, set_cookie, ';').?];
+    @memcpy(cookie_out[0..value.len], value);
+    return .{ res, cookie_out[0..value.len] };
+}
+
+test "PLUGINS flash messages example" {
+    var app = try FlashApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{ .sessions = .{
+            .keys = &.{.{ .id = 1, .secret = "example-secret-of-at-least-32-bytes!" }},
+            .lifetime_seconds = 3600,
+            .now_seconds = flashClock,
+        } },
+        .route_fn = flashRoute,
+    });
+    defer app.deinit();
+    var first: [zoda.plugins.sessions.max_cookie_bytes]u8 = undefined;
+    var second: [zoda.plugins.sessions.max_cookie_bytes]u8 = undefined;
+
+    var created, const flash_cookie = try flashVisit(&app, .post, "/items", "", &first);
+    defer created.deinit();
+    try std.testing.expectEqual(@as(u16, 303), created.status_code);
+
+    var shown, const consumed_cookie = try flashVisit(&app, .get, "/", flash_cookie.?, &second);
+    defer shown.deinit();
+    try std.testing.expectEqualStrings("notice: Item created\n", shown.body);
+
+    var after, _ = try flashVisit(&app, .get, "/", consumed_cookie.?, &first);
+    defer after.deinit();
+    try std.testing.expectEqualStrings("", after.body);
 }

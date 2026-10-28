@@ -54,6 +54,8 @@ pub const plugins = struct {
     pub const sessions = @import("plugins/sessions.zig");
     /// Session-bound synchronizer token helpers.
     pub const csrf = @import("plugins/csrf.zig");
+    /// One-time flash messages stored in the cookie session.
+    pub const flash = @import("plugins/flash.zig");
     /// Application-validated Authorization Bearer credentials.
     pub const bearer_token = @import("plugins/bearer_token.zig");
     /// Request IDs and access records across the dispatch chain.
@@ -68,6 +70,7 @@ pub const Json = plugins.json.Json;
 /// Re-export the not-found wrapper instance type for convenience.
 pub const NotFound = plugins.not_found.NotFound;
 pub const Sessions = plugins.sessions.Sessions;
+pub const Flash = plugins.flash.Flash;
 pub const BearerToken = plugins.bearer_token.BearerToken;
 pub const RequestTrace = plugins.request_trace.RequestTrace;
 
@@ -90,6 +93,7 @@ comptime {
     std.testing.refAllDecls(plugins.not_found);
     std.testing.refAllDecls(plugins.sessions);
     std.testing.refAllDecls(plugins.csrf);
+    std.testing.refAllDecls(plugins.flash);
     std.testing.refAllDecls(plugins.bearer_token);
     std.testing.refAllDecls(plugins.request_trace);
     std.testing.refAllDecls(plugins.http_cache);

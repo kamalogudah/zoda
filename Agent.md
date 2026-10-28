@@ -2,6 +2,28 @@
 
 Instructions for coding agents (and people) working on Zoda.
 
+## Document every plugin
+
+[PLUGINS.md](PLUGINS.md) is the user-facing catalog of built-in plugins. The
+README keeps only a short [plugin system](README.md#plugins) overview and a
+one-line-per-plugin table that links to it. Whenever you add a plugin to
+`src/plugins/`, or change one's public behavior, in the same change:
+
+1. Add or update its section in `PLUGINS.md`: what it is for, how to register
+   it, a usage example, limits, ownership and lifetimes, error behavior, and
+   its interaction with sessions, short circuits, errors/recovery, and
+   middleware order, as it applies.
+2. Add a row to the catalog table at the top of `PLUGINS.md` and to the
+   built-in plugins table in the README's Plugins section. Do not put detailed
+   plugin docs in the README.
+3. Back the example with a compiling test in `examples/contract.zig` (or the
+   plugin's own tests for app-dispatch examples) and link to it.
+4. Export it from `src/root.zig`, record its support status in
+   `SUPPORTED_API.md`, and mark it available in the
+   [adding_plugins.md](adding_plugins.md) catalog if it is listed there.
+5. When a section moves, update every link to its old anchor
+   (`grep -rn "README.md#" --include=*.md .`).
+
 ## Keep the performance log current
 
 [performance_improvement.md](performance_improvement.md) is the single record

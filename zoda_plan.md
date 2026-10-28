@@ -1745,7 +1745,7 @@ payloads and cookie values, key rotation, and explicit `save`/`clear` operations
 Its tests cover round trips, tampering, invalid/expired/oversized and duplicate
 cookies, unsuitable configuration, key rotation, response header failure, and
 app dispatch with isolated state and a middleware short circuit.
-[`README.md`](README.md#cookie-sessions) documents setup, cookie policy, and
+[`README.md`](PLUGINS.md#cookie-sessions) documents setup, cookie policy, and
 the lack of confidentiality. CSRF remains separately tracked in
 [#34](https://github.com/kamalogudah/zoda/issues/34). Implementation and review:
 [PR #53](https://github.com/kamalogudah/zoda/pull/53).
@@ -1768,7 +1768,7 @@ issue dirties the session; the route explicitly calls `save`. Tests cover
 missing, invalid, duplicate, and cross-session tokens, a v1 upgrade, and an
 app dispatch integration example with explicit registered plugin/state access
 that proves rejected POSTs do not execute the protected action.
-[`README.md`](README.md#csrf-helpers) documents usage and the cookie policy.
+[`README.md`](PLUGINS.md#csrf-helpers) documents usage and the cookie policy.
 No conditional follow-up is required for the current buffered request API;
 applications parse their own form bodies and reject duplicate fields.
 Implementation and review: [PR #55](https://github.com/kamalogudah/zoda/pull/55).
@@ -1799,7 +1799,7 @@ Allocation-failure injection covers partial response construction.
 handler failure, and partial plugin initialization. The [`src/plugins/csrf.zig`](src/plugins/csrf.zig)
 integration test verifies session-backed token persistence and rejection of
 invalid submissions. These tests run in the pinned CI `zig build test` job.
-The public cookie policy is in [`README.md`](README.md#cookie-sessions). No
+The public cookie policy is in [`README.md`](PLUGINS.md#cookie-sessions). No
 conditional follow-up is required for the Phase 5 contract.
 
 Local validation on exact pinned Zig `0.16.0`: `zig fmt --check build.zig src`;
