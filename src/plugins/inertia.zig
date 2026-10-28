@@ -45,8 +45,15 @@
 //!   `deferredProps: {group: [names]}`. The client then requests each group
 //!   with a partial reload, which resolves them like `optional` props and
 //!   sends no `deferredProps`.
+//! - Merge props: `merge(prop)`, `prepend(prop)`, and `deepMerge(prop)` wrap
+//!   a plain, `optional`, or `deferred` prop. When the prop is in `props`,
+//!   its name is listed in `mergeProps`, `prependProps`, or `deepMergeProps`,
+//!   and each `.matchOn(key)` adds `name.key` to `matchPropsOn`. The client
+//!   merges them into its current props on a partial reload. Props named in
+//!   `X-Inertia-Reset` on such a reload are sent without the listing, so the
+//!   client replaces them.
 //!
-//! Not implemented: top-level `flash`, once/merge props, error bags,
+//! Not implemented: top-level `flash`, once and scroll props, error bags,
 //! history encryption, precognition, and server-side rendering.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
@@ -67,9 +74,11 @@ const http_cache = @import("http_cache.zig");
 pub const layout_marker = "@inertia";
 pub const html_content_type = "text/html; charset=utf-8";
 pub const max_root_id_bytes = 64;
-/// Most names one `X-Inertia-Partial-Data` or `-Except` field may list.
+/// Most names one `X-Inertia-Partial-Data`, `-Except`, or `X-Inertia-Reset`
+/// field may list.
 pub const max_partial_props = 64;
-/// Most bytes in one `X-Inertia-Partial-Data` or `-Except` value.
+/// Most bytes in one `X-Inertia-Partial-Data`, `-Except`, or
+/// `X-Inertia-Reset` value.
 pub const max_partial_bytes = 1024;
 
 pub const HeaderError = error{ DuplicateInertiaHeader, MalformedInertiaHeader, DuplicateVersionHeader };
@@ -185,7 +194,7 @@ pub fn deferredGroup(
 
 /// The prop type `always(value)` returns.
 pub fn Always(comptime T: type) type {
-    if (propKind(T) != .eager) @compileError("always() takes a plain value, not another prop wrapper");
+    if (propKind(T) != .eager or mergeMode(T) != null) @compileError("always() takes a plain value, not another prop wrapper");
     return struct {
         pub const inertia_prop: PropKind = .always;
 
@@ -198,8 +207,106 @@ pub fn always(value: anytype) Always(@TypeOf(value)) {
     return .{ .value = value };
 }
 
+/// How a merge prop combines with the client's current value on a partial
+/// reload of the same component. Otherwise the client replaces the value.
+pub const MergeMode = enum {
+    /// `mergeProps`: arrays are appended, objects shallow-merged.
+    append,
+    /// `prependProps`: arrays are prepended, objects shallow-merged.
+    prepend,
+    /// `deepMergeProps`: objects are merged recursively, arrays appended.
+    deep,
+};
+
+/// The prop type `merge`, `prepend`, and `deepMerge` return, wrapping the
+/// prop `T` (a plain value, `Optional`, or `Deferred`). Each `match_on` key
+/// is matched below the prop: one `[A-Za-z0-9_$-]` field name, or for
+/// `.deep` a dot path to an array field such as `data.id`.
+pub fn Mergeable(comptime mode: MergeMode, comptime T: type, comptime match_on: []const []const u8) type {
+    comptime {
+        if (mergeMode(T) != null) @compileError("merge props do not nest");
+        if (propKind(T) == .always) @compileError("always props cannot be merged");
+        if (mode != .deep and match_on.len > 1) @compileError("merge and prepend props match on one key");
+        for (match_on, 0..) |key, i| {
+            if (mode != .deep and std.mem.indexOfScalar(u8, key, '.') != null) {
+                @compileError("only deepMerge match keys may be dot paths");
+            }
+            var segments = std.mem.splitScalar(u8, key, '.');
+            while (segments.next()) |segment| {
+                if (segment.len == 0) @compileError("match keys are non-empty dot-separated names");
+                for (segment) |c| {
+                    if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '$')) {
+                        @compileError("match key \"" ++ key ++ "\" must use [A-Za-z0-9_$-]");
+                    }
+                }
+            }
+            for (match_on[0..i]) |earlier| {
+                if (std.mem.eql(u8, earlier, key)) @compileError("match key \"" ++ key ++ "\" is repeated");
+            }
+        }
+    }
+    return struct {
+        pub const inertia_merge: MergeMode = mode;
+        pub const inertia_match_on = match_on;
+        pub const Inner = T;
+
+        inner: T,
+
+        /// Merges array items whose `key` field is equal: the new item
+        /// replaces the current one in place instead of being added again.
+        pub fn matchOn(self: @This(), comptime key: []const u8) Mergeable(mode, T, match_on ++ .{key}) {
+            return .{ .inner = self.inner };
+        }
+    };
+}
+
+/// The prop type `merge(prop)` returns.
+pub fn Merge(comptime T: type) type {
+    return Mergeable(.append, T, &.{});
+}
+
+/// The prop type `prepend(prop)` returns.
+pub fn Prepend(comptime T: type) type {
+    return Mergeable(.prepend, T, &.{});
+}
+
+/// The prop type `deepMerge(prop)` returns.
+pub fn DeepMerge(comptime T: type) type {
+    return Mergeable(.deep, T, &.{});
+}
+
+/// A prop whose items a partial reload appends to the client's current
+/// array (or whose fields it adds to the current object). `prop` is a plain
+/// value, `optional(...)`, or `deferred(...)`.
+pub fn merge(prop: anytype) Merge(@TypeOf(prop)) {
+    return .{ .inner = prop };
+}
+
+/// Like `merge`, but new array items go before the current ones.
+pub fn prepend(prop: anytype) Prepend(@TypeOf(prop)) {
+    return .{ .inner = prop };
+}
+
+/// Like `merge`, but objects are merged recursively, so nested arrays are
+/// appended and nested fields kept.
+pub fn deepMerge(prop: anytype) DeepMerge(@TypeOf(prop)) {
+    return .{ .inner = prop };
+}
+
+pub fn mergeMode(comptime T: type) ?MergeMode {
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "inertia_merge")) return T.inertia_merge;
+    return null;
+}
+
+/// The prop a merge wrapper holds, or `T` itself.
+fn Unmerged(comptime T: type) type {
+    return if (mergeMode(T) != null) T.Inner else T;
+}
+
+/// The kind of `T`, or of the prop a merge wrapper holds.
 pub fn propKind(comptime T: type) PropKind {
-    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "inertia_prop")) return T.inertia_prop;
+    const U = Unmerged(T);
+    if (@typeInfo(U) == .@"struct" and @hasDecl(U, "inertia_prop")) return U.inertia_prop;
     return .eager;
 }
 
@@ -208,7 +315,7 @@ pub fn PropsError(comptime P: type) type {
     comptime var E = error{};
     inline for (std.meta.fields(P)) |field| {
         switch (comptime propKind(field.type)) {
-            .optional, .deferred => E = E || field.type.Error,
+            .optional, .deferred => E = E || Unmerged(field.type).Error,
             .eager, .always => {},
         }
     }
@@ -220,6 +327,8 @@ pub fn PropsError(comptime P: type) type {
 pub const Partial = struct {
     only: ?[]const u8 = null,
     except: ?[]const u8 = null,
+    /// `X-Inertia-Reset`: merge props the client replaces this time.
+    reset: ?[]const u8 = null,
 
     /// Reports whether the prop `name` belongs in the page. `partial` is null
     /// for a full visit.
@@ -231,6 +340,13 @@ pub const Partial = struct {
         // Only a whole top-level name removes a prop, so `a.b` keeps `a`.
         if (p.except) |list| if (listNames(list, name, .exact)) return false;
         return true;
+    }
+
+    /// Reports whether the merge prop `name` is sent without its merge
+    /// listing. Only a whole top-level name resets a prop.
+    pub fn resets(partial: ?Partial, name: []const u8) bool {
+        const p = partial orelse return false;
+        return listNames(p.reset orelse return false, name, .exact);
     }
 
     fn listNames(list: []const u8, name: []const u8, match: enum { exact, first_segment }) bool {
@@ -246,15 +362,16 @@ pub const Partial = struct {
     }
 };
 
-/// Reads the partial-reload headers of an Inertia request. All three are
-/// validated whatever the component; the result is null unless
-/// `X-Inertia-Partial-Component` equals `component`.
+/// Reads the partial-reload headers of an Inertia request, including
+/// `X-Inertia-Reset`. All four are validated whatever the component; the
+/// result is null unless `X-Inertia-Partial-Component` equals `component`.
 pub fn partialReload(req: *const router.Request, component: []const u8) PartialError!?Partial {
     const target = req.getHeaderOne("X-Inertia-Partial-Component") catch return error.DuplicatePartialHeader;
     const only = try partialList(req, "X-Inertia-Partial-Data");
     const except = try partialList(req, "X-Inertia-Partial-Except");
+    const reset = try partialList(req, "X-Inertia-Reset");
     if (!std.mem.eql(u8, target orelse return null, component)) return null;
-    return .{ .only = only, .except = except };
+    return .{ .only = only, .except = except, .reset = reset };
 }
 
 /// Accepts 1 to `max_partial_props` comma-separated names in at most
@@ -505,6 +622,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             json.endObject() catch return error.OutOfMemory;
             try writeField(json, "url", url);
             try writeField(json, "version", version);
+            try writeMerge(json, partial, shared != null, comptime mergeProps(P));
             // Only full visits announce deferred props; a partial reload
             // either resolves them or leaves them to the client.
             if (partial == null) try writeDeferred(json, shared != null, comptime deferredProps(P));
@@ -531,18 +649,91 @@ pub fn Inertia(comptime SharedProps: type) type {
                 for (std.meta.fields(T)) |field| {
                     if (propKind(field.type) != .deferred) continue;
                     if (is_shared and @hasField(P, field.name)) continue;
-                    if (std.mem.eql(u8, field.name, "errors")) @compileError("the errors prop cannot be deferred");
-                    // The client sends the name back in `X-Inertia-Partial-Data`.
-                    if (field.name.len == 0) @compileError("deferred prop names cannot be empty");
-                    for (field.name) |c| {
-                        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '$')) {
-                            @compileError("deferred prop \"" ++ field.name ++ "\" must be named with [A-Za-z0-9_$-]");
-                        }
-                    }
-                    found = found ++ .{DeferredProp{ .group = field.type.inertia_group, .name = field.name, .shared = is_shared }};
+                    checkListedName("deferred", field.name);
+                    found = found ++ .{DeferredProp{ .group = Unmerged(field.type).inertia_group, .name = field.name, .shared = is_shared }};
                 }
             }
             return found;
+        }
+
+        /// Checks the name of a prop the page lists by name. The client sends
+        /// it back in `X-Inertia-Partial-Data` and reads it as a dot path.
+        fn checkListedName(comptime what: []const u8, comptime name: []const u8) void {
+            if (std.mem.eql(u8, name, "errors")) @compileError("the errors prop cannot be " ++ what);
+            if (name.len == 0) @compileError(what ++ " prop names cannot be empty");
+            for (name) |c| {
+                if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '$')) {
+                    @compileError(what ++ " prop \"" ++ name ++ "\" must be named with [A-Za-z0-9_$-]");
+                }
+            }
+        }
+
+        const MergeProp = struct {
+            name: []const u8,
+            mode: MergeMode,
+            match_on: []const []const u8,
+            kind: PropKind,
+            shared: bool,
+        };
+
+        /// The merge props of a page with route props `P`, shared ones
+        /// first, leaving out shared props that a route prop overrides.
+        fn mergeProps(comptime P: type) []const MergeProp {
+            var found: []const MergeProp = &.{};
+            for (.{ SharedProps, P }, .{ true, false }) |T, is_shared| {
+                for (std.meta.fields(T)) |field| {
+                    const mode = mergeMode(field.type) orelse continue;
+                    if (is_shared and @hasField(P, field.name)) continue;
+                    checkListedName("merged", field.name);
+                    found = found ++ .{MergeProp{
+                        .name = field.name,
+                        .mode = mode,
+                        .match_on = field.type.inertia_match_on,
+                        .kind = propKind(field.type),
+                        .shared = is_shared,
+                    }};
+                }
+            }
+            return found;
+        }
+
+        /// Whether the merge prop is in `props` and not reset.
+        fn mergesProp(partial: ?Partial, has_shared: bool, comptime prop: MergeProp) bool {
+            if (prop.shared and !has_shared) return false;
+            return Partial.wants(partial, prop.name, prop.kind) and !Partial.resets(partial, prop.name);
+        }
+
+        /// Writes `mergeProps`, `prependProps`, `deepMergeProps`, and
+        /// `matchPropsOn` for the merge props this page sends, each as an
+        /// array of names in declaration order and left out when empty.
+        fn writeMerge(json: *std.json.Stringify, partial: ?Partial, has_shared: bool, comptime props: []const MergeProp) error{OutOfMemory}!void {
+            const lists = .{
+                .{ @as(?MergeMode, .append), "mergeProps" },
+                .{ @as(?MergeMode, .prepend), "prependProps" },
+                .{ @as(?MergeMode, .deep), "deepMergeProps" },
+                .{ @as(?MergeMode, null), "matchPropsOn" },
+            };
+            inline for (lists) |list| {
+                var started = false;
+                inline for (props) |prop| {
+                    const names: []const []const u8 = comptime if (list[0]) |mode|
+                        (if (prop.mode == mode) &.{prop.name} else &.{})
+                    else names: {
+                        var keys: []const []const u8 = &.{};
+                        for (prop.match_on) |key| keys = keys ++ .{prop.name ++ "." ++ key};
+                        break :names keys;
+                    };
+                    if (names.len != 0 and mergesProp(partial, has_shared, prop)) {
+                        if (!started) {
+                            json.objectField(list[1]) catch return error.OutOfMemory;
+                            json.beginArray() catch return error.OutOfMemory;
+                            started = true;
+                        }
+                        inline for (names) |name| json.write(name) catch return error.OutOfMemory;
+                    }
+                }
+                if (started) json.endArray() catch return error.OutOfMemory;
+            }
         }
 
         /// Writes `deferredProps` as `{group: [names]}` in first-seen group
@@ -588,10 +779,11 @@ pub fn Inertia(comptime SharedProps: type) type {
             const kind = comptime propKind(@TypeOf(value));
             const is_errors = comptime std.mem.eql(u8, name, "errors");
             if (!is_errors and !Partial.wants(partial, name, kind)) return;
+            const prop = if (comptime mergeMode(@TypeOf(value)) != null) value.inner else value;
             switch (kind) {
-                .eager => try writeField(json, name, value),
-                .always => try writeField(json, name, value.value),
-                .optional, .deferred => try writeField(json, name, try value.resolveIn(arena)),
+                .eager => try writeField(json, name, prop),
+                .always => try writeField(json, name, prop.value),
+                .optional, .deferred => try writeField(json, name, try prop.resolveIn(arena)),
             }
         }
 
@@ -1394,6 +1586,11 @@ test "malformed, duplicate, and oversized partial headers fail without changing 
         .{ "X-Inertia-Partial-Except", "a\"b", error.MalformedPartialHeader },
         .{ "X-Inertia-Partial-Data", too_many, error.PartialHeaderTooLarge },
         .{ "X-Inertia-Partial-Except", too_long, error.PartialHeaderTooLarge },
+        .{ "X-Inertia-Reset", "", error.MalformedPartialHeader },
+        .{ "X-Inertia-Reset", "todos,", error.MalformedPartialHeader },
+        .{ "X-Inertia-Reset", "todos filter", error.MalformedPartialHeader },
+        .{ "X-Inertia-Reset", too_many, error.PartialHeaderTooLarge },
+        .{ "X-Inertia-Reset", too_long, error.PartialHeaderTooLarge },
     };
     inline for (cases) |case| {
         // Lists are validated even when another component is named.
@@ -1421,6 +1618,7 @@ test "malformed, duplicate, and oversized partial headers fail without changing 
         &[_]router.Header{ .{ .name = "X-Inertia", .value = "true" }, .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" }, .{ .name = "x-inertia-partial-component", .value = "Todos/Index" } },
         partialHeaders("Todos/Index", &.{ .{ .name = "X-Inertia-Partial-Data", .value = "todos" }, .{ .name = "X-Inertia-Partial-Data", .value = "todos" } }),
         partialHeaders("Other", &.{ .{ .name = "X-Inertia-Partial-Except", .value = "a" }, .{ .name = "x-inertia-partial-except", .value = "b" } }),
+        partialHeaders("Todos/Index", &.{ .{ .name = "X-Inertia-Reset", .value = "todos" }, .{ .name = "x-inertia-reset", .value = "todos" } }),
     };
     inline for (duplicates) |headers| {
         var res = response.Response.init(testing.allocator);
@@ -1596,4 +1794,225 @@ test "deferred callback errors propagate and leave the response unchanged" {
     try plugin.render(&full, &res, "Dashboard", .{ .feed = deferred(&state, DeferredTest.fail) });
     try testing.expectEqual(@as(u16, 200), res.status_code);
     try testing.expect(std.mem.indexOf(u8, res.body, "\"deferredProps\":{\"default\":[\"feed\"]}") != null);
+}
+
+const MergeTest = struct {
+    const Item = struct { id: u32, text: []const u8 };
+    const Feed = struct { posts: []const Item, meta: struct { page: u32 } };
+
+    feed_calls: usize = 0,
+
+    fn feed(self: *MergeTest, _: std.mem.Allocator) Feed {
+        self.feed_calls += 1;
+        return .{ .posts = &.{.{ .id = 3, .text = "c" }}, .meta = .{ .page = 2 } };
+    }
+
+    fn fail(_: *MergeTest, _: std.mem.Allocator) error{FeedUnavailable}![]const Item {
+        return error.FeedUnavailable;
+    }
+
+    fn render(self: *MergeTest, headers: []const router.Header, res: *response.Response) !void {
+        const req = testRequest(.get, "/feed", headers);
+        try merge_plugin.render(&req, res, "Feed", .{
+            .title = "hi",
+            .items = merge(@as([]const Item, &.{.{ .id = 1, .text = "a" }})).matchOn("id"),
+            .alerts = prepend(@as([]const []const u8, &.{"new"})),
+            .feed = deepMerge(deferred(self, MergeTest.feed)).matchOn("posts.id"),
+            .tags = merge(@as([]const []const u8, &.{"zig"})),
+        });
+    }
+};
+
+const MergeShared = struct {
+    app_name: []const u8,
+    notices: Mergeable(.append, []const MergeTest.Item, &.{"id"}),
+};
+
+const merge_plugin: Inertia(MergeShared) = .{
+    .layout = test_layout,
+    .shared = .{ .value = .{
+        .app_name = "zoda",
+        .notices = merge(@as([]const MergeTest.Item, &.{.{ .id = 9, .text = "hello" }})).matchOn("id"),
+    } },
+};
+
+fn expectMergePage(comptime props: []const u8, comptime fields: []const u8, body: []const u8) !void {
+    try testing.expectEqualStrings(
+        "{\"component\":\"Feed\",\"props\":{" ++ props ++ "},\"url\":\"/feed\",\"version\":null," ++
+            fields ++ "\"sharedProps\":[\"app_name\",\"notices\"]}",
+        body,
+    );
+}
+
+test "merge, prepend, and deep merge props are listed with their match keys" {
+    var state: MergeTest = .{};
+    var json = response.Response.init(testing.allocator);
+    defer json.deinit();
+    try state.render(&inertia_headers, &json);
+    // `feed` is deferred, so a full visit neither sends nor lists it as merged.
+    try expectMergePage(
+        "\"app_name\":\"zoda\",\"notices\":[{\"id\":9,\"text\":\"hello\"}],\"title\":\"hi\",\"items\":[{\"id\":1,\"text\":\"a\"}]," ++
+            "\"alerts\":[\"new\"],\"tags\":[\"zig\"],\"errors\":{}",
+        "\"mergeProps\":[\"notices\",\"items\",\"tags\"],\"prependProps\":[\"alerts\"],\"matchPropsOn\":[\"notices.id\",\"items.id\"]," ++
+            "\"deferredProps\":{\"default\":[\"feed\"]},",
+        json.body,
+    );
+    try testing.expectEqual(@as(usize, 0), state.feed_calls);
+
+    // The shapes match `Page` in @inertiajs/core 3.9.1: each field is `string[]`.
+    const Page = struct {
+        mergeProps: []const []const u8,
+        prependProps: []const []const u8,
+        matchPropsOn: []const []const u8,
+        deepMergeProps: ?[]const []const u8 = null,
+    };
+    const parsed = try std.json.parseFromSlice(Page, testing.allocator, json.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqualStrings("items", parsed.value.mergeProps[1]);
+    try testing.expectEqual(@as(?[]const []const u8, null), parsed.value.deepMergeProps);
+
+    // The HTML shell lists them the same way.
+    var html = response.Response.init(testing.allocator);
+    defer html.deinit();
+    try state.render(&.{}, &html);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"mergeProps\":[\"notices\",\"items\",\"tags\"],\"prependProps\":[\"alerts\"]") != null);
+
+    // The deferred reload resolves `feed` and lists it for a deep merge,
+    // with the match key below the prop.
+    var loaded = response.Response.init(testing.allocator);
+    defer loaded.deinit();
+    try state.render(partialHeaders("Feed", &.{.{ .name = "X-Inertia-Partial-Data", .value = "feed" }}), &loaded);
+    try expectMergePage(
+        "\"feed\":{\"posts\":[{\"id\":3,\"text\":\"c\"}],\"meta\":{\"page\":2}},\"errors\":{}",
+        "\"deepMergeProps\":[\"feed\"],\"matchPropsOn\":[\"feed.posts.id\"],",
+        loaded.body,
+    );
+    try testing.expectEqual(@as(usize, 1), state.feed_calls);
+}
+
+test "partial reloads list only the merge props they send" {
+    var state: MergeTest = .{};
+    var only = response.Response.init(testing.allocator);
+    defer only.deinit();
+    try state.render(partialHeaders("Feed", &.{.{ .name = "X-Inertia-Partial-Data", .value = "items,title" }}), &only);
+    try expectMergePage(
+        "\"title\":\"hi\",\"items\":[{\"id\":1,\"text\":\"a\"}],\"errors\":{}",
+        "\"mergeProps\":[\"items\"],\"matchPropsOn\":[\"items.id\"],",
+        only.body,
+    );
+
+    var except = response.Response.init(testing.allocator);
+    defer except.deinit();
+    try state.render(partialHeaders("Feed", &.{.{ .name = "X-Inertia-Partial-Except", .value = "app_name,notices,items,feed,tags" }}), &except);
+    try expectMergePage("\"title\":\"hi\",\"alerts\":[\"new\"],\"errors\":{}", "\"prependProps\":[\"alerts\"],", except.body);
+
+    // Nothing merged in the response, so no merge fields at all.
+    var plain = response.Response.init(testing.allocator);
+    defer plain.deinit();
+    try state.render(partialHeaders("Feed", &.{.{ .name = "X-Inertia-Partial-Data", .value = "title" }}), &plain);
+    try expectMergePage("\"title\":\"hi\",\"errors\":{}", "", plain.body);
+    try testing.expectEqual(@as(usize, 0), state.feed_calls);
+}
+
+test "X-Inertia-Reset sends the listed props without merge metadata" {
+    var state: MergeTest = .{};
+    // What `router.reload({ reset: ['items', 'feed'] })` sends: the reset
+    // names are also in `-Data`.
+    var reset = response.Response.init(testing.allocator);
+    defer reset.deinit();
+    try state.render(partialHeaders("Feed", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "items,feed,notices" },
+        .{ .name = "X-Inertia-Reset", .value = "items,feed,title,missing" },
+    }), &reset);
+    try expectMergePage(
+        "\"notices\":[{\"id\":9,\"text\":\"hello\"}],\"items\":[{\"id\":1,\"text\":\"a\"}]," ++
+            "\"feed\":{\"posts\":[{\"id\":3,\"text\":\"c\"}],\"meta\":{\"page\":2}},\"errors\":{}",
+        "\"mergeProps\":[\"notices\"],\"matchPropsOn\":[\"notices.id\"],",
+        reset.body,
+    );
+    try testing.expectEqual(@as(usize, 1), state.feed_calls);
+
+    // Only whole top-level names reset a prop.
+    var dotted = response.Response.init(testing.allocator);
+    defer dotted.deinit();
+    try state.render(partialHeaders("Feed", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "items" },
+        .{ .name = "X-Inertia-Reset", .value = "items.id" },
+    }), &dotted);
+    try testing.expect(std.mem.indexOf(u8, dotted.body, "\"mergeProps\":[\"items\"]") != null);
+
+    // The client merges only on a partial reload of the same component, so
+    // a reset for another component, or with no component, changes nothing.
+    var full = response.Response.init(testing.allocator);
+    defer full.deinit();
+    try state.render(&inertia_headers, &full);
+    inline for (.{
+        partialHeaders("Other", &.{.{ .name = "X-Inertia-Reset", .value = "items,tags,notices,alerts" }}),
+        &[_]router.Header{ .{ .name = "X-Inertia", .value = "true" }, .{ .name = "X-Inertia-Reset", .value = "items" } },
+    }) |headers| {
+        var other = response.Response.init(testing.allocator);
+        defer other.deinit();
+        try state.render(headers, &other);
+        try testing.expectEqualStrings(full.body, other.body);
+    }
+    // Ordinary HTML visits ignore it, even malformed.
+    var html = response.Response.init(testing.allocator);
+    defer html.deinit();
+    try state.render(&.{.{ .name = "X-Inertia-Reset", .value = ",," }}, &html);
+    try testing.expectEqualStrings(html_content_type, html.content_type);
+}
+
+test "route props override shared merge props and unset shared ones are not listed" {
+    const req = testRequest(.get, "/feed", &inertia_headers);
+    var overridden = response.Response.init(testing.allocator);
+    defer overridden.deinit();
+    try merge_plugin.render(&req, &overridden, "Feed", .{ .notices = prepend(@as([]const u32, &.{1})) });
+    try expectMergePage(
+        "\"app_name\":\"zoda\",\"notices\":[1],\"errors\":{}",
+        "\"prependProps\":[\"notices\"],",
+        overridden.body,
+    );
+
+    const unset: Inertia(MergeShared) = .{ .layout = test_layout };
+    var route_only = response.Response.init(testing.allocator);
+    defer route_only.deinit();
+    try unset.render(&req, &route_only, "Feed", .{ .more = deepMerge(.{ .a = @as(u32, 1) }) });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Feed\",\"props\":{\"more\":{\"a\":1},\"errors\":{}},\"url\":\"/feed\",\"version\":null,\"deepMergeProps\":[\"more\"]}",
+        route_only.body,
+    );
+}
+
+test "optional merge props resolve only when sent and their errors propagate" {
+    var state: MergeTest = .{};
+    const Plain = struct {
+        fn items(_: void, _: std.mem.Allocator) []const u32 {
+            return &.{ 4, 5 };
+        }
+    };
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const full = testRequest(.get, "/feed", &inertia_headers);
+    var skipped = response.Response.init(testing.allocator);
+    defer skipped.deinit();
+    try plugin.render(&full, &skipped, "Feed", .{ .items = merge(optional({}, Plain.items)), .bad = merge(optional(&state, MergeTest.fail)) });
+    try testing.expectEqualStrings("{\"component\":\"Feed\",\"props\":{\"errors\":{}},\"url\":\"/feed\",\"version\":null}", skipped.body);
+
+    // What `router.reload({ only: ['items'] })` for the next page sends.
+    const next = testRequest(.get, "/feed?page=2", partialHeaders("Feed", &.{.{ .name = "X-Inertia-Partial-Data", .value = "items" }}));
+    var page = response.Response.init(testing.allocator);
+    defer page.deinit();
+    try plugin.render(&next, &page, "Feed", .{ .items = merge(optional({}, Plain.items)), .bad = merge(optional(&state, MergeTest.fail)) });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Feed\",\"props\":{\"items\":[4,5],\"errors\":{}},\"url\":\"/feed?page=2\",\"version\":null,\"mergeProps\":[\"items\"]}",
+        page.body,
+    );
+
+    const failing = testRequest(.get, "/feed", partialHeaders("Feed", &.{.{ .name = "X-Inertia-Partial-Data", .value = "bad" }}));
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try res.text(201, "keep");
+    try testing.expectError(error.FeedUnavailable, plugin.render(&failing, &res, "Feed", .{ .bad = merge(optional(&state, MergeTest.fail)) }));
+    try testing.expectEqual(@as(u16, 201), res.status_code);
+    try testing.expectEqualStrings("keep", res.body);
+    try testing.expectEqual(@as(usize, 0), res.header_count);
 }

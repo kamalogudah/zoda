@@ -662,6 +662,9 @@ layout or root id before the first request; `render` checks again.
     are sent; see [Partial reloads](#partial-reloads).
   - Props wrapped in `deferred` are left out of the first response and
     listed in `deferredProps`; see [Deferred props](#deferred-props).
+  - Props wrapped in `merge`, `prepend`, or `deepMerge` are listed in
+    `mergeProps`, `prependProps`, or `deepMergeProps` so a partial reload
+    adds to them; see [Merge props](#merge-props).
   - Nested empty values need a named type: in Zig an empty `.{}` literal is
     a tuple and serializes as `[]`. Pass a named empty struct such as
     `struct {}{}` for an empty nested object. Tuples with values are a
@@ -743,13 +746,14 @@ return ctx.plugins.inertia.render(req, res, "Reports/Index", .{
   example `stats: zoda.plugins.inertia.Optional(*Stats, Stats.compute)` and
   `auth: zoda.plugins.inertia.Always([]const u8)`, initialized as
   `.{ .value = "..." }`.
-- **Headers.** Each list holds 1 to `max_partial_props` (64)
+- **Headers.** Each list (including `X-Inertia-Reset`; see
+  [Merge props](#merge-props)) holds 1 to `max_partial_props` (64)
   comma-separated names in at most `max_partial_bytes` (1024) bytes; larger
   lists return `error.PartialHeaderTooLarge`. A name is one or more
   non-empty `.`-separated segments of `[A-Za-z0-9_$-]`; an empty item,
   whitespace, or any other byte returns `error.MalformedPartialHeader`.
-  A repeated `X-Inertia-Partial-*` field returns
-  `error.DuplicatePartialHeader`. On Inertia visits all three are checked
+  A repeated `X-Inertia-Partial-*` or `X-Inertia-Reset` field returns
+  `error.DuplicatePartialHeader`. On Inertia visits all four are checked
   even when the component does not match. These failures leave the response
   unchanged.
 - **Caching.** Partial and full responses share `Vary: X-Inertia`; no
@@ -809,6 +813,66 @@ return ctx.plugins.inertia.render(req, res, "Dashboard", .{
   so `always(deferred(...))` is rejected; wrappers do not nest.
 - **Request headers.** Deferred loading adds no headers of its own; the
   partial-reload header rules and errors apply unchanged.
+
+### Merge props
+
+A merge prop is added to the value the client already has instead of
+replacing it, for "load more" lists and infinite feeds. The client merges
+only on a partial reload of the same component; full visits replace every
+prop as usual.
+
+```zig
+const inertia = zoda.plugins.inertia;
+return ctx.plugins.inertia.render(req, res, "Messages/Index", .{
+    .page = page,
+    // A reload with `only: ['messages']` appends; an item with an
+    // `id` the client already has replaces it in place.
+    .messages = inertia.merge(pages[page - 1]).matchOn("id"),
+    // Deferred, then deep-merged into the current object.
+    .activity = inertia.deepMerge(inertia.deferred({}, Activity.load)),
+});
+```
+
+```js
+router.reload({ data: { page: page + 1 }, only: ['messages', 'page'] })
+router.reload({ only: ['messages'], reset: ['messages'] }) // start over
+```
+
+- **Wrappers.** `merge(prop)` appends arrays, `prepend(prop)` puts new items
+  first, and `deepMerge(prop)` merges objects recursively, appending nested
+  arrays. Objects are shallow-merged by `merge` and `prepend`. `prop` is a
+  plain value, an `optional(...)`, or a `deferred(...)` prop, which keeps
+  its own rules: an optional merge prop is resolved only when a reload asks
+  for it, and a deferred one is left out of full visits, listed in
+  `deferredProps`, and merged when its group loads. The types are
+  `Merge(T)`, `Prepend(T)`, and `DeepMerge(T)`, or
+  `Mergeable(mode, T, match_on)` with match keys, for `SharedProps`
+  fields, for example
+  `notices: zoda.plugins.inertia.Mergeable(.append, []const Notice, &.{"id"})`.
+- **Page fields.** After `version`, the page lists the props it sends that
+  are wrapped: `"mergeProps"`, `"prependProps"`, and `"deepMergeProps"`,
+  each an array of names in declaration order (shared props first). Props
+  left out by the partial-reload lists, deferred props on a full visit,
+  and shared props overridden by a route prop or not configured are not
+  listed. A field with no names is left out.
+- **Match keys.** `.matchOn(key)` adds `"<name>.<key>"` to `matchPropsOn`.
+  The client then replaces an existing array item whose `key` field equals
+  a new item's instead of adding a duplicate (`prepend` moves it to the
+  front). `merge` and `prepend` take one field name. `deepMerge` takes a dot
+  path to an array below the prop, such as `.matchOn("posts.id")` for
+  `feed.posts`, and may be called more than once.
+- **Reset.** `router.reload({ reset: ['messages'] })` sends
+  `X-Inertia-Reset: messages` (and lists the name in `-Data`). On a partial
+  reload of the rendered component, a reset prop is sent without its merge
+  listing or match keys, so the client replaces it. Only whole top-level
+  names count; names that are not merge props are ignored. On other visits
+  the header is validated but changes nothing, because the client would
+  not merge anyway. It follows the partial-list rules and errors above.
+- **Rules checked at compile time.** `errors` cannot be merged. A merge
+  prop's name must be non-empty `[A-Za-z0-9_$-]`, since the client reads it
+  as a dot path. Match-key segments use the same bytes, are not repeated,
+  and only `deepMerge` keys may contain `.`. Merge wrappers do not nest and
+  do not take `always(...)`, and `always` does not take a merge prop.
 
 ### URL and origin policy
 
@@ -891,7 +955,9 @@ The features not yet implemented are tracked in
 | Top-level `flash` | Not implemented: the client defaults it to `{}`. Pass flash messages as props, as the example's README describes. |
 | Optional props (`optional`) and always props (`always`) | Implemented |
 | Deferred props (`deferred`, `deferredGroup`, `deferredProps`) | Implemented, including groups and shared deferred props |
-| Once, merge, and scroll props | Not implemented |
+| Merge props (`merge`, `prepend`, `deepMerge`, `matchOn`; `mergeProps`, `prependProps`, `deepMergeProps`, `matchPropsOn`) | Implemented, including optional, deferred, and shared merge props |
+| Reset (`X-Inertia-Reset`) | Implemented: listed props are sent without merge metadata on partial reloads of the rendered component |
+| Once and scroll props | Not implemented |
 | Error bags (`X-Inertia-Error-Bag`) | Not implemented: the header is ignored |
 | History encryption (`encryptHistory`, `clearHistory`) | Not implemented: never sent, so off |
 | Precognition validation | Not implemented |

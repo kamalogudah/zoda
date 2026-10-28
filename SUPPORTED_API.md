@@ -155,11 +155,16 @@ runs inside `zig build test`.
   `deferredGroup(group, context, resolve)` props are left out of full visits
   without calling `resolve` and listed as `deferredProps: {group: [names]}`
   (route and shared props); a partial reload resolves them like `optional`
-  props and sends no `deferredProps`. Lists are bounded by
-  `max_partial_props` and `max_partial_bytes`; malformed, oversized, or
-  duplicate partial headers return errors. Top-level `flash`,
-  once/merge props, error bags, history encryption, precognition, and SSR
-  are not implemented. See
+  props and sends no `deferredProps`. `merge(prop)`, `prepend(prop)`, and
+  `deepMerge(prop)` wrap a plain, `optional`, or `deferred` prop; when it is
+  sent, its name is listed in `mergeProps`, `prependProps`, or
+  `deepMergeProps`, and each `.matchOn(key)` adds `name.key` to
+  `matchPropsOn`. On a partial reload of the rendered component, props named
+  in `X-Inertia-Reset` are sent without that metadata. Lists (including
+  `X-Inertia-Reset`) are bounded by `max_partial_props` and
+  `max_partial_bytes`; malformed, oversized, or duplicate partial headers
+  return errors. Top-level `flash`, once and scroll props, error bags,
+  history encryption, precognition, and SSR are not implemented. See
   [PLUGINS.md](PLUGINS.md#inertiajs).
 - `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
   local-path rules without changing a response.

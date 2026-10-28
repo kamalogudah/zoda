@@ -524,6 +524,36 @@ fn inertiaDashboardRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, re
     }
 }
 
+// PLUGINS.md "Merge props".
+const InertiaMessages = struct {
+    const Message = struct { id: u32, text: []const u8 };
+    const pages = [_][]const Message{
+        &.{ .{ .id = 1, .text = "hi" }, .{ .id = 2, .text = "yo" } },
+        &.{.{ .id = 3, .text = "hey" }},
+    };
+
+    fn activity(_: void, _: std.mem.Allocator) struct { events: []const u32 } {
+        return .{ .events = &.{7} };
+    }
+};
+
+fn inertiaMessagesRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.onLiteral("messages") and req.isRoot() and req.isGet()) {
+        const raw = (req.getOne("page") catch null) orelse "1";
+        const page = std.fmt.parseInt(usize, raw, 10) catch 0;
+        if (page < 1 or page > InertiaMessages.pages.len) return res.text(404, "No such page");
+        const inertia = zoda.plugins.inertia;
+        return ctx.plugins.inertia.render(req, res, "Messages/Index", .{
+            .page = page,
+            // A reload with `only: ['messages']` appends; an item with an
+            // `id` the client already has replaces it in place.
+            .messages = inertia.merge(InertiaMessages.pages[page - 1]).matchOn("id"),
+            // Deferred, then deep-merged into the current object.
+            .activity = inertia.deepMerge(inertia.deferred({}, InertiaMessages.activity)),
+        });
+    }
+}
+
 fn inertiaVisit(app: *const InertiaApp, method: zoda.router.Method, target: []const u8, headers: []const zoda.request.Header) !zoda.response.Response {
     var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
     defer arena.deinit();
@@ -621,5 +651,59 @@ test "PLUGINS Inertia.js deferred props example" {
     try std.testing.expectEqualStrings(
         "{\"component\":\"Dashboard\",\"props\":{\"feed\":[6],\"errors\":{}},\"url\":\"/dashboard\",\"version\":null}",
         social.body,
+    );
+}
+
+test "PLUGINS Inertia.js merge props example" {
+    var app = try InertiaApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{ .inertia = .{ .layout = inertia_layout } },
+        .route_fn = inertiaMessagesRoute,
+    });
+    defer app.deinit();
+
+    var full = try inertiaVisit(&app, .get, "/messages", &.{.{ .name = "X-Inertia", .value = "true" }});
+    defer full.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Messages/Index\",\"props\":{\"page\":1,\"messages\":[{\"id\":1,\"text\":\"hi\"},{\"id\":2,\"text\":\"yo\"}],\"errors\":{}}," ++
+            "\"url\":\"/messages\",\"version\":null,\"mergeProps\":[\"messages\"],\"matchPropsOn\":[\"messages.id\"],\"deferredProps\":{\"default\":[\"activity\"]}}",
+        full.body,
+    );
+
+    // `router.reload({ data: { page: 2 }, only: ['messages', 'page'] })`.
+    var next = try inertiaVisit(&app, .get, "/messages?page=2", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Messages/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "messages,page" },
+    });
+    defer next.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Messages/Index\",\"props\":{\"page\":2,\"messages\":[{\"id\":3,\"text\":\"hey\"}],\"errors\":{}}," ++
+            "\"url\":\"/messages?page=2\",\"version\":null,\"mergeProps\":[\"messages\"],\"matchPropsOn\":[\"messages.id\"]}",
+        next.body,
+    );
+
+    // `router.reload({ reset: ['messages'] })` replaces the list instead.
+    var reset = try inertiaVisit(&app, .get, "/messages", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Messages/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "messages" },
+        .{ .name = "X-Inertia-Reset", .value = "messages" },
+    });
+    defer reset.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Messages/Index\",\"props\":{\"messages\":[{\"id\":1,\"text\":\"hi\"},{\"id\":2,\"text\":\"yo\"}],\"errors\":{}},\"url\":\"/messages\",\"version\":null}",
+        reset.body,
+    );
+
+    var activity = try inertiaVisit(&app, .get, "/messages", &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Messages/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "activity" },
+    });
+    defer activity.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Messages/Index\",\"props\":{\"activity\":{\"events\":[7]},\"errors\":{}},\"url\":\"/messages\",\"version\":null,\"deepMergeProps\":[\"activity\"]}",
+        activity.body,
     );
 }
