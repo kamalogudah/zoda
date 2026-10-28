@@ -293,7 +293,7 @@ pub fn App(comptime Plugins: type) type {
             errdefer res.deinit();
             try self.runFrom(0, &ctx, req, &res);
             // A middleware short circuit can leave the response unhandled.
-            if (!res.handled) try res.text(404, "Not Found");
+            if (!res.handled) try res.defaultNotFound();
             return res;
         }
 
@@ -308,7 +308,7 @@ pub fn App(comptime Plugins: type) type {
                 // Terminal continuation: route, then the default 404 before
                 // control returns to middleware.
                 try self.route_fn(ctx, req, res);
-                if (!res.handled) try res.text(404, "Not Found");
+                if (!res.handled) try res.defaultNotFound();
                 return;
             }
             const entry = self.middleware[index];

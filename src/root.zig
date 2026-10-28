@@ -64,6 +64,10 @@ pub const plugins = struct {
     pub const request_trace = @import("plugins/request_trace.zig");
     /// Explicit Cache-Control, ETag, Vary, and conditional GET helpers.
     pub const http_cache = @import("plugins/http_cache.zig");
+    /// Configured responses for selected empty or generated 4xx/5xx statuses.
+    pub const status_handler = @import("plugins/status_handler.zig");
+    /// Recovery middleware that clears partial responses before replacement.
+    pub const error_handler = @import("plugins/error_handler.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
@@ -101,6 +105,8 @@ comptime {
     std.testing.refAllDecls(plugins.bearer_token);
     std.testing.refAllDecls(plugins.request_trace);
     std.testing.refAllDecls(plugins.http_cache);
+    std.testing.refAllDecls(plugins.status_handler);
+    std.testing.refAllDecls(plugins.error_handler);
 }
 
 test {

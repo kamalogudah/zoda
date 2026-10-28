@@ -379,6 +379,7 @@ Built-in plugins:
 | `zoda.Flash` | One-time messages carried in the session |
 | `zoda.plugins.http_cache` | Explicit `Cache-Control`, `ETag`, `Vary`, and conditional GET |
 | `zoda.RequestTrace` | Request IDs and one access record per request |
+| `zoda.plugins.status_handler`, `zoda.plugins.error_handler` | Configured error pages and error recovery middleware |
 
 **See [PLUGINS.md](PLUGINS.md) for detailed usage and examples of every
 plugin.**
@@ -434,7 +435,8 @@ defer app.deinit();
   through a copy, returns `error.NextAlreadyCalled` without running anything
   again.
 - Errors propagate through middleware to `dispatch`. Put cleanup in `defer`.
-  To recover from an error, call `res.clear()` before writing a replacement.
+  To recover from an error, call `res.clear()` before writing a replacement,
+  or register [`error_handler`](PLUGINS.md#status-and-error-handlers).
 - Each request gets its own continuation frames, including a request
   dispatched from inside middleware. Concurrent requests do not share them.
 - Do not store `next`, return it, or call it after your function returns or

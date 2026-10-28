@@ -16,6 +16,7 @@ documented beside its code in `src/plugins/`, and its support status is in
 | Flash messages | `flash: zoda.Flash = .{}` next to `Sessions` | Registered instance over session state | [Flash messages](#flash-messages) |
 | HTTP caching | `zoda.plugins.http_cache` functions | Explicit response helpers | [HTTP caching](#http-caching) |
 | Request IDs and access logs | `trace: zoda.RequestTrace` + middleware entry | Registered instance with request state and middleware | [Request IDs and access logs](#request-ids-and-access-logs) |
+| Status and error handlers | `zoda.plugins.status_handler` / `error_handler` middleware entries | Middleware | [Status and error handlers](#status-and-error-handlers) |
 
 Core middleware that is not a plugin (host authorization, default response
 headers, response timing, and static files) is documented in the
@@ -383,3 +384,95 @@ registration.
   data. A custom `IdSource.custom` and the sink are called from concurrent
   requests, so both must be thread-safe. Sinks cannot fail; handle write errors
   inside the callback.
+
+## Status and error handlers
+
+Two middleware entries replace selected responses and recover errors.
+`zoda.plugins.status_handler` runs a configured handler for selected 4xx or
+5xx statuses. `zoda.plugins.error_handler` catches errors from the rest of the
+chain, clears the partial response, and writes a replacement.
+
+```zig
+const status_handler = zoda.plugins.status_handler;
+const error_handler = zoda.plugins.error_handler;
+
+fn notFoundPage(_: *App.Context, _: *zoda.router.Request, res: *zoda.response.Response) !void {
+    try res.text(404, "Page not found");
+}
+
+fn serverErrorPage(_: *App.Context, _: *zoda.router.Request, res: *zoda.response.Response) !void {
+    try res.text(500, "Something went wrong");
+}
+
+fn logError(_: *App.Context, req: *zoda.router.Request, _: *zoda.response.Response, err: anyerror) !void {
+    std.log.err("{s} failed: {t}", .{ req.target, err });
+    // Writing nothing leaves the generated 500 for the status handler.
+}
+
+// Both configs are borrowed and must outlive the app.
+const pages = status_handler.Config(App){ .handlers = &.{
+    .{ .status = 404, .run = notFoundPage },
+    .{ .status = 500, .run = serverErrorPage },
+} };
+const recovery = error_handler.Config(App){ .handler = logError };
+
+var app = try App.init(gpa, .{
+    .response_allocator = gpa,
+    .plugins = .{},
+    .route_fn = route,
+    .middleware = &.{
+        try status_handler.middleware(App, &pages), // validates the config
+        error_handler.middleware(App, &recovery),
+        zoda.static.middleware(App, &static_config),
+    },
+});
+```
+
+The [compiling contract example](examples/contract.zig) uses the same
+registration and checks each outcome below.
+
+- **Precedence.** For one request, from innermost to outermost:
+  1. The route (or a route wrapper such as `NotFound`) writes a response.
+  2. If the response is still unhandled, dispatch writes the default
+     `404 Not Found` before middleware unwinds.
+  3. If anything downstream fails, `error_handler` clears the partial response
+     and writes its replacement.
+  4. `status_handler` replaces a response whose status it selects, but only
+     when the body is empty or framework-generated. The default 404 and the
+     recovery 500 are generated; a body written by a route, `NotFound`, static
+     files, or middleware is not, so it wins. For example, `res.text(404, "")`
+     is replaced and `res.text(404, "this report was removed")` is kept.
+     `Response.generated` reports which case applies.
+- **Coverage.** Each entry covers only what runs after it: inner middleware,
+  static files, route wrappers, the route, and the default 404. A silent inner
+  short circuit is turned into the generated 404 and handled. A short circuit
+  or error in an entry registered before these is not covered, and dispatch's
+  final 404 after an outer short circuit is not handled.
+- **Order between the two.** Put `status_handler` outside `error_handler`, as
+  above, to render one error page for both recovered errors and error statuses.
+  Its own handler errors then propagate to the transport, which sends a
+  generic 500. Put it inside to have `error_handler` recover status-handler
+  failures; the recovery 500 is then not styled.
+- **Status handlers.** A handler has the route signature. It receives the
+  matched response with its status and headers. Writing with `text`,
+  `replaceJson`, or another helper replaces the body, status, and content
+  type and keeps headers such as `WWW-Authenticate`. Writing nothing keeps the
+  matched response. Handlers run once and are not re-matched against the
+  status they write. Only distinct statuses from 400 to 599 are accepted, so
+  redirects and bodyless 1xx, 204, and 304 responses are never replaced.
+  Errors from downstream propagate without running a status handler.
+- **Recovery.** `error_handler` calls `res.clear()` before the handler, so
+  nothing from the failed attempt survives: no partial body, status, or
+  headers, including `Set-Cookie`. A handler that needs a session change must
+  make it again (for example `Flash.reset` and a save). If the handler writes
+  nothing, or none is configured, the response is a generated
+  `500 Internal Server Error`. Errors from the handler propagate. Middleware
+  outside the entry sees a recovery as a success, so its post-processing runs.
+- **Errors that are not recovered.** By default, `error.OutOfMemory`,
+  `error.Canceled`, and the transport failures `ReadFailed`, `WriteFailed`,
+  `BrokenPipe`, `ConnectionResetByPeer`, and `ConnectionTimedOut` propagate
+  unchanged (`error_handler.default_passthrough`). Set `passthrough` to your
+  own list, or to `&.{}` to recover every error.
+- **Other middleware.** Register `RequestTrace` and timing before both entries
+  so they record the final response. Register `default_headers` before them so
+  replacement pages also get the default headers.

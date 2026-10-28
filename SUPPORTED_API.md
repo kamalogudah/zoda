@@ -101,6 +101,16 @@ runs inside `zig build test`.
   path, status, duration_ms, failed }`; errors give `status = null` and
   `failed = true`. Records exclude headers, query strings, and bodies.
   Register it outermost.
+- `zoda.plugins.status_handler` and `zoda.plugins.error_handler` are opt-in
+  middleware. `status_handler.middleware(App, &config)` validates distinct
+  400–599 statuses and, after downstream succeeds, runs the matching handler
+  only when the body is empty or `Response.generated` (the default 404 or the
+  recovery 500). Route-written bodies win; headers are kept; errors propagate.
+  `error_handler.middleware(App, &config)` clears the partial response, runs
+  the optional handler with the error, and otherwise writes a generated 500.
+  `OutOfMemory`, `Canceled`, and transport I/O errors propagate unless
+  `passthrough` is overridden. Both cover only entries registered after them.
+  See [PLUGINS.md](PLUGINS.md#status-and-error-handlers).
 - `BearerToken.guard_routes = true` adds a wrapper through `App.composeRoute`.
   It sends 401, `WWW-Authenticate: Bearer`, and a fixed body before the inner
   route on failure. The default is false. With `NotFound` registered,

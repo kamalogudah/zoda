@@ -318,3 +318,62 @@ test "PLUGINS flash messages example" {
     defer after.deinit();
     try std.testing.expectEqualStrings("", after.body);
 }
+
+// PLUGINS "Status and error handlers": the registration and precedence shown
+// there compile and run here.
+const status_handler = zoda.plugins.status_handler;
+const error_handler = zoda.plugins.error_handler;
+const PagePlugins = struct {};
+const PageApp = zoda.app.App(PagePlugins);
+
+fn pageRoute(_: *PageApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.isRoot() and req.isGet()) return res.text(200, "home");
+    if (req.isLiteral("report")) return error.ReportUnavailable;
+    if (req.isLiteral("gone")) return res.text(404, "this report was removed");
+}
+
+fn notFoundPage(_: *PageApp.Context, _: *zoda.router.Request, res: *zoda.response.Response) !void {
+    try res.text(404, "Page not found");
+}
+
+fn serverErrorPage(_: *PageApp.Context, _: *zoda.router.Request, res: *zoda.response.Response) !void {
+    try res.text(500, "Something went wrong");
+}
+
+fn logError(_: *PageApp.Context, req: *zoda.router.Request, _: *zoda.response.Response, err: anyerror) !void {
+    std.log.debug("{s} failed: {t}", .{ req.target, err });
+    // Writing nothing leaves the generated 500 for the status handler.
+}
+
+const pages = status_handler.Config(PageApp){ .handlers = &.{
+    .{ .status = 404, .run = notFoundPage },
+    .{ .status = 500, .run = serverErrorPage },
+} };
+const recovery = error_handler.Config(PageApp){ .handler = logError };
+
+test "PLUGINS status and error handlers example" {
+    var app = try PageApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{},
+        .route_fn = pageRoute,
+        // Status pages outermost so they style the recovery 500.
+        .middleware = &.{ try status_handler.middleware(PageApp, &pages), error_handler.middleware(PageApp, &recovery) },
+    });
+    defer app.deinit();
+
+    const cases = [_]struct { target: []const u8, status: u16, body: []const u8 }{
+        .{ .target = "/", .status = 200, .body = "home" },
+        .{ .target = "/missing", .status = 404, .body = "Page not found" },
+        .{ .target = "/gone", .status = 404, .body = "this report was removed" },
+        .{ .target = "/report", .status = 500, .body = "Something went wrong" },
+    };
+    for (cases) |case| {
+        var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, case.target);
+        defer arena.deinit();
+        var req = arena.requestView(.get);
+        var res = try app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqual(case.status, res.status_code);
+        try std.testing.expectEqualStrings(case.body, res.body);
+    }
+}

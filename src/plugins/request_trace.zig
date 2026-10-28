@@ -122,7 +122,7 @@ pub fn middleware(comptime AppT: type, comptime name: []const u8) AppT.Middlewar
             try next.call(ctx, req, res);
             // A silent short circuit would otherwise receive dispatch's 404
             // after this entry unwinds. Materialize it before logging.
-            if (!res.handled) try res.text(404, "Not Found");
+            if (!res.handled) try res.defaultNotFound();
             try res.setHeader(header_name, id);
             plugin.sink.write(plugin.sink.context, .{
                 .id = id,

@@ -106,6 +106,11 @@ pub const Response = struct {
     header_bytes_used: usize = 0,
     /// Whether a helper successfully produced a response.
     handled: bool = false,
+    /// Whether the body is a framework placeholder (the default 404 or a
+    /// recovery 500) rather than application output. Every body-replacing
+    /// helper clears it; status handlers replace only empty or generated
+    /// bodies.
+    generated: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Response {
         return .{ .allocator = allocator };
@@ -144,6 +149,14 @@ pub const Response = struct {
         self.header_bytes_used = 0;
         self.status_code = 0;
         self.handled = false;
+        self.generated = false;
+    }
+
+    /// Writes dispatch's default `404 Not Found` and marks it generated, so a
+    /// status handler can tell it apart from a route-written 404.
+    pub fn defaultNotFound(self: *Response) BodyError!void {
+        try self.text(404, "Not Found");
+        self.generated = true;
     }
 
     /// Replaces the body, status, and content type with a plain-text response
@@ -208,6 +221,7 @@ pub const Response = struct {
         self.content_type = content_type;
         self.status_code = status_code;
         self.handled = true;
+        self.generated = false;
     }
 
     /// Appends a copied header field. Names must be valid HTTP tokens; values
@@ -253,6 +267,7 @@ pub const Response = struct {
         self.content_type = &.{};
         self.status_code = @intFromEnum(status);
         self.handled = true;
+        self.generated = false;
     }
 
     /// Converts a handled response into `304 Not Modified`: releases the body
@@ -266,6 +281,7 @@ pub const Response = struct {
         self.content_type = &.{};
         self.status_code = 304;
         self.handled = true;
+        self.generated = false;
     }
 
     /// Formats a value with `std.fmt` and appends it via `setHeader`. The
@@ -700,4 +716,26 @@ test "response with repeated Set-Cookie fields remains valid after request destr
     try std.testing.expectEqualStrings("csrf=b", it.next().?);
     try std.testing.expect(it.next() == null);
     try std.testing.expectEqualStrings("/users/42?tag=one", (try res.getHeaderOne("x-path")).?);
+}
+
+test "only the default 404 is generated until a helper replaces it" {
+    var res = Response.init(std.testing.allocator);
+    defer res.deinit();
+    try res.defaultNotFound();
+    try std.testing.expect(res.generated and res.handled);
+    try std.testing.expectEqualStrings("Not Found", res.body);
+    try res.setHeader("X-Kept", "1");
+    try std.testing.expect(res.generated);
+    try res.text(404, "Not Found");
+    try std.testing.expect(!res.generated);
+
+    try res.defaultNotFound();
+    try res.redirectPath(.found, "/next");
+    try std.testing.expect(!res.generated);
+    try res.defaultNotFound();
+    res.notModified();
+    try std.testing.expect(!res.generated);
+    try res.defaultNotFound();
+    res.clear();
+    try std.testing.expect(!res.generated and !res.handled);
 }
