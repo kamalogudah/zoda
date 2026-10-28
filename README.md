@@ -841,23 +841,12 @@ connection is closed. The server rejects `Expect`, content codings, and
 ambiguous framing (for example, a signed `Content-Length` or malformed
 chunked encoding).
 
-### Local `wrk` measurement
+### Performance
 
-With Zig 0.16.0 and a ReleaseFast build, the demo server using the default
-`server.Config` was measured on loopback on 2026-10-27:
-
-```sh
-zig build -Doptimize=ReleaseFast
-./zig-out/bin/zoda serve 18080
-# In another terminal:
-wrk -t12 -c128 -d30s http://127.0.0.1:18080
-```
-
-`wrk` completed 1,354,883 requests in 30.10 s (45,019.86 requests/s), with
-2.33 ms average latency and no reported socket errors. This is a local
-measurement, not a throughput guarantee. The default `max_connections` is
-128; a 400-connection run exceeds that cap and can report socket read errors
-and fewer completed requests.
+Benchmark results, the standard `wrk` procedure, and the list of performance
+proposals are kept in [performance_improvement.md](performance_improvement.md).
+The default `max_connections` is 128, so a 400-connection run exceeds that cap
+and reports socket read errors.
 
 ## License
 
