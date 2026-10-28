@@ -465,3 +465,66 @@ test "routes send confined files with sendFile" {
         try std.testing.expectEqualStrings(case[2], res.body);
     }
 }
+
+// PLUGINS.md "Inertia.js": registration, render, redirect, and version check.
+const Shared = struct { app_name: []const u8 };
+const InertiaPlugins = struct { inertia: zoda.Inertia(Shared) };
+const InertiaApp = zoda.app.App(InertiaPlugins);
+const inertia_layout =
+    \\<!doctype html>
+    \\<html><head><script type="module" src="/assets/app.js"></script></head>
+    \\<body>@inertia</body></html>
+;
+
+fn inertiaRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    const inertia = &ctx.plugins.inertia;
+    if (req.onLiteral("users")) {
+        if (!req.isRoot()) return;
+        if (req.isGet()) return inertia.render(req, res, "Users/Index", .{ .users = &[_][]const u8{"ada"} });
+        if (req.method == .post) return inertia.redirect(req, res, "/users");
+    }
+}
+
+fn inertiaVisit(app: *const InertiaApp, method: zoda.router.Method, target: []const u8, headers: []const zoda.request.Header) !zoda.response.Response {
+    var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
+    defer arena.deinit();
+    try arena.copyHeaders(headers);
+    var req = arena.requestView(method);
+    return app.dispatch(&req);
+}
+
+test "PLUGINS Inertia.js example" {
+    var app = try InertiaApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{ .inertia = .{
+            .layout = inertia_layout,
+            .version = .{ .value = "1" },
+            .shared = .{ .value = .{ .app_name = "Zoda" } },
+        } },
+        .route_fn = inertiaRoute,
+    });
+    defer app.deinit();
+    try app.plugins.inertia.validate();
+
+    var page = try inertiaVisit(&app, .get, "/users?page=2", &.{});
+    defer page.deinit();
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", page.content_type);
+    try std.testing.expect(std.mem.indexOf(u8, page.body, "<script data-page=\"app\" type=\"application/json\">{\"component\":\"Users/Index\"") != null);
+
+    var json = try inertiaVisit(&app, .get, "/users?page=2", &.{ .{ .name = "X-Inertia", .value = "true" }, .{ .name = "X-Inertia-Version", .value = "1" } });
+    defer json.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Users/Index\",\"props\":{\"app_name\":\"Zoda\",\"users\":[\"ada\"],\"errors\":{}},\"url\":\"/users?page=2\",\"version\":\"1\",\"sharedProps\":[\"app_name\"]}",
+        json.body,
+    );
+
+    var stale = try inertiaVisit(&app, .get, "/users?page=2", &.{ .{ .name = "X-Inertia", .value = "true" }, .{ .name = "X-Inertia-Version", .value = "0" } });
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u16, 409), stale.status_code);
+    try std.testing.expectEqualStrings("/users?page=2", (try stale.getHeaderOne("X-Inertia-Location")).?);
+
+    var created = try inertiaVisit(&app, .post, "/users", &.{.{ .name = "X-Inertia", .value = "true" }});
+    defer created.deinit();
+    try std.testing.expectEqual(@as(u16, 303), created.status_code);
+    try std.testing.expectEqualStrings("/users", (try created.getHeaderOne("Location")).?);
+}

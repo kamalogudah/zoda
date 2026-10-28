@@ -366,7 +366,8 @@ fn hasForbiddenValueByte(value: []const u8) bool {
     return false;
 }
 
-fn validateRedirectPath(path: []const u8) error{InvalidRedirectPath}!void {
+/// Checks the local-path rules used by `redirectPath` without changing a response.
+pub fn validateRedirectPath(path: []const u8) error{InvalidRedirectPath}!void {
     if (path.len == 0 or path[0] != '/' or (path.len > 1 and path[1] == '/')) return error.InvalidRedirectPath;
     var i: usize = 0;
     while (i < path.len) : (i += 1) {

@@ -1,0 +1,63 @@
+<script>
+  import { Link, router, useForm } from '@inertiajs/svelte'
+
+  let { app, framework, todos, filter, remaining } = $props()
+
+  const filters = [
+    ['all', 'All'],
+    ['active', 'Active'],
+    ['done', 'Done'],
+  ]
+  const form = useForm({ text: '' })
+  const options = { preserveScroll: true }
+  // Mutations carry the filter so the server's 303 lands on the same view.
+  let query = $derived(filter === 'all' ? '' : `?filter=${filter}`)
+
+  function add(event) {
+    event.preventDefault()
+    form.post(`/todos${query}`, { ...options, onSuccess: () => form.reset() })
+  }
+</script>
+
+<main>
+  <h1>{app} todos <small>{framework}</small></h1>
+
+  <form class="new" onsubmit={add}>
+    <!-- svelte-ignore a11y_autofocus -->
+    <input type="text" bind:value={form.text} placeholder="What needs doing?" aria-label="New todo" autofocus />
+    <button disabled={form.processing}>Add</button>
+  </form>
+  {#if form.errors.text}
+    <p class="error">{form.errors.text}</p>
+  {/if}
+
+  <nav>
+    {#each filters as [value, label] (value)}
+      <Link href={value === 'all' ? '/todos' : `/todos?filter=${value}`} class={filter === value ? 'active' : ''}>
+        {label}
+      </Link>
+    {/each}
+  </nav>
+
+  <ul>
+    {#each todos as todo (todo.id)}
+      <li id={`todo-${todo.id}`} class:done={todo.done}>
+        <label>
+          <input
+            type="checkbox"
+            checked={todo.done}
+            onchange={() => router.patch(`/todos/${todo.id}${query}`, {}, options)}
+          />
+          <span>{todo.text}</span>
+        </label>
+        <button onclick={() => router.delete(`/todos/${todo.id}${query}`, options)} aria-label={`Delete ${todo.text}`}>
+          ×
+        </button>
+      </li>
+    {:else}
+      <li class="empty">Nothing here yet.</li>
+    {/each}
+  </ul>
+
+  <footer>{remaining} {remaining === 1 ? 'item' : 'items'} left</footer>
+</main>

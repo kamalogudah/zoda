@@ -18,6 +18,7 @@ documented beside its code in `src/plugins/`, and its support status is in
 | Request IDs and access logs | `trace: zoda.RequestTrace` + middleware entry | Registered instance with request state and middleware | [Request IDs and access logs](#request-ids-and-access-logs) |
 | Status and error handlers | `zoda.plugins.status_handler` / `error_handler` middleware entries | Middleware | [Status and error handlers](#status-and-error-handlers) |
 | Security response policies | `zoda.plugins.security_policy` middleware entry | Middleware | [Security response policies](#security-response-policies) |
+| Inertia.js pages | `inertia: zoda.Inertia(Shared)` | Registered instance | [Inertia.js](#inertiajs) |
 
 Core middleware that is not a plugin (host authorization, default response
 headers, response timing, and static files) is documented in the
@@ -575,3 +576,186 @@ policies and checks the headers on a route and on the default 404.
 - **Sessions and caching.** The policies do not depend on the request, except
   for the HSTS signal, and do not touch `Set-Cookie`, `Cache-Control`, or
   `Vary`.
+
+## Inertia.js
+
+`zoda.Inertia(SharedProps)` renders [Inertia.js](https://inertiajs.com/)
+pages, inspired by [inertia-roda](https://github.com/holamendi/inertia-roda).
+It is a registered instance with no request state and no route wrapper: the
+route picks the component, passes a props struct, and calls the instance
+explicitly. Ordinary route dispatch is unchanged.
+
+```zig
+const Shared = struct { app_name: []const u8 };
+const Plugins = struct { inertia: zoda.Inertia(Shared) };
+const App = zoda.app.App(Plugins);
+
+const layout =
+    \\<!doctype html>
+    \\<html><head><script type="module" src="/assets/app.js"></script></head>
+    \\<body>@inertia</body></html>
+;
+
+fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    const inertia = &ctx.plugins.inertia;
+    if (req.onLiteral("users")) {
+        if (!req.isRoot()) return;
+        if (req.isGet()) return inertia.render(req, res, "Users/Index", .{ .users = &[_][]const u8{"ada"} });
+        if (req.method == .post) return inertia.redirect(req, res, "/users");
+    }
+}
+
+// .plugins = .{ .inertia = .{
+//     .layout = layout,
+//     .version = .{ .value = "1" },
+//     .shared = .{ .value = .{ .app_name = "Zoda" } },
+// } },
+```
+
+The [compiling contract example](examples/contract.zig) uses this
+registration. For a complete app with React, Svelte, and Vue frontends, see
+[the Inertia todo example](examples/inertia/README.md). Call `app.plugins.inertia.validate()` at startup to catch a bad
+layout or root id before the first request; `render` checks again.
+
+### Configuration
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `layout` | required | Full HTML document with the `@inertia` marker exactly once. It holds your asset tags and is copied verbatim. Zoda loads no templates at runtime. |
+| `root_id` | `"app"` | `id` of the generated root element; 1–64 `[A-Za-z0-9_-]` bytes. |
+| `initial_page` | `.script` | `.script` for Inertia v3 clients, `.attribute` for v1 and v2. See below. |
+| `version` | `.none` | `.value = "..."` or `.callback = fn (*const Request) []const u8`. `.none` sends `"version":null` and skips version checks. |
+| `shared` | `.none` | `.value = SharedProps{...}` or `.callback = fn (*const Request) SharedProps`. Use `zoda.Inertia(struct {})` for no shared props. |
+
+### Responses
+
+- **`render(req, res, component, props)`** builds the page object
+  `{"component", "props", "url", "version"}`. `props` must be a struct.
+  Shared props come first and a route prop with the same name replaces the
+  shared one (checked at comptime). The status is 200.
+  - Without `X-Inertia`, the response is `text/html; charset=utf-8`: the
+    layout with `@inertia` replaced by the initial page. With the default
+    `.script`, the form Inertia v3 reads, that is
+    `<script data-page="app" type="application/json">{...}</script><div id="app"></div>`.
+    The JSON writes `<`, `>`, and `&` as `\u003c`, `\u003e`, and `\u0026`,
+    so no prop value can close the script element. With `.attribute`, for
+    v1 and v2 clients, it is `<div id="app" data-page="..."></div>` and the
+    JSON is escaped for a double-quoted attribute (`&`, `<`, `>`, `"`, `'`).
+  - With `X-Inertia: true`, the body is the page object as
+    `application/json`, with `X-Inertia: true`.
+  - Both add `Vary: X-Inertia` unless a `Vary` field already lists it.
+  - On an Inertia **GET** with a configured version, a different
+    `X-Inertia-Version` returns `409` with an empty body and
+    `X-Inertia-Location` set to the current URL. Ordinary visits and non-GET
+    Inertia requests are never sent a conflict. A missing field counts as
+    the empty version, because the client leaves it out when the page
+    version is empty; so an empty configured version never causes a reload
+    loop. The check runs inside `render`, so a route that redirects instead
+    does not run it.
+  - `props.errors` is always an object: a route `errors` prop wins, then a
+    configured shared `errors`, and otherwise the plugin adds `errors: {}`,
+    as the Laravel adapter does.
+  - With shared props configured, the page also lists their names in
+    `sharedProps`. v3 clients use it to keep shared props during instant
+    client-side visits.
+  - Nested empty values need a named type: in Zig an empty `.{}` literal is
+    a tuple and serializes as `[]`. Pass a named empty struct such as
+    `struct {}{}` for an empty nested object. Tuples with values are a
+    compile error as `props`.
+- **`redirect(req, res, path)`** sends a local path under the
+  `Response.redirectPath` rules: 302 after GET/HEAD and 303 after POST, PUT,
+  PATCH, DELETE, or any other method, so the client follows with GET.
+  External URLs are refused with `error.InvalidRedirectPath`. XHR drops the
+  `#fragment` of a redirect it follows, so for an Inertia request to a path
+  with `#`, `redirect` sends `409` with `X-Inertia-Redirect` and an empty
+  body. The v3 client then visits that URL with GET and keeps the fragment.
+  Ordinary requests always get a `Location` redirect. `redirect` reads
+  `X-Inertia`, so a malformed one is an error here too.
+- **`location(req, res, destination)`** forces a full page load, for example to
+  an external payment page or a non-Inertia route. It accepts a local path or
+  an absolute `http`/`https` URL with a host, without userinfo (`@`),
+  backslashes, spaces, controls, or bad percent escapes. An Inertia request
+  gets 409, `X-Inertia-Location`, and `Vary: X-Inertia`; any other request
+  gets a 302/303 `Location`.
+
+### URL and origin policy
+
+The page `url` and the conflict's `X-Inertia-Location` are the raw
+origin-form request target, so path and query are kept byte for byte
+(repeated query keys included). Zoda never builds an absolute URL from `Host`
+or forwarded headers. The Inertia client resolves the relative URL against
+the page it is already on, so the conflict reload always stays on the same
+origin. A target that starts with `//` or contains `\` is refused with
+`error.UnsafeRequestTarget`; a request with no target (a hand-built
+`router.Request` in a test) returns `error.MissingRequestTarget`.
+
+### Errors, limits, and ownership
+
+- **Headers.** `X-Inertia` must appear once with the exact value `true`.
+  Another value returns `error.MalformedInertiaHeader`; a repeated field
+  returns `error.DuplicateInertiaHeader`; a repeated `X-Inertia-Version`
+  returns `error.DuplicateVersionHeader`. There is no silent HTML fallback.
+  `zoda.plugins.inertia.isInertia(req)` applies the same rules.
+- **Limits.** The finished HTML or JSON must fit `max_body_bytes`
+  (`error.BodyTooLarge`), and every header the call adds must fit the
+  response's header limits (`error.TooManyHeaders`,
+  `error.HeaderBytesExceeded`). These failures, header errors, and
+  configuration errors (`InvalidLayout`, `InvalidRootId`, `InvalidComponent`
+  for an empty name) leave the response unchanged. The page JSON is built in
+  full before the body limit is checked, as with `Response.replaceJson`.
+- **Errors propagate.** Nothing is mapped to a status. Register
+  [`error_handler`](#status-and-error-handlers) to turn header errors into a
+  400 page; an `OutOfMemory` can leave headers added before it failed, and
+  `error_handler` clears the partial response.
+- **Ownership.** The response owns every serialized byte. Shared values and
+  the version string are borrowed from the instance and must outlive the app;
+  callback results must stay valid until the call returns. Callbacks must be
+  safe to call concurrently.
+
+### Interactions
+
+- **Sessions, CSRF, and flash.** Shared-props callbacks receive only the
+  request, not `ctx`, so put session-derived values (the current user, flash
+  messages, validation `errors`) in route props. Save the session before
+  `render` or `redirect` as usual. `csrf.valid` reads `X-CSRF-Token`, not
+  the `X-XSRF-TOKEN` header that Inertia's axios client sends from an
+  `XSRF-TOKEN` cookie. Either set `X-CSRF-Token` in your client's request
+  headers or pass the submitted value to `csrf.validToken`.
+- **Caching.** Do not mark Inertia pages `public` without `Vary: X-Inertia`,
+  which `render` already adds; add other `Vary` fields with
+  `http_cache.addVary`.
+- **Middleware.** It is not middleware. `default_headers`,
+  `security_policy`, and `status_handler` see its responses like any route
+  response; a status handler replaces the 409 only if you configure 409.
+
+### Supported protocol features
+
+Checked against `@inertiajs/core`, `@inertiajs/react`, `@inertiajs/svelte`,
+and `@inertiajs/vue3` 3.9.1. The three frontends in
+[examples/inertia](examples/inertia/README.md) were driven in headless Chrome
+through the script-element page, JSON visits, shared props, `errors`, 303
+and fragment redirects, and filter links. The other rows are covered by the
+plugin's unit tests only.
+
+The features not yet implemented are tracked in
+[#80](https://github.com/kamalogudah/zoda/issues/80), with one issue each.
+
+| Inertia v3 feature | Status |
+| --- | --- |
+| Initial page in `<script data-page type="application/json">` | Implemented (default `initial_page = .script`) |
+| v1/v2 `data-page` attribute | Implemented (`initial_page = .attribute`) |
+| JSON page visits, `X-Inertia`, `Vary: X-Inertia` | Implemented |
+| Shared props, route precedence, `sharedProps` list | Implemented |
+| `props.errors` always present | Implemented (`{}` by default) |
+| Asset version 409 + `X-Inertia-Location` (missing header = empty version) | Implemented |
+| 303 after PUT/PATCH/DELETE/POST | Implemented (`redirect`) |
+| Fragment redirects, 409 + `X-Inertia-Redirect` | Implemented (`redirect` with `#`) |
+| External and full-page visits, 409 + `X-Inertia-Location` | Implemented (`location`) |
+| Prefetching (`Purpose: prefetch`) | Not special-cased: a prefetch is an ordinary Inertia GET and gets a full response. Not exercised by the example. |
+| Partial reloads (`X-Inertia-Partial-Data`, `-Component`, `-Except`) | Not implemented: headers are ignored and every prop is sent. v3 merges the response into the current props, so pages stay correct, but nothing is skipped on the server. |
+| Top-level `flash` | Not implemented: the client defaults it to `{}`. Pass flash messages as props, as the example's README describes. |
+| Deferred, optional, once, merge, and scroll props | Not implemented |
+| Error bags (`X-Inertia-Error-Bag`) | Not implemented: the header is ignored |
+| History encryption (`encryptHistory`, `clearHistory`) | Not implemented: never sent, so off |
+| Precognition validation | Not implemented |
+| Server-side rendering | Not implemented |

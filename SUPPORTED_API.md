@@ -121,6 +121,34 @@ runs inside `zig build test`.
   required `hsts.https` signal returns true; forwarded scheme headers are
   never read. It covers only entries registered after it.
   See [PLUGINS.md](PLUGINS.md#security-response-policies).
+- `zoda.Inertia(SharedProps)` (`zoda.plugins.inertia`) is an opt-in
+  registered plugin for a subset of the Inertia.js protocol.
+  `render(req, res, component, props)` writes the page object
+  `{component, props, url, version}` either into the configured layout's
+  single `@inertia` marker (HTML) or, for
+  `X-Inertia: true`, as `application/json` with `X-Inertia: true`; both add
+  `Vary: X-Inertia`. The HTML page defaults to the Inertia v3 form, a
+  `<script data-page type="application/json">` with `<`, `>`, and `&`
+  `\u`-escaped, followed by the empty root element; `initial_page =
+  .attribute` writes the v1/v2 attribute-escaped `data-page` instead. Route
+  props replace shared props of the same name; `props.errors` defaults to
+  `{}`; configured shared props are named in `sharedProps`. An Inertia GET whose
+  `X-Inertia-Version` (missing counts as empty) differs from the configured
+  version gets 409 and `X-Inertia-Location`. Checked against
+  `@inertiajs/react`, `@inertiajs/svelte`, and `@inertiajs/vue3` 3.9.1 by
+  [examples/inertia](examples/inertia/README.md). `redirect` sends a local
+  path with 302 after GET/HEAD and 303 otherwise, or, for an Inertia request
+  to a path with a `#fragment`, 409 and `X-Inertia-Redirect`; `location` sends 409 and `X-Inertia-Location`
+  to Inertia requests and 302/303 otherwise, for a local path or a validated
+  absolute `http(s)` URL without userinfo. URLs are the raw origin-form target;
+  no origin is read from `Host` or forwarded headers. Duplicate or malformed
+  `X-Inertia`/`X-Inertia-Version` fields, unsafe targets, configuration, and
+  limit failures return errors and leave the response unchanged. Partial
+  reloads, top-level `flash`, deferred/optional/once/merge props, error
+  bags, history encryption, precognition, and SSR are not implemented. See
+  [PLUGINS.md](PLUGINS.md#inertiajs).
+- `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
+  local-path rules without changing a response.
 - `BearerToken.guard_routes = true` adds a wrapper through `App.composeRoute`.
   It sends 401, `WWW-Authenticate: Bearer`, and a fixed body before the inner
   route on failure. The default is false. With `NotFound` registered,

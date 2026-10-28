@@ -169,6 +169,25 @@ pub fn build(b: *std.Build) void {
     examples_step.dependOn(&todo_tests.step);
     test_step.dependOn(&todo_tests.step);
 
+    // Inertia.js todo app. Build a frontend first, then pick it after `--`:
+    // `zig build run-inertia -- svelte`. Runs from the repo root so the
+    // server finds `examples/inertia/<frontend>/dist`.
+    const inertia_module = b.createModule(.{
+        .root_source_file = b.path("examples/inertia/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zoda", .module = mod }},
+    });
+    const inertia_exe = b.addExecutable(.{ .name = "inertia-todo", .root_module = inertia_module });
+    const inertia_run = b.addRunArtifact(inertia_exe);
+    inertia_run.setCwd(b.path("."));
+    if (b.args) |args| inertia_run.addArgs(args);
+    const inertia_step = b.step("run-inertia", "Run the Inertia.js todo app (react, svelte, or vue) on localhost:8080");
+    inertia_step.dependOn(&inertia_run.step);
+    const inertia_tests = b.addRunArtifact(b.addTest(.{ .root_module = inertia_module }));
+    examples_step.dependOn(&inertia_tests.step);
+    test_step.dependOn(&inertia_tests.step);
+
     // Phase 2b adversarial real-socket suite, runnable on its own so CI can
     // repeat it under other optimize modes, e.g.
     // `zig build test-hardening -Doptimize=ReleaseSafe`. It gets its own

@@ -59,7 +59,7 @@ corresponding ideas in the [Roda catalog](https://roda.jeremyevans.net/rdoc/clas
 | 3 | Status and error handlers (`status_handler`, `error_handler`) — available as `zoda.plugins.status_handler` and `zoda.plugins.error_handler` | Middleware | Map selected errors/statuses to responses with clear precedence. Recovery must clear a partial response before replacement. |
 | 3 | Security response policies (`content_security_policy`, `hsts`, `permissions_policy`) — available as `zoda.plugins.security_policy` | Middleware | Validate configured policy values and emit headers on the selected response classes. HSTS requires a trustworthy HTTPS signal. |
 | 3 | Files and assets (`public`, `send_file`, `assets`) — `public` and `send_file` available as `zoda.static` cache options and `zoda.static.sendFile` | Middleware/helpers | Extend the existing confined static-file code instead of duplicating path security. Asset pipelines need a separate build-time design; see [the asset contract](#asset-pipeline-contract-67). |
-| 3 | Inertia.js responses (`inertia`) | Registered helper with an explicit HTML shell | Render a component and typed props as an escaped initial HTML page or an Inertia JSON page response. Handle asset-version conflicts and Inertia redirects without changing normal route dispatch. |
+| 3 | Inertia.js responses (`inertia`) — available as `zoda.Inertia`; see [PLUGINS.md](PLUGINS.md#inertiajs) | Registered helper with an explicit HTML shell | Render a component and typed props as an escaped initial HTML page or an Inertia JSON page response. Handle asset-version conflicts and Inertia redirects without changing normal route dispatch. |
 
 Start with a small public catalog rather than all of Roda's modules. Several
 Roda entries are Ruby-specific (`erb_h`, `sinatra_helpers`, class/module
@@ -69,6 +69,12 @@ runtime template loading need core or transport decisions recorded in
 `SUPPORTED_API.md`; do not promise them as simple plugins.
 
 ### Inertia.js adapter ([#68](https://github.com/kamalogudah/zoda/issues/68))
+
+Available as `zoda.Inertia(SharedProps)`. The contract below was implemented
+with a configured layout containing one `@inertia` marker, `render`,
+`redirect`, and `location` methods, and a same-origin relative URL policy;
+partial reloads and the other deferred features are listed in
+[PLUGINS.md](PLUGINS.md#supported-protocol-features).
 
 Inspired by [inertia-roda](https://github.com/holamendi/inertia-roda), add an
 opt-in `Inertia` instance with route methods such as

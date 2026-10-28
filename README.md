@@ -104,6 +104,14 @@ source is in [`examples/todo.zig`](examples/todo.zig) and
 [`examples/todo.html`](examples/todo.html). Its API tests run with
 `zig build test-examples`.
 
+The same todo app is also built with Inertia.js and your choice of React,
+Svelte, or Vue in [`examples/inertia`](examples/inertia/README.md):
+
+```sh
+(cd examples/inertia/react && npm install && npm run build)
+zig build run-inertia -- react
+```
+
 ### A complete server
 
 ```zig
@@ -381,6 +389,7 @@ Built-in plugins:
 | `zoda.RequestTrace` | Request IDs and one access record per request |
 | `zoda.plugins.status_handler`, `zoda.plugins.error_handler` | Configured error pages and error recovery middleware |
 | `zoda.plugins.security_policy` | Validated CSP, Permissions-Policy, and HTTPS-gated HSTS headers |
+| `zoda.Inertia` | Inertia.js HTML/JSON pages, asset-version conflicts, and redirects ([example](PLUGINS.md#inertiajs)) |
 
 **See [PLUGINS.md](PLUGINS.md) for detailed usage and examples of every
 plugin.**

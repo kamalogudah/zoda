@@ -70,6 +70,8 @@ pub const plugins = struct {
     pub const error_handler = @import("plugins/error_handler.zig");
     /// Validated Content-Security-Policy, Permissions-Policy, and gated HSTS.
     pub const security_policy = @import("plugins/security_policy.zig");
+    /// Inertia.js page responses, asset-version conflicts, and redirects.
+    pub const inertia = @import("plugins/inertia.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
@@ -82,6 +84,7 @@ pub const Sessions = plugins.sessions.Sessions;
 pub const Flash = plugins.flash.Flash;
 pub const BearerToken = plugins.bearer_token.BearerToken;
 pub const RequestTrace = plugins.request_trace.RequestTrace;
+pub const Inertia = plugins.inertia.Inertia;
 
 comptime {
     // Collect the imported modules' test declarations into the library test
@@ -110,6 +113,7 @@ comptime {
     std.testing.refAllDecls(plugins.status_handler);
     std.testing.refAllDecls(plugins.error_handler);
     std.testing.refAllDecls(plugins.security_policy);
+    std.testing.refAllDecls(plugins.inertia);
 }
 
 test {

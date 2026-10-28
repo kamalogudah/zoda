@@ -145,6 +145,9 @@ measurement.
 
 | Date | Commit | Change | Target | Command | Req/s | Avg latency | Socket errors | Environment |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-28 | `1b8b3ee` + working tree | Inertia.js plugin (opt-in, not in todo app; request path unchanged). About 2x the previous rows with no request-path change: machine load differed, not an improvement | todo `/api/todos` | `wrk -t8 -c128 -d10s` | 65,867 | 2.03 ms | read 196 | A |
+| 2026-10-28 | `1b8b3ee` + working tree | Inertia.js plugin (opt-in, not in todo app; request path unchanged). About 2x the previous rows with no request-path change: machine load differed, not an improvement | todo `/` | `wrk -t8 -c128 -d10s` | 41,911 | 2.87 ms | read 63 | A |
+| 2026-10-28 | `1b8b3ee` + working tree | Inertia.js plugin (opt-in, not in todo app; request path unchanged). About 2x the previous rows with no request-path change: machine load differed, not an improvement | todo `/api/todos` | `wrk -t8 -c400 -d10s` | 29,565 | 2.35 ms | read 211,631 | A |
 | 2026-10-28 | `1d0023e` + working tree | security response policy middleware (opt-in, not in todo app; request path unchanged) | todo `/api/todos` | `wrk -t8 -c128 -d10s` | 33,684 | 4.08 ms | read 69 | A |
 | 2026-10-28 | `1d0023e` + working tree | security response policy middleware (opt-in, not in todo app; request path unchanged) | todo `/` | `wrk -t8 -c128 -d10s` | 26,223 | 4.28 ms | read 22 | A |
 | 2026-10-28 | `1d0023e` + working tree | security response policy middleware (opt-in, not in todo app; request path unchanged) | todo `/api/todos` | `wrk -t8 -c400 -d10s` | 17,960 | 3.88 ms | read 125,062 | A |
