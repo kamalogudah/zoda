@@ -292,7 +292,9 @@ HTTPS redirection is not provided until the server has a trusted request-scheme
 contract; forwarded scheme headers are not trusted by default.
 
 Repeated headers such as `Set-Cookie` are kept as separate fields. The
-transport sets `Content-Length` and other framing headers itself.
+transport sets `Content-Length` and other framing headers itself. A 1xx, 204,
+or 304 response is sent with no `Content-Length`, `Content-Type`, or body, as
+RFC 9110 requires, and the connection stays open.
 
 ### Plugins
 
@@ -469,6 +471,54 @@ policy above, and do not allow untrusted cross-origin requests to send the
 custom header through permissive CORS. The [compiling app dispatch example](src/plugins/csrf.zig)
 exercises explicit plugin access, session persistence, and rejection before
 the protected action.
+
+#### HTTP caching
+
+`zoda.plugins.http_cache` provides explicit helpers; nothing is registered and
+no policy is applied by default. A route without a `Cache-Control` call sends
+none. Build the full 2xx response, set its policy, validator, and `Vary`, save
+any session, then call `evaluate` last:
+
+```zig
+const http_cache = zoda.plugins.http_cache;
+
+if (req.isLiteral("report") and (req.isGet() or req.method == .head)) {
+    try res.text(200, report_text);
+    try http_cache.setCacheControl(req, res, .{ .private = .{ .no_cache = true } });
+    try http_cache.setBodyETag(res); // or .setETag(res, .strong("v42"))
+    try http_cache.addVary(res, "Accept-Encoding");
+    _ = try http_cache.evaluate(req, res); // .full or .not_modified
+    return;
+}
+```
+
+Policies are `.no_store`, `.private`, and `.public`, with optional `max_age`,
+`no_cache`, `must_revalidate`, and `immutable`; `public` also takes
+`s_maxage`. Lifetimes above 2147483648 seconds and a second `Cache-Control`
+are rejected. `public` is refused when the response already has `Set-Cookie`.
+It is also refused when the request carries `Authorization` or `Cookie`,
+unless the route sets `.allow_credentials = true` to state that the body does
+not depend on them. Choose `.private` or `.no_store` for session and other
+personalized pages. Call `setCacheControl` after `sessions.save` so the
+`Set-Cookie` check can see the cookie.
+
+`setETag` takes a strong or weak tag of at most 128 visible ASCII bytes
+without `"`. `setBodyETag` derives a strong tag from the content type and
+body. `addVary` adds one field name once, case-insensitively across repeated
+`Vary` fields, and refuses `*` (use `.no_store`).
+
+`evaluate` checks `If-None-Match` only on handled GET and HEAD 2xx responses.
+Comparison is weak, so `W/"v1"` and `"v1"` match. Repeated fields form one
+list, empty list elements are accepted, and `*` matches only as the sole
+member. A malformed request field voids the whole condition and sends the
+full response. When the condition matches, the response becomes `304 Not
+Modified`. It keeps every header (`ETag`, `Cache-Control`, `Vary`,
+`Set-Cookie`) and drops its body and content type. The transport sends a 304
+with no `Content-Length`, `Content-Type`, or body, and keeps the connection
+open. HEAD has no GET fallback, so answer it explicitly. A 200 HEAD response
+still reports the representation's `Content-Length`. Other methods are left
+unchanged; check their preconditions before acting. `If-Modified-Since`,
+`If-Match`, and ranges are not supported.
 
 ### Middleware
 

@@ -58,6 +58,8 @@ pub const plugins = struct {
     pub const bearer_token = @import("plugins/bearer_token.zig");
     /// Request IDs and access records across the dispatch chain.
     pub const request_trace = @import("plugins/request_trace.zig");
+    /// Explicit Cache-Control, ETag, Vary, and conditional GET helpers.
+    pub const http_cache = @import("plugins/http_cache.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
@@ -90,6 +92,7 @@ comptime {
     std.testing.refAllDecls(plugins.csrf);
     std.testing.refAllDecls(plugins.bearer_token);
     std.testing.refAllDecls(plugins.request_trace);
+    std.testing.refAllDecls(plugins.http_cache);
 }
 
 test {

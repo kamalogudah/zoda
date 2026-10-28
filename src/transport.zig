@@ -16,7 +16,9 @@
 //! extensions, each a request-smuggling ambiguity (Phase 2b, issue #16).
 //! `respond` supplies exactly one Content-Length and
 //! suppresses HEAD bodies; this adapter additionally suppresses bodies for
-//! bodyless status codes and removes application framing headers.
+//! bodyless status codes and removes application framing headers. 1xx, 204,
+//! and 304 heads are written here instead, without Content-Length,
+//! Content-Type, or a body.
 const std = @import("std");
 const buffering = @import("buffering.zig");
 const request = @import("request.zig");
@@ -320,29 +322,38 @@ fn processRequest(
         return .close;
     }
 
+    // RFC 9110 §8.6: 1xx and 204 must not carry Content-Length, and a 304's
+    // would claim the 200 length (§15.4.5). None has content to type.
+    const bodyless = !statusAllowsBody(res.status_code);
     var extra: std.ArrayList(std.http.Header) = .empty;
     defer extra.deinit(allocator);
     var has_content_type = false;
     for (res.headers[0..res.header_count]) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "content-length") or
             std.ascii.eqlIgnoreCase(header.name, "transfer-encoding")) continue;
-        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) has_content_type = true;
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+            if (bodyless) continue;
+            has_content_type = true;
+        }
         extra.append(allocator, .{ .name = header.name, .value = header.value }) catch {
             try reject(wire_req, .internal_server_error, version, deadlines);
             return .close;
         };
     }
-    if (!has_content_type and res.content_type.len != 0) {
+    if (!bodyless and !has_content_type and res.content_type.len != 0) {
         extra.append(allocator, .{ .name = "content-type", .value = res.content_type }) catch {
             try reject(wire_req, .internal_server_error, version, deadlines);
             return .close;
         };
     }
 
-    const status: std.http.Status = @enumFromInt(res.status_code);
-    const content = if (statusAllowsBody(res.status_code)) res.body else "";
     if (deadlines) |operation_deadlines| operation_deadlines.write();
-    try wire_req.respond(content, .{
+    const status: std.http.Status = @enumFromInt(res.status_code);
+    if (bodyless) {
+        try writeBodylessHead(wire_req.server.out, version, status, keep_alive, extra.items);
+        return if (keep_alive) .keep_alive else .close;
+    }
+    try wire_req.respond(res.body, .{
         .version = version,
         .status = status,
         .keep_alive = keep_alive,
@@ -496,6 +507,30 @@ fn reject(req: *std.http.Server.Request, status: std.http.Status, version: std.h
     });
 }
 
+/// `respond` always emits Content-Length unless chunked or `.none` framing is
+/// chosen, and `.none` forces a close. Every body path has already left the
+/// reader `.ready`, so the head is written here with the same connection
+/// semantics and no framing fields.
+fn writeBodylessHead(
+    out: *std.Io.Writer,
+    version: std.http.Version,
+    status: std.http.Status,
+    keep_alive: bool,
+    headers: []const std.http.Header,
+) !void {
+    try out.print("{t} {d} {s}\r\n", .{ version, @intFromEnum(status), status.phrase() orelse "" });
+    switch (version) {
+        .@"HTTP/1.0" => if (keep_alive) try out.writeAll("connection: keep-alive\r\n"),
+        .@"HTTP/1.1" => if (!keep_alive) try out.writeAll("connection: close\r\n"),
+    }
+    for (headers) |header| {
+        var vecs: [4][]const u8 = .{ header.name, ": ", header.value, "\r\n" };
+        try out.writeVecAll(&vecs);
+    }
+    try out.writeAll("\r\n");
+    try out.flush();
+}
+
 fn writeRawError(out: *std.Io.Writer, status: std.http.Status) !void {
     const phrase = status.phrase() orelse "Error";
     try out.print(
@@ -510,6 +545,7 @@ const TestApp = struct {
     calls: *usize,
     fail: bool = false,
     bodyless: bool = false,
+    not_modified: bool = false,
 
     fn dispatch(self: *const TestApp, req: *router.Request) !response.Response {
         self.calls.* += 1;
@@ -520,6 +556,12 @@ const TestApp = struct {
             try res.text(204, "must not be sent");
             try res.setHeader("Content-Length", "999");
             try res.setHeader("Transfer-Encoding", "chunked");
+        } else if (self.not_modified and !std.mem.eql(u8, req.target, "/after")) {
+            try res.text(200, "must not be sent");
+            try res.setHeader("Content-Type", "text/html");
+            try res.setHeader("Content-Length", "16");
+            try res.setHeader("ETag", "\"v1\"");
+            res.notModified();
         } else {
             try res.text(200, req.body);
             try res.setHeader("x-target", req.target);
@@ -613,10 +655,31 @@ test "dispatch failures are generic and response framing is transport owned" {
     const bodyless: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls, .bodyless = true };
     const framed = try runTest("GET / HTTP/1.1\r\nHost: example\r\n\r\n", &bodyless, .{});
     defer std.testing.allocator.free(framed);
-    try std.testing.expect(std.mem.indexOf(u8, framed, "content-length: 0\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, framed, "content-length: 999") == null);
+    try std.testing.expectEqualStrings("HTTP/1.1 204 No Content\r\n\r\n", framed);
     try std.testing.expect(std.mem.indexOf(u8, framed, "transfer-encoding") == null);
     try std.testing.expect(!std.mem.endsWith(u8, framed, "must not be sent"));
+}
+
+test "304 carries no framing, content type, or body and keeps the connection" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls, .not_modified = true };
+    const output = try runTest(
+        "GET / HTTP/1.1\r\nHost: example\r\nIf-None-Match: \"v1\"\r\n\r\n" ++
+            "HEAD / HTTP/1.1\r\nHost: example\r\n\r\n" ++
+            "GET /after HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n",
+        &app,
+        .{},
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqual(@as(usize, 3), calls);
+    const expected_304 = "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n\r\n";
+    try std.testing.expect(std.mem.startsWith(u8, output, expected_304 ++ expected_304 ++ "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, output, "must not be sent") == null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\n"));
+
+    const http10 = try runTest("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", &app, .{});
+    defer std.testing.allocator.free(http10);
+    try std.testing.expectEqualStrings("HTTP/1.0 304 Not Modified\r\nconnection: keep-alive\r\nETag: \"v1\"\r\n\r\n", http10);
 }
 
 test "HEAD retains representation length and emits no body" {

@@ -11,7 +11,7 @@ Numbers here are local loopback measurements, not throughput guarantees.
 
 | | |
 |---|---|
-| Last measured | 2026-10-28, commit `09cfa3c` |
+| Last measured | 2026-10-28, `14ee0c2` + HTTP cache helpers |
 | Todo app, `GET /api/todos`, 128 connections | ~32–38k req/s (some socket read errors) |
 | Todo app, `GET /`, 128 connections | ~21–24k req/s |
 | Todo app, `GET /api/todos`, 400 connections | ~17–21k req/s, ~61k socket read errors |
@@ -145,6 +145,12 @@ measurement.
 
 | Date | Commit | Change | Target | Command | Req/s | Avg latency | Socket errors | Environment |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-28 | `14ee0c2` + working tree | 1xx/204 also sent without Content-Length (200 path unchanged; within noise) | todo `/api/todos` | `wrk -t8 -c128 -d10s` | 34,820 | 3.65 ms | read 98 | A |
+| 2026-10-28 | `14ee0c2` + working tree | 1xx/204 also sent without Content-Length (200 path unchanged; within noise) | todo `/` | `wrk -t8 -c128 -d10s` | 23,253 | 5.35 ms | read 23 | A |
+| 2026-10-28 | `14ee0c2` + working tree | 1xx/204 also sent without Content-Length (200 path unchanged; within noise) | todo `/api/todos` | `wrk -t8 -c400 -d10s` | 20,437 | 3.92 ms | read 90,299 | A |
+| 2026-10-28 | `14ee0c2` + working tree | HTTP cache helpers; transport writes 304 head without Content-Length (other responses unchanged; within noise) | todo `/api/todos` | `wrk -t8 -c128 -d10s` | 31,511 | 4.85 ms | read 94 | A |
+| 2026-10-28 | `14ee0c2` + working tree | HTTP cache helpers; transport writes 304 head without Content-Length (other responses unchanged; within noise) | todo `/` | `wrk -t8 -c128 -d10s` | 22,286 | 5.17 ms | read 25 | A |
+| 2026-10-28 | `14ee0c2` + working tree | HTTP cache helpers; transport writes 304 head without Content-Length (other responses unchanged; within noise) | todo `/api/todos` | `wrk -t8 -c400 -d10s` | 19,882 | 4.19 ms | read 56,647 | A |
 | 2026-10-28 | `09cfa3c` | baseline (harness rerun) | todo `/api/todos` | `wrk -t8 -c128 -d8s` | 37,855 | 3.31 ms | read 44 | A |
 | 2026-10-28 | `09cfa3c` | baseline (harness rerun) | todo `/` | `wrk -t8 -c128 -d8s` | 24,221 | 4.57 ms | read 12 | A |
 | 2026-10-28 | `09cfa3c` | baseline (harness rerun) | todo `/api/todos` | `wrk -t8 -c400 -d8s` | 21,362 | 3.56 ms | read 61,002 | A |

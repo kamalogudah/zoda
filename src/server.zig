@@ -581,7 +581,7 @@ test "a stalled connection does not block a second client" {
     try std.testing.expect(shutdown_elapsed.raw.nanoseconds < @as(i96, std.time.ns_per_s));
 }
 
-fn expectSocketResponse(reader: *Io.Reader, expected_status: u16, expected_body: []const u8, representation_length: usize) !void {
+fn expectSocketResponse(reader: *Io.Reader, expected_status: u16, expected_body: []const u8, representation_length: ?usize) !void {
     const status_line = std.mem.trim(u8, try reader.takeDelimiterInclusive('\n'), "\r\n");
     var expected_status_line: [32]u8 = undefined;
     const status_text = try std.fmt.bufPrint(&expected_status_line, "HTTP/1.1 {d}", .{expected_status});
@@ -595,7 +595,7 @@ fn expectSocketResponse(reader: *Io.Reader, expected_status: u16, expected_body:
             content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " \t\r\n"), 10);
         }
     }
-    try std.testing.expectEqual(representation_length, content_length.?);
+    try std.testing.expectEqual(representation_length, content_length);
     if (expected_body.len != 0) {
         var body: [256]u8 = undefined;
         try std.testing.expect(expected_body.len <= body.len);
@@ -633,7 +633,9 @@ test "JSON vertical slice runs over real sockets" {
         .{ "POST /users/42 HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n", @as(u16, 404), "Not Found", @as(usize, 9) },
         .{ "POST /echo HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", @as(u16, 200), "hello", @as(usize, 5) },
         .{ "HEAD / HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 200), "", @as(usize, 15) },
-        .{ "GET /empty HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 204), "", @as(usize, 0) },
+        // 204 has no Content-Length; the next response must stay aligned.
+        .{ "GET /empty HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 204), "", @as(?usize, null) },
+        .{ "GET / HTTP/1.1\r\nHost: test\r\n\r\n", @as(u16, 200), "hello from zoda", @as(usize, 15) },
     };
     inline for (requests) |request_case| {
         try writer.interface.writeAll(request_case[0]);

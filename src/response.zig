@@ -255,6 +255,19 @@ pub const Response = struct {
         self.handled = true;
     }
 
+    /// Converts a handled response into `304 Not Modified`: releases the body
+    /// and content type and keeps every header field, so validators, cache
+    /// policy, `Vary`, and `Set-Cookie` still reach the client. Infallible.
+    /// The transport omits Content-Length and Content-Type on a 304.
+    pub fn notModified(self: *Response) void {
+        if (self.body.len != 0) self.allocator.free(self.body);
+        if (self.content_type.len != 0) self.allocator.free(@constCast(self.content_type));
+        self.body = &.{};
+        self.content_type = &.{};
+        self.status_code = 304;
+        self.handled = true;
+    }
+
     /// Formats a value with `std.fmt` and appends it via `setHeader`. The
     /// formatted bytes are transient and never stored beyond the header byte
     /// limit; on any error the response is unchanged.
@@ -426,6 +439,22 @@ test "redirect honors header limits before changing response" {
     defer empty_body.deinit();
     try empty_body.redirectPath(.permanent_redirect, "/new");
     try testing.expectEqualStrings("", empty_body.body);
+}
+
+test "notModified drops body and content type and keeps headers" {
+    const testing = std.testing;
+    var res = Response.init(testing.allocator);
+    defer res.deinit();
+    try res.text(200, "body");
+    try res.setHeader("ETag", "\"v1\"");
+    try res.setHeader("Set-Cookie", "a=1");
+    res.notModified();
+    try testing.expectEqual(@as(u16, 304), res.status_code);
+    try testing.expect(res.handled);
+    try testing.expectEqualStrings("", res.body);
+    try testing.expectEqualStrings("", res.content_type);
+    try testing.expectEqual(@as(usize, 2), res.header_count);
+    res.notModified();
 }
 
 test "fresh response is empty and unhandled" {

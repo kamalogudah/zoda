@@ -55,6 +55,24 @@ runs inside `zig build test`.
   HTTPS redirect middleware is deferred until the transport or trusted-proxy
   scheme contract is specified and covered by integration tests. Forwarded
   scheme headers are not trusted by default.
+- `zoda.plugins.http_cache` holds explicit helpers; no cache policy is applied
+  by default, including to session or authenticated responses.
+  `setCacheControl(req, res, policy)` writes one `no-store`, `private`, or
+  `public` field with optional `max-age`, `s-maxage` (public only),
+  `no-cache`, `must-revalidate`, and `immutable`. It rejects a second policy
+  and lifetimes over 2147483648 s. It also rejects `public` when the response
+  has `Set-Cookie`, or when the request has `Authorization` or `Cookie`
+  without `allow_credentials`. `setETag` (strong or weak, ≤128 bytes of
+  `%x21 / %x23-7E`), `setBodyETag` (SHA-256 of content type and body, 128
+  bits hex), and `addVary` (deduplicated token, `*` refused) append fields
+  under the response header limits and fail without partial changes.
+  `evaluate(req, res)` applies weak `If-None-Match` comparison to handled GET
+  and HEAD 2xx responses. Repeated fields are one list, and `*` is valid
+  alone. A malformed field voids the condition. A match calls
+  `Response.notModified()`, which keeps headers and drops the body and content
+  type. The transport writes a 304 without `Content-Length`, `Content-Type`,
+  or body, and keeps the connection alive. `If-Modified-Since`, `If-Match`,
+  unsafe-method preconditions, and ranges are unsupported.
 - `zoda.BearerToken` is an opt-in registered plugin. `token(req)` returns a
   request-borrowed credential or null, and reports duplicate, malformed, or
   oversized Authorization credentials as errors. `authorized(req)` maps all

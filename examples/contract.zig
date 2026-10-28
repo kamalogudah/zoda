@@ -167,3 +167,59 @@ test "README request trace example" {
     try std.testing.expectEqual(@as(usize, 1), log.count);
     try std.testing.expectEqual(@as(?u16, 200), log.last_status);
 }
+
+// README "HTTP caching": explicit policy, validator, and conditional GET.
+const http_cache = zoda.plugins.http_cache;
+const CachePlugins = struct {};
+const CacheApp = zoda.app.App(CachePlugins);
+
+fn cacheRoute(_: *CacheApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.isLiteral("report") and (req.isGet() or req.method == .head)) {
+        try res.text(200, "report v42");
+        try http_cache.setCacheControl(req, res, .{ .private = .{ .no_cache = true } });
+        try http_cache.setBodyETag(res);
+        try http_cache.addVary(res, "Accept-Encoding");
+        _ = try http_cache.evaluate(req, res);
+        return;
+    }
+    if (req.isLiteral("plain") and req.isGet()) return res.text(200, "no policy");
+}
+
+test "README HTTP caching example" {
+    var app = try CacheApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{},
+        .route_fn = cacheRoute,
+    });
+    defer app.deinit();
+
+    var first_arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, "/report");
+    defer first_arena.deinit();
+    var first_req = first_arena.requestView(.get);
+    var first = try app.dispatch(&first_req);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try std.testing.expectEqualStrings("private, no-cache", (try first.getHeaderOne("Cache-Control")).?);
+    const etag = (try first.getHeaderOne("ETag")).?;
+
+    for ([_]zoda.router.Method{ .get, .head }) |method| {
+        var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, "/report");
+        defer arena.deinit();
+        try arena.copyHeaders(&.{.{ .name = "If-None-Match", .value = etag }});
+        var req = arena.requestView(method);
+        var res = try app.dispatch(&req);
+        defer res.deinit();
+        try std.testing.expectEqual(@as(u16, 304), res.status_code);
+        try std.testing.expectEqualStrings("", res.body);
+        try std.testing.expectEqualStrings(etag, (try res.getHeaderOne("ETag")).?);
+        try std.testing.expectEqualStrings("Accept-Encoding", (try res.getHeaderOne("Vary")).?);
+    }
+
+    // Routes that set no policy send no Cache-Control.
+    var plain_arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, "/plain");
+    defer plain_arena.deinit();
+    var plain_req = plain_arena.requestView(.get);
+    var plain = try app.dispatch(&plain_req);
+    defer plain.deinit();
+    try std.testing.expect((try plain.getHeaderOne("Cache-Control")) == null);
+}

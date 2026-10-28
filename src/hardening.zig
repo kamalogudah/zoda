@@ -12,6 +12,7 @@ const std = @import("std");
 const server = @import("server.zig");
 const response = @import("response.zig");
 const router = @import("router.zig");
+const http_cache = @import("plugins/http_cache.zig");
 
 const Io = std.Io;
 const net = Io.net;
@@ -93,7 +94,8 @@ const Counters = struct {
 
 /// Application used by every scenario. Routes:
 /// `GET|HEAD /` → "ok"; `POST /echo` → request body; `GET /big` → a body of
-/// `big_body_len` bytes; `GET /block` → parks in dispatch until canceled.
+/// `big_body_len` bytes; `GET /block` → parks in dispatch until canceled;
+/// `GET|HEAD /cached` → "cached body" with ETag "v1" and conditional GET.
 const TestApp = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -109,6 +111,12 @@ const TestApp = struct {
 
         if (req.isRoot() and (req.isGet() or req.method == .head)) {
             try res.text(200, "ok");
+        } else if (req.isLiteral("cached") and (req.isGet() or req.method == .head)) {
+            try res.text(200, "cached body");
+            try http_cache.setCacheControl(req, &res, .{ .private = .{ .no_cache = true } });
+            try http_cache.setETag(&res, .strong("v1"));
+            try http_cache.addVary(&res, "Accept-Encoding");
+            _ = try http_cache.evaluate(req, &res);
         } else if (req.isLiteral("echo") and req.method == .post) {
             try res.text(200, req.body);
         } else if (req.isLiteral("big") and req.isGet()) {
@@ -454,6 +462,52 @@ test "pipelined requests keep their boundaries and the request cap closes" {
     try testing.expect(four.close);
     try client.expectClosed();
     try testing.expectEqual(@as(usize, 4), h.dispatches());
+
+    try h.expectBaseline();
+    try h.stop();
+}
+
+test "pipelined conditional requests keep 304 and HEAD framing in sync" {
+    var h: Harness = undefined;
+    try h.start(.{ .shutdown_grace_period = ms(25) }, 0);
+    defer h.deinit();
+
+    var client = try h.connect();
+    defer client.close();
+    try client.send("GET /cached HTTP/1.1\r\nHost: t\r\nIf-None-Match: \"v1\"\r\n\r\n" ++
+        "HEAD /cached HTTP/1.1\r\nHost: t\r\nIf-None-Match: W/\"v1\"\r\n\r\n" ++
+        "HEAD /cached HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /cached HTTP/1.1\r\nHost: t\r\nIf-None-Match: \"v2\"\r\n\r\n" ++
+        "GET /cached HTTP/1.1\r\nHost: t\r\nIf-None-Match: \"a\"\r\nIf-None-Match: \"v1\"\r\n\r\n" ++
+        "GET /cached HTTP/1.1\r\nHost: t\r\nIf-None-Match: v1\r\n\r\n" ++
+        "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    // A 304 carries no Content-Length; reading it as bodyless must leave the
+    // next response aligned on the same connection.
+    for ([_]u16{ 304, 304 }) |status| {
+        const reply = try client.readResponse(true);
+        defer reply.deinit();
+        try testing.expectEqual(status, reply.status);
+        try testing.expectEqual(@as(?usize, null), reply.content_length);
+        try testing.expect(!reply.close);
+    }
+    const head = try client.readResponse(true);
+    defer head.deinit();
+    try testing.expectEqual(@as(u16, 200), head.status);
+    try testing.expectEqual(@as(?usize, 11), head.content_length);
+    const changed = try client.expectResponse(200, "cached body");
+    defer changed.deinit();
+    const repeated = try client.readResponse(true);
+    defer repeated.deinit();
+    try testing.expectEqual(@as(u16, 304), repeated.status);
+    try testing.expectEqual(@as(?usize, null), repeated.content_length);
+    const invalid = try client.expectResponse(200, "cached body");
+    defer invalid.deinit();
+    const root = try client.expectResponse(200, "ok");
+    defer root.deinit();
+    try testing.expect(root.close);
+    try client.expectClosed();
+    try testing.expectEqual(@as(usize, 7), h.dispatches());
+    try testing.expectEqual(@as(usize, 1), h.stats.admitted.load(.acquire));
 
     try h.expectBaseline();
     try h.stop();
