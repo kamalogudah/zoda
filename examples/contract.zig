@@ -21,6 +21,34 @@ const Plugins = struct {
 };
 const App = zoda.app.App(Plugins);
 
+// README "Typed JSON requests": this route and its plugin registration compile
+// as part of `zig build test-examples`.
+const JsonInput = struct { name: []const u8 };
+const JsonPlugins = struct { json_parser: zoda.JsonParser = .{} };
+const JsonApp = zoda.app.App(JsonPlugins);
+
+fn jsonRoute(ctx: *JsonApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.isLiteral("names") and req.method == .post) {
+        var parsed = ctx.plugins.json_parser.parse(res.allocator, req, JsonInput) catch |err| switch (err) {
+            error.BodyTooLarge => return res.text(413, "body too large"),
+            error.OutOfMemory => return err,
+            else => return res.text(400, "invalid JSON request"),
+        };
+        defer parsed.deinit();
+        return res.text(201, parsed.value.name);
+    }
+}
+
+test "typed JSON route uses registered parser" {
+    const json_app: JsonApp = .{ .response_allocator = std.testing.allocator, .config = .{}, .plugins = .{}, .route_fn = jsonRoute };
+    const headers = [_]zoda.router.Header{.{ .name = "Content-Type", .value = "application/json" }};
+    var req: zoda.router.Request = .{ .method = .post, .segments = &.{"names"}, .headers = &headers, .body = "{\"name\":\"Ada\"}" };
+    var res = try json_app.dispatch(&req);
+    defer res.deinit();
+    try std.testing.expectEqual(@as(u16, 201), res.status_code);
+    try std.testing.expectEqualStrings("Ada", res.body);
+}
+
 fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
     if (req.isRoot() and req.isGet()) return res.text(200, "hello from zoda");
     if (req.isLiteral("old")) {

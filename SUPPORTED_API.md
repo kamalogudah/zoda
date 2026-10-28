@@ -40,6 +40,16 @@ runs inside `zig build test`.
   to space. `getAll` iterates all values; `getOne` errors on duplicates. Header
   names are case-insensitive; repeated fields remain separate, and
   `getHeaderOne` errors on duplicates. The body is fully buffered.
+- `zoda.JsonParser` (`zoda.plugins.json_parser`) is an opt-in registered
+  request plugin. `parse(allocator, req, T)` accepts exactly one
+  `Content-Type: application/json` field, optionally with `charset=utf-8`,
+  and parses the buffered body into `std.json.Parsed(T)`. It reports missing,
+  duplicate, or unsupported content types, empty or oversized bodies, invalid
+  JSON (including duplicate or unknown object fields), and allocation failure
+  distinctly. Its default body limit is 1 MiB. The caller owns the parsed
+  value and calls `deinit()`; parsed strings are copied and may outlive the
+  request until then. See the [compiling route](examples/contract.zig) and
+  [README](README.md#typed-json-requests).
 - `zoda.app.App(Plugins)`: typed context, explicit plugin access, request
   state lifecycle, `composeRoute` wrappers, ordered middleware, default 404,
   and owned `Response` return from `dispatch`.

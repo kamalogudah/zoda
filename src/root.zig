@@ -48,6 +48,8 @@ pub const static = @import("static.zig");
 pub const plugins = struct {
     /// Stateless JSON response plugin (ADR-0001 §5.3).
     pub const json = @import("plugins/json.zig");
+    /// Typed parsing of bounded JSON request bodies.
+    pub const json_parser = @import("plugins/json_parser.zig");
     /// Configured route-miss fallback (ADR-0001 §3.3).
     pub const not_found = @import("plugins/not_found.zig");
     /// Authenticated cookie sessions with explicit persistence.
@@ -66,6 +68,7 @@ pub const plugins = struct {
 
 /// Re-export the JSON plugin instance type for convenience.
 pub const Json = plugins.json.Json;
+pub const JsonParser = plugins.json_parser.JsonParser;
 
 /// Re-export the not-found wrapper instance type for convenience.
 pub const NotFound = plugins.not_found.NotFound;
@@ -90,6 +93,7 @@ comptime {
     std.testing.refAllDecls(host_authorization);
     std.testing.refAllDecls(static);
     std.testing.refAllDecls(plugins.json);
+    std.testing.refAllDecls(plugins.json_parser);
     std.testing.refAllDecls(plugins.not_found);
     std.testing.refAllDecls(plugins.sessions);
     std.testing.refAllDecls(plugins.csrf);

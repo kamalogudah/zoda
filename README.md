@@ -256,6 +256,39 @@ const ua = try req.getHeaderOne("user-agent"); // case-insensitive lookup
 const body = req.body;                    // fully buffered body
 ```
 
+### Typed JSON requests
+
+Register `zoda.JsonParser` separately from the JSON response plugin. It parses
+the already buffered body into a caller-selected type, with a default 1 MiB
+parser bound. The transport's request body bound applies first for socket
+requests. This route is compiled in `examples/contract.zig`:
+
+```zig
+const JsonInput = struct { name: []const u8 };
+const Plugins = struct { json_parser: zoda.JsonParser = .{} };
+const App = zoda.app.App(Plugins);
+
+fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (req.isLiteral("names") and req.method == .post) {
+        var parsed = ctx.plugins.json_parser.parse(res.allocator, req, JsonInput) catch |err| switch (err) {
+            error.BodyTooLarge => return res.text(413, "body too large"),
+            error.OutOfMemory => return err,
+            else => return res.text(400, "invalid JSON request"),
+        };
+        defer parsed.deinit();
+        return res.text(201, parsed.value.name);
+    }
+}
+```
+
+`parse` accepts one `Content-Type: application/json` field, optionally with
+`charset=utf-8` (case-insensitive). It reports missing, duplicate, and
+unsupported content types separately; empty, oversized, and invalid bodies
+also have distinct errors. JSON object fields must match the selected type;
+unknown and duplicate fields fail. Pass an allocator explicitly and call
+`parsed.deinit()` after using the value. Parsed strings are copied and can
+outlive the request, but become invalid after `deinit()`.
+
 ### Responses
 
 A `Response` owns copies of its body and headers, allocated from the app's
@@ -338,6 +371,7 @@ Built-in plugins:
 | Plugin | Use it for |
 | --- | --- |
 | `zoda.Json` | Rendering typed values as JSON responses |
+| `zoda.JsonParser` | Parsing bounded request JSON into a caller-selected type |
 | `zoda.NotFound` | A configured text fallback for route misses |
 | `zoda.BearerToken` | Parsing and validating `Authorization: Bearer` credentials |
 | `zoda.Sessions` | Signed client-side cookie sessions with explicit saves |
