@@ -78,8 +78,10 @@ Partial reloads with `optional` and `always` props followed
 ([#70](https://github.com/kamalogudah/zoda/issues/70)), merge props with
 reset ([#71](https://github.com/kamalogudah/zoda/issues/71)), scroll
 props ([#72](https://github.com/kamalogudah/zoda/issues/72)), once
-props ([#73](https://github.com/kamalogudah/zoda/issues/73)), and top-level
-flash from `zoda.Flash` ([#74](https://github.com/kamalogudah/zoda/issues/74)); the remaining
+props ([#73](https://github.com/kamalogudah/zoda/issues/73)), top-level
+flash from `zoda.Flash` ([#74](https://github.com/kamalogudah/zoda/issues/74)),
+and session-backed validation errors with error bags
+([#75](https://github.com/kamalogudah/zoda/issues/75)); the remaining
 deferred features are listed in
 [PLUGINS.md](PLUGINS.md#supported-protocol-features).
 

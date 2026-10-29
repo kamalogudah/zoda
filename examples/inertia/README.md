@@ -39,7 +39,7 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
 | --- | --- | --- |
 | `GET /` | redirect | 302 to `/todos` |
 | `GET /todos[?filter=active\|done][&page=n]` | `render("Todos/Index", …)` | HTML shell on the first visit, the page JSON on Inertia visits; 10 todos per page, newest first |
-| `POST /todos` with `{"text": "…"}` | add | flash "Todo added", then back to the current filter at `#todo-<id>`, or the page again with `errors.text` |
+| `POST /todos` with `{"text": "…"}` | add | flash "Todo added", then back to the current filter at `#todo-<id>`; or store `errors.text` and 303 back to the current filter |
 | `PATCH /todos/:id` | toggle | 303 back |
 | `DELETE /todos/:id` | delete | 303 back, or 404 |
 
@@ -60,9 +60,16 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   instead, and the v3 client visits that URL and keeps the fragment. The
   target is built from the validated filter enum and the new id, never from
   request bytes.
-- **Validation.** An empty or too-long todo re-renders the page with
-  `errors: { text: "…" }`, which `useForm` exposes as `form.errors.text`.
-  Other renders leave `errors` out and the plugin sends `errors: {}`.
+- **Validation.** An empty or too-long todo is not re-rendered on the
+  POST. `rejectTodo` calls `redirectWithErrors`, which stores
+  `{text: "…"}` in the session through `zoda.Flash` and sends 303 back to
+  the current filter's list, a path built from the filter enum rather than
+  `Referer`. The add form posts with `errorBag: 'createTodo'`, so the
+  client sends `X-Inertia-Error-Bag: createTodo` and the errors are stored
+  as `{createTodo: {text: "…"}}`. The followed GET's `renderWith` sends
+  them as `props.errors` and the save after it drops them; the client
+  hands `errors.createTodo` to `useForm`, which shows
+  `form.errors.text`. The next visit has `errors: {}` again.
 - **Partial reloads.** `router.reload({ only: ['todos'] })` sends
   `X-Inertia-Partial-Component: Todos/Index` and
   `X-Inertia-Partial-Data: todos`, and the server answers with only `todos`
@@ -105,8 +112,7 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   that sends the old version gets 409 and `X-Inertia-Location` and does a full
   reload, so it never mixes old JavaScript with new props.
 
-The session only carries flash messages. Validation errors are still
-rendered directly rather than redirected back through the session. The JSON body parser accepts only
+The session only carries flash messages and validation errors. The JSON body parser accepts only
 `Content-Type: application/json`, so a plain cross-site HTML form cannot post
 here. A real app that uses cookies should still add CSRF checks; see
 [PLUGINS.md](../../PLUGINS.md#inertiajs) for how Inertia's `X-XSRF-TOKEN`
@@ -117,6 +123,6 @@ relates to Zoda's CSRF helpers.
 `zig build test` (and `zig build test-examples`) runs the server tests in
 `server.zig`, which dispatch requests without a browser or a built frontend.
 They cover the HTML shell, the JSON page, add, toggle, filter, and delete,
-validation errors, the version conflict, a partial reload of `todos`,
+redirect-back validation errors in the `createTodo` bag shown once, the version conflict, a partial reload of `todos`,
 loading the deferred `stats`, paging `todos` forward, backward, and
 after a reset, and the "Todo added" flash shown once.

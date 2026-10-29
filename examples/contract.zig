@@ -958,3 +958,73 @@ test "PLUGINS Inertia.js flash example" {
     try std.testing.expectEqualStrings("{\"component\":\"Todos/Index\",\"props\":{\"errors\":{}},\"url\":\"/todos\",\"version\":null}", after.body);
     try std.testing.expect(unchanged == null);
 }
+
+// PLUGINS.md "Inertia.js" validation errors: a failed POST stores its errors
+// and redirects back; the next render sends them as `props.errors` once.
+fn inertiaErrorsRoute(ctx: *InertiaFlashApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    const session = &ctx.state.sessions;
+    const inertia = &ctx.plugins.inertia;
+    const source: zoda.plugins.inertia.FlashSource = .{ .plugin = &ctx.plugins.flash, .session = session };
+    if (req.onLiteral("todos") and req.isRoot()) {
+        if (req.method == .post) {
+            // The route names the page to go back to; `Referer` is not used.
+            try inertia.redirectWithErrors(req, res, source, "/todos", .{ .text = "Write something first." });
+            return ctx.plugins.sessions.save(session, res);
+        }
+        try inertia.renderWith(req, res, "Todos/Index", .{}, .{ .flash = source });
+        return ctx.plugins.sessions.save(session, res);
+    }
+}
+
+test "PLUGINS Inertia.js validation errors example" {
+    var app = try InertiaFlashApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{
+            .sessions = .{
+                .keys = &.{.{ .id = 1, .secret = "example-secret-of-at-least-32-bytes!" }},
+                .lifetime_seconds = 3600,
+                .now_seconds = flashClock,
+            },
+            .inertia = .{ .layout = inertia_layout },
+        },
+        .route_fn = inertiaErrorsRoute,
+    });
+    defer app.deinit();
+
+    var cookies: [2][zoda.plugins.sessions.max_cookie_bytes]u8 = undefined;
+    const Visit = struct {
+        fn run(a: *const InertiaFlashApp, method: zoda.router.Method, cookie: ?[]const u8, out: []u8) !struct { zoda.response.Response, ?[]const u8 } {
+            var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, "/todos");
+            defer arena.deinit();
+            const headers = [_]zoda.request.Header{
+                .{ .name = "X-Inertia", .value = "true" },
+                .{ .name = "X-Inertia-Error-Bag", .value = "createTodo" },
+                .{ .name = "Cookie", .value = cookie orelse "" },
+            };
+            try arena.copyHeaders(if (cookie != null) &headers else headers[0..2]);
+            var req = arena.requestView(method);
+            const res = try a.dispatch(&req);
+            const set_cookie = (try res.getHeaderOne("Set-Cookie")) orelse return .{ res, null };
+            const value = set_cookie[0..std.mem.indexOfScalar(u8, set_cookie, ';').?];
+            @memcpy(out[0..value.len], value);
+            return .{ res, out[0..value.len] };
+        }
+    };
+
+    var posted, const pending = try Visit.run(&app, .post, null, &cookies[0]);
+    defer posted.deinit();
+    try std.testing.expectEqual(@as(u16, 303), posted.status_code);
+    try std.testing.expectEqualStrings("/todos", (try posted.getHeaderOne("Location")).?);
+
+    var shown, const read = try Visit.run(&app, .get, pending, &cookies[1]);
+    defer shown.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Todos/Index\",\"props\":{\"errors\":{\"createTodo\":{\"text\":\"Write something first.\"}}},\"url\":\"/todos\",\"version\":null}",
+        shown.body,
+    );
+
+    var after, const unchanged = try Visit.run(&app, .get, read, &cookies[0]);
+    defer after.deinit();
+    try std.testing.expectEqualStrings("{\"component\":\"Todos/Index\",\"props\":{\"errors\":{}},\"url\":\"/todos\",\"version\":null}", after.body);
+    try std.testing.expect(unchanged == null);
+}

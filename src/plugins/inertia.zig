@@ -76,9 +76,17 @@
 //!   included: the client cannot be told apart from a deferred-props reload,
 //!   whose flash it ignores. A page with no messages has no `flash` field,
 //!   which the client reads as `{}`.
+//! - Validation errors: `redirectWithErrors(req, res, source, path, errors)`
+//!   stores the typed `errors` in the session through `zoda.Flash`, under
+//!   the reserved kind `errors_flash_kind`, and redirects to the
+//!   route-supplied local `path` with 303. An Inertia request's
+//!   `X-Inertia-Error-Bag: name` nests them as `{name: errors}`. The next
+//!   `renderWith` with `.flash` sends them as `props.errors`, where route
+//!   `errors` win over them and they win over shared `errors`, and consumes
+//!   them with the flash messages.
 //!
-//! Not implemented: once deferred props, error bags, history encryption,
-//! precognition, and server-side rendering.
+//! Not implemented: once deferred props, history encryption, precognition,
+//! and server-side rendering.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
 //! the current page are the raw origin-form request target, so path and
@@ -109,6 +117,12 @@ pub const max_partial_bytes = 1024;
 /// Largest `expiresAt`: the largest integer a JavaScript number holds
 /// exactly.
 pub const max_once_expires_at: i64 = (1 << 53) - 1;
+/// Most bytes in an `X-Inertia-Error-Bag` value.
+pub const max_error_bag_bytes = 64;
+/// The `zoda.Flash` kind that holds the errors `redirectWithErrors` stores.
+/// `renderWith` leaves it out of the page's `flash`; do not add messages of
+/// this kind yourself.
+pub const errors_flash_kind = "inertia-errors";
 
 pub const HeaderError = error{ DuplicateInertiaHeader, MalformedInertiaHeader, DuplicateVersionHeader };
 pub const PartialError = error{ DuplicatePartialHeader, MalformedPartialHeader, PartialHeaderTooLarge };
@@ -116,11 +130,13 @@ pub const ScrollError = error{InvalidScrollPageName};
 pub const OnceError = error{ OnceClockNotConfigured, InvalidOnceTime };
 pub const ConfigError = error{ InvalidLayout, InvalidRootId };
 pub const TargetError = error{ MissingRequestTarget, UnsafeRequestTarget };
+pub const ErrorBagError = error{ DuplicateErrorBagHeader, MalformedErrorBagHeader };
 pub const RenderError = HeaderError || PartialError || ScrollError || OnceError || ConfigError || TargetError || response.HeaderError || error{
     BodyTooLarge,
     InvalidComponent,
 };
 pub const RedirectError = HeaderError || response.RedirectError || error{InvalidLocation};
+pub const ErrorsRedirectError = RedirectError || ErrorBagError || flash_mod.Error;
 
 /// Reports whether `req` is an Inertia visit. Exactly one `X-Inertia` field
 /// with the value `true` qualifies; a repeated field or any other value is an
@@ -141,6 +157,19 @@ pub fn requestUrl(req: *const router.Request) TargetError![]const u8 {
         if (c <= ' ' or c >= 0x7f or c == '\\') return error.UnsafeRequestTarget;
     }
     return target;
+}
+
+/// Returns the `X-Inertia-Error-Bag` value: 1 to `max_error_bag_bytes`
+/// `[A-Za-z0-9_-]` bytes, or null without the field. A repeated field or
+/// any other value is an error.
+pub fn errorBag(req: *const router.Request) ErrorBagError!?[]const u8 {
+    const value = req.getHeaderOne("X-Inertia-Error-Bag") catch return error.DuplicateErrorBagHeader;
+    const bag = value orelse return null;
+    if (bag.len == 0 or bag.len > max_error_bag_bytes) return error.MalformedErrorBagHeader;
+    for (bag) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return error.MalformedErrorBagHeader;
+    }
+    return bag;
 }
 
 /// How a prop takes part in partial reloads.
@@ -583,8 +612,9 @@ fn partialList(req: *const router.Request, name: []const u8) PartialError!?[]con
     return value;
 }
 
-/// Where `renderWith` reads flash messages: the registered `zoda.Flash` and
-/// this request's session state.
+/// Where `renderWith` reads flash messages and stored validation errors, and
+/// `redirectWithErrors` stores errors: the registered `zoda.Flash` and this
+/// request's session state.
 pub const FlashSource = struct {
     plugin: *const flash_mod.Flash,
     session: *sessions.Sessions.State,
@@ -593,8 +623,9 @@ pub const FlashSource = struct {
 /// Per-call additions to `render`.
 pub const RenderOptions = struct {
     /// Sends the messages this request received as the page's top-level
-    /// `flash` and consumes them. Call `Sessions.save` after `renderWith` to
-    /// persist the consumption.
+    /// `flash`, and errors stored by `redirectWithErrors` as `props.errors`,
+    /// and consumes them. Call `Sessions.save` after `renderWith` to persist
+    /// the consumption.
     flash: ?FlashSource = null,
 };
 
@@ -664,9 +695,9 @@ pub fn Inertia(comptime SharedProps: type) type {
         }
 
         /// `render` with per-call options. With `options.flash`, the page
-        /// carries the received flash messages, which are marked read once
-        /// the response is committed; on an error or a version conflict they
-        /// stay unread.
+        /// carries the received flash messages and stored validation errors,
+        /// which are marked read once the response is committed; on an error
+        /// or a version conflict they stay unread.
         pub fn renderWith(
             self: *const Self,
             req: *const router.Request,
@@ -741,17 +772,49 @@ pub fn Inertia(comptime SharedProps: type) type {
             res: *response.Response,
             path: []const u8,
         ) RedirectError!void {
-            const inertia = try isInertia(req);
-            if (!inertia or std.mem.indexOfScalar(u8, path, '#') == null) {
-                return res.redirectPath(followUpStatus(req), path);
+            return sendRedirect(req, res, followUpStatus(req), path);
+        }
+
+        /// Stores `errors`, a struct such as `.{ .text = "Required" }`, in the
+        /// session for the next `renderWith` with `.flash`, then redirects to
+        /// the local `path` with 303, or with 409 and `X-Inertia-Redirect`
+        /// like `redirect` when it has a fragment. Pass the form's page, built
+        /// by the route: `Referer` is never read. On an Inertia request,
+        /// `X-Inertia-Error-Bag: name` nests them as `{name: errors}`. Null
+        /// optional fields are left out. Call `Sessions.save` afterwards.
+        /// Any failure, including `error.FlashTooLarge` for errors that do
+        /// not fit the flash budget, leaves the response and session
+        /// unchanged.
+        pub fn redirectWithErrors(
+            _: *const Self,
+            req: *const router.Request,
+            res: *response.Response,
+            source: FlashSource,
+            path: []const u8,
+            errors: anytype,
+        ) ErrorsRedirectError!void {
+            comptime {
+                const info = @typeInfo(@TypeOf(errors));
+                if (info != .@"struct" or info.@"struct".is_tuple) @compileError("Inertia errors must be a struct with named fields");
             }
-            try response.validateRedirectPath(path);
-            var existing = res.getAllHeaders("X-Inertia-Redirect");
-            if (existing.next() != null) return error.LocationAlreadySet;
-            try reserveHeaders(res, 1, "X-Inertia-Redirect".len + path.len);
-            try res.setHeader("X-Inertia-Redirect", path);
-            try addInertiaVary(res);
-            emptyBody(res, 409);
+            const inertia = try isInertia(req);
+            const bag = if (inertia) try errorBag(req) else null;
+            var buffer: [flash_mod.max_bytes]u8 = undefined;
+            var out: std.Io.Writer = .fixed(&buffer);
+            var json: std.json.Stringify = .{ .writer = &out, .options = .{ .emit_null_optional_fields = false } };
+            encodeErrors(&json, bag, errors) catch return error.FlashTooLarge;
+            try checkRedirect(inertia, res, path);
+            try source.plugin.add(source.session, errors_flash_kind, out.buffered());
+            return sendRedirect(req, res, .see_other, path);
+        }
+
+        fn encodeErrors(json: *std.json.Stringify, bag: ?[]const u8, errors: anytype) std.json.Stringify.Error!void {
+            if (bag) |name| {
+                try json.beginObject();
+                try json.objectField(name);
+            }
+            try json.write(errors);
+            if (bag != null) try json.endObject();
         }
 
         /// Forces a full page visit to a local path or an absolute `http(s)`
@@ -838,14 +901,19 @@ pub fn Inertia(comptime SharedProps: type) type {
             flash: ?flash_mod.Messages,
         ) (error{OutOfMemory} || ScrollError || OnceError || PropsError(SharedProps) || PropsError(@TypeOf(props)))!void {
             const P = @TypeOf(props);
+            // Route `errors` win over stored ones, which win over shared ones.
+            const stored = if (comptime @hasField(P, "errors")) null else if (flash) |messages| try storedErrors(arena, messages) else null;
             json.beginObject() catch return error.OutOfMemory;
             try writeField(json, "component", component);
             json.objectField("props") catch return error.OutOfMemory;
             json.beginObject() catch return error.OutOfMemory;
             if (shared) |value| {
                 inline for (std.meta.fields(SharedProps)) |field| {
+                    const replaced = comptime std.mem.eql(u8, field.name, "errors");
                     if (comptime !@hasField(P, field.name)) {
-                        try writeProp(json, arena, partial, once_visit, field.name, @field(value, field.name));
+                        if (!replaced or stored == null) {
+                            try writeProp(json, arena, partial, once_visit, field.name, @field(value, field.name));
+                        }
                     }
                 }
             }
@@ -854,7 +922,10 @@ pub fn Inertia(comptime SharedProps: type) type {
             }
             // Clients treat `errors` as always present, as Laravel sends it.
             const shared_errors = shared != null and @hasField(SharedProps, "errors");
-            if (comptime !@hasField(P, "errors")) {
+            if (stored) |text| {
+                json.objectField("errors") catch return error.OutOfMemory;
+                json.print("{s}", .{text}) catch return error.OutOfMemory;
+            } else if (comptime !@hasField(P, "errors")) {
                 if (!shared_errors) try writeField(json, "errors", struct {}{});
             }
             json.endObject() catch return error.OutOfMemory;
@@ -880,16 +951,34 @@ pub fn Inertia(comptime SharedProps: type) type {
             json.endObject() catch return error.OutOfMemory;
         }
 
+        /// The errors `redirectWithErrors` stored, the last entry of
+        /// `errors_flash_kind` winning. One that is not a JSON object, which
+        /// only a hand-added message can be, is ignored.
+        fn storedErrors(arena: std.mem.Allocator, messages: flash_mod.Messages) error{OutOfMemory}!?[]const u8 {
+            var it = messages;
+            var found: ?[]const u8 = null;
+            while (it.next()) |message| {
+                if (std.mem.eql(u8, message.kind, errors_flash_kind)) found = message.text;
+            }
+            const text = found orelse return null;
+            if (text.len == 0 or text[0] != '{' or !try std.json.validate(arena, text)) return null;
+            return text;
+        }
+
         /// Writes `flash` as `{kind: text}` in the order each kind was last
         /// added, so a later message of a kind replaces an earlier one, as
         /// the client's `router.flash(key, value)` does. Leaves the field out
-        /// when there are no messages.
+        /// when there are no messages other than stored errors.
         fn writeFlash(json: *std.json.Stringify, messages: flash_mod.Messages) error{OutOfMemory}!void {
-            if (messages.count == 0) return;
+            var shown = messages;
+            while (shown.next()) |message| {
+                if (!std.mem.eql(u8, message.kind, errors_flash_kind)) break;
+            } else return;
             json.objectField("flash") catch return error.OutOfMemory;
             json.beginObject() catch return error.OutOfMemory;
             var it = messages;
             while (it.next()) |message| {
+                if (std.mem.eql(u8, message.kind, errors_flash_kind)) continue;
                 var later = it;
                 const replaced = while (later.next()) |next| {
                     if (std.mem.eql(u8, next.kind, message.kind)) break true;
@@ -1285,6 +1374,34 @@ fn followUpStatus(req: *const router.Request) response.RedirectStatus {
         .get, .head => .found,
         else => .see_other,
     };
+}
+
+/// Checks, without changing the response, that `sendRedirect` to `path`
+/// cannot fail other than by running out of memory.
+fn checkRedirect(inertia: bool, res: *const response.Response, path: []const u8) RedirectError!void {
+    try response.validateRedirectPath(path);
+    const fragment = inertia and std.mem.indexOfScalar(u8, path, '#') != null;
+    const name = if (fragment) "X-Inertia-Redirect" else "Location";
+    var existing = res.getAllHeaders(name);
+    if (existing.next() != null) return error.LocationAlreadySet;
+    if (fragment) return reserveHeaders(res, 1, name.len + path.len);
+    if (res.header_count + 1 > res.limits.max_headers) return error.TooManyHeaders;
+    if (res.header_bytes_used + name.len + path.len > res.limits.header_bytes) return error.HeaderBytesExceeded;
+}
+
+/// `redirect` with an explicit status for the plain `Location` form.
+fn sendRedirect(req: *const router.Request, res: *response.Response, status: response.RedirectStatus, path: []const u8) RedirectError!void {
+    const inertia = try isInertia(req);
+    if (!inertia or std.mem.indexOfScalar(u8, path, '#') == null) {
+        return res.redirectPath(status, path);
+    }
+    try response.validateRedirectPath(path);
+    var existing = res.getAllHeaders("X-Inertia-Redirect");
+    if (existing.next() != null) return error.LocationAlreadySet;
+    try reserveHeaders(res, 1, "X-Inertia-Redirect".len + path.len);
+    try res.setHeader("X-Inertia-Redirect", path);
+    try addInertiaVary(res);
+    emptyBody(res, 409);
 }
 
 /// Checks that `count` more fields plus `bytes`, and a possible `Vary:
@@ -3237,4 +3354,274 @@ test "flash counts toward the body limit and a failure leaves it unread" {
     }));
     try testing.expect(!big.dirty and !big.flash.consumed);
     try testing.expectEqual(@as(usize, 0), json.header_count);
+}
+
+/// A request's session state with nothing stored.
+fn emptySession() !sessions.Sessions.State {
+    var req: router.Request = .{ .method = .get, .segments = &.{} };
+    return flash_test_sessions.initRequest(&req);
+}
+
+const ErrorsTest = struct {
+    const App = FlashTest.App;
+
+    const TodoErrors = struct { text: []const u8, due: ?[]const u8 = null };
+
+    fn route(ctx: *App.Context, req: *router.Request, res: *response.Response) !void {
+        const session = &ctx.state.sessions;
+        const inertia = &ctx.plugins.inertia;
+        const source: FlashSource = .{ .plugin = &ctx.plugins.flash, .session = session };
+        if (!req.onLiteral("todos") or !req.isRoot()) return;
+        if (req.method == .post) {
+            try ctx.plugins.flash.add(session, "alert", "Check the form");
+            try inertia.redirectWithErrors(req, res, source, "/todos", TodoErrors{ .text = "Write something first." });
+            return ctx.plugins.sessions.save(session, res);
+        }
+        try inertia.renderWith(req, res, "Todos/Index", .{}, .{ .flash = source });
+        return ctx.plugins.sessions.save(session, res);
+    }
+
+    fn app() !App {
+        return App.init(testing.allocator, .{
+            .response_allocator = testing.allocator,
+            .plugins = .{ .sessions = flash_test_sessions, .inertia = .{ .layout = test_layout, .version = .{ .value = "v1" } } },
+            .route_fn = route,
+        });
+    }
+
+    fn page(comptime errors: []const u8, comptime rest: []const u8) []const u8 {
+        return "{\"component\":\"Todos/Index\",\"props\":{\"errors\":" ++ errors ++ "},\"url\":\"/todos\",\"version\":\"v1\"" ++ rest ++ "}";
+    }
+
+    fn withBag(comptime bag: []const u8) []const router.Header {
+        return &(inertia_headers ++ [_]router.Header{.{ .name = "X-Inertia-Error-Bag", .value = bag }});
+    }
+};
+
+test "errors stored before a redirect are sent once as props.errors" {
+    var app = try ErrorsTest.app();
+    defer app.deinit();
+    var a: [2][8192]u8 = undefined;
+    var b: [2][8192]u8 = undefined;
+    var c: [2][8192]u8 = undefined;
+
+    const failed = try FlashTest.visit(&app, .post, "/todos", null, &inertia_headers, &a);
+    try testing.expectEqual(@as(u16, 303), failed.status);
+    try testing.expectEqualStrings("", failed.body);
+
+    // The followed GET carries the errors, without the null `due`, and the
+    // alert as `flash`, which leaves the errors entry out.
+    const shown = try FlashTest.visit(&app, .get, "/todos", failed.cookie, &inertia_headers, &b);
+    try testing.expectEqualStrings(
+        ErrorsTest.page("{\"text\":\"Write something first.\"}", ",\"flash\":{\"alert\":\"Check the form\"}"),
+        shown.body,
+    );
+
+    // Displayed once: the saved cookie no longer holds them.
+    const after = try FlashTest.visit(&app, .get, "/todos", shown.cookie, &inertia_headers, &c);
+    try testing.expectEqualStrings(ErrorsTest.page("{}", ""), after.body);
+    try testing.expect(after.cookie == null);
+
+    // A partial reload, which always sends `errors`, consumes them too.
+    const reload = try FlashTest.visit(&app, .get, "/todos", failed.cookie, partialHeaders("Todos/Index", &.{
+        .{ .name = "X-Inertia-Partial-Except", .value = "errors" },
+    }), &c);
+    try testing.expect(std.mem.indexOf(u8, reload.body, "\"errors\":{\"text\":\"Write something first.\"}") != null);
+    try testing.expect(reload.cookie != null);
+
+    // So does the HTML shell, where they are escaped like the rest.
+    const html = try FlashTest.visit(&app, .get, "/todos", failed.cookie, &.{}, &c);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"props\":{\"errors\":{\"text\":\"Write something first.\"}}") != null);
+
+    // A version conflict leaves them unread.
+    const stale = try FlashTest.visit(&app, .get, "/todos", failed.cookie, &.{.{ .name = "X-Inertia", .value = "true" }}, &c);
+    try testing.expectEqual(@as(u16, 409), stale.status);
+    try testing.expect(stale.cookie == null);
+
+    // An ordinary form post redirects the same way and ignores the bag.
+    const plain = try FlashTest.visit(&app, .post, "/todos", null, &.{.{ .name = "X-Inertia-Error-Bag", .value = "bad bag" }}, &a);
+    try testing.expectEqual(@as(u16, 303), plain.status);
+    const plain_shown = try FlashTest.visit(&app, .get, "/todos", plain.cookie, &inertia_headers, &b);
+    try testing.expect(std.mem.indexOf(u8, plain_shown.body, "\"errors\":{\"text\":\"Write something first.\"}") != null);
+}
+
+test "X-Inertia-Error-Bag nests errors under the bag and bad bags change nothing" {
+    var app = try ErrorsTest.app();
+    defer app.deinit();
+    var a: [2][8192]u8 = undefined;
+    var b: [2][8192]u8 = undefined;
+
+    const failed = try FlashTest.visit(&app, .post, "/todos", null, ErrorsTest.withBag("create_todo-2"), &a);
+    try testing.expectEqual(@as(u16, 303), failed.status);
+    // The bag was applied when storing, so the GET needs no header.
+    const shown = try FlashTest.visit(&app, .get, "/todos", failed.cookie, &inertia_headers, &b);
+    try testing.expectEqualStrings(
+        ErrorsTest.page("{\"create_todo-2\":{\"text\":\"Write something first.\"}}", ",\"flash\":{\"alert\":\"Check the form\"}"),
+        shown.body,
+    );
+
+    const longest = "b" ** max_error_bag_bytes;
+    const at_limit = try FlashTest.visit(&app, .post, "/todos", null, ErrorsTest.withBag(longest), &a);
+    try testing.expectEqual(@as(u16, 303), at_limit.status);
+
+    for ([_][]const u8{ "", "has space", "dot.ted", "b" ** (max_error_bag_bytes + 1), "caf\xc3\xa9" }) |bag| {
+        const headers = inertia_headers ++ [_]router.Header{.{ .name = "X-Inertia-Error-Bag", .value = bag }};
+        try testing.expectError(error.MalformedErrorBagHeader, FlashTest.visit(&app, .post, "/todos", null, &headers, &a));
+    }
+    try testing.expectError(error.DuplicateErrorBagHeader, FlashTest.visit(&app, .post, "/todos", null, &(inertia_headers ++ [_]router.Header{
+        .{ .name = "X-Inertia-Error-Bag", .value = "one" },
+        .{ .name = "x-inertia-error-bag", .value = "two" },
+    }), &a));
+
+    // Direct calls: a header error leaves the response and session as they were.
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const flash: flash_mod.Flash = .{};
+    var state = try emptySession();
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    const req = testRequest(.post, "/todos", &(inertia_headers ++ [_]router.Header{.{ .name = "X-Inertia-Error-Bag", .value = "a,b" }}));
+    try testing.expectError(error.MalformedErrorBagHeader, plugin.redirectWithErrors(&req, &res, .{ .plugin = &flash, .session = &state }, "/todos", .{ .text = "x" }));
+    try testing.expectEqual(@as(usize, 0), res.header_count);
+    try testing.expect(!state.dirty and state.flash.queued_count == 0);
+    try testing.expectEqual(@as(?[]const u8, null), try errorBag(&testRequest(.get, "/", &.{})));
+}
+
+test "redirectWithErrors validates the path, fragments, limits, and size first" {
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const flash: flash_mod.Flash = .{};
+    const inertia_post = testRequest(.post, "/todos", &inertia_headers);
+    const plain_post = testRequest(.post, "/todos", &.{});
+
+    // An Inertia request to a path with a fragment gets X-Inertia-Redirect.
+    var state = try emptySession();
+    var fragment = response.Response.init(testing.allocator);
+    defer fragment.deinit();
+    try plugin.redirectWithErrors(&inertia_post, &fragment, .{ .plugin = &flash, .session = &state }, "/todos#new", .{ .text = "x" });
+    try testing.expectEqual(@as(u16, 409), fragment.status_code);
+    try testing.expectEqualStrings("/todos#new", (try fragment.getHeaderOne("X-Inertia-Redirect")).?);
+    try testing.expect(state.dirty and state.flash.queued_count == 1);
+
+    // A GET still gets 303, and a plain request keeps the fragment in Location.
+    var get_state = try emptySession();
+    var after_get = response.Response.init(testing.allocator);
+    defer after_get.deinit();
+    try plugin.redirectWithErrors(&testRequest(.get, "/todos", &.{}), &after_get, .{ .plugin = &flash, .session = &get_state }, "/todos#new", .{ .text = "x" });
+    try testing.expectEqual(@as(u16, 303), after_get.status_code);
+    try testing.expectEqualStrings("/todos#new", (try after_get.getHeaderOne("Location")).?);
+
+    const Failure = struct { path: []const u8, limits: response.Limits = .{}, expected: ErrorsRedirectError };
+    const failures = [_]Failure{
+        .{ .path = "https://evil.example/", .expected = error.InvalidRedirectPath },
+        .{ .path = "//evil.example/", .expected = error.InvalidRedirectPath },
+        .{ .path = "/a\\b", .expected = error.InvalidRedirectPath },
+        .{ .path = "", .expected = error.InvalidRedirectPath },
+        .{ .path = "/todos", .limits = .{ .max_headers = 0 }, .expected = error.TooManyHeaders },
+        .{ .path = "/todos", .limits = .{ .header_bytes = "Location".len + "/todos".len - 1 }, .expected = error.HeaderBytesExceeded },
+    };
+    for (failures) |failure| {
+        var unchanged = try emptySession();
+        var res = response.Response.initWithLimits(testing.allocator, failure.limits);
+        defer res.deinit();
+        try testing.expectError(failure.expected, plugin.redirectWithErrors(&plain_post, &res, .{ .plugin = &flash, .session = &unchanged }, failure.path, .{ .text = "x" }));
+        try testing.expectEqual(@as(usize, 0), res.header_count);
+        try testing.expect(!res.handled and !unchanged.dirty and unchanged.flash.queued_count == 0);
+    }
+
+    // A fragment redirect also reserves room for `Vary`.
+    var tight_state = try emptySession();
+    var tight = response.Response.initWithLimits(testing.allocator, .{ .max_headers = 1 });
+    defer tight.deinit();
+    try testing.expectError(error.TooManyHeaders, plugin.redirectWithErrors(&inertia_post, &tight, .{ .plugin = &flash, .session = &tight_state }, "/todos#new", .{ .text = "x" }));
+    try testing.expect(!tight_state.dirty);
+
+    // A Location already set is not replaced.
+    var set_state = try emptySession();
+    var set = response.Response.init(testing.allocator);
+    defer set.deinit();
+    try set.setHeader("Location", "/elsewhere");
+    try testing.expectError(error.LocationAlreadySet, plugin.redirectWithErrors(&plain_post, &set, .{ .plugin = &flash, .session = &set_state }, "/todos", .{ .text = "x" }));
+    try testing.expect(!set_state.dirty);
+
+    // Errors share the flash budget with unread messages.
+    const big = "x" ** (flash_mod.max_bytes - 3 - errors_flash_kind.len - "{\"text\":\"\"}".len);
+    var fits_state = try emptySession();
+    var fits = response.Response.init(testing.allocator);
+    defer fits.deinit();
+    try plugin.redirectWithErrors(&plain_post, &fits, .{ .plugin = &flash, .session = &fits_state }, "/todos", .{ .text = big });
+    var full_state = try receivedFlash(&.{.{ "notice", "unread" }});
+    var full = response.Response.init(testing.allocator);
+    defer full.deinit();
+    try testing.expectError(error.FlashTooLarge, plugin.redirectWithErrors(&plain_post, &full, .{ .plugin = &flash, .session = &full_state }, "/todos", .{ .text = big }));
+    try testing.expectError(error.FlashTooLarge, plugin.redirectWithErrors(&plain_post, &full, .{ .plugin = &flash, .session = &full_state }, "/todos", .{ .text = "x" ** flash_mod.max_bytes }));
+    try testing.expectEqual(@as(usize, 0), full.header_count);
+    try testing.expect(!full_state.dirty);
+}
+
+test "route errors win over stored errors, which win over shared errors" {
+    const flash: flash_mod.Flash = .{};
+    const req = testRequest(.get, "/", &inertia_headers);
+    const stored = "{\"text\":\"stored\"}";
+
+    const WithErrors = Inertia(struct { app: []const u8, errors: struct { base: []const u8 } });
+    const shared: WithErrors = .{ .layout = test_layout, .shared = .{ .value = .{ .app = "zoda", .errors = .{ .base = "shared" } } } };
+    const plain: TestInertia = .{ .layout = test_layout };
+
+    var over_shared = try receivedFlash(&.{.{ errors_flash_kind, stored }});
+    var a = response.Response.init(testing.allocator);
+    defer a.deinit();
+    try shared.renderWith(&req, &a, "Home", .{}, .{ .flash = .{ .plugin = &flash, .session = &over_shared } });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Home\",\"props\":{\"app\":\"zoda\",\"errors\":{\"text\":\"stored\"}},\"url\":\"/\",\"version\":null,\"sharedProps\":[\"app\",\"errors\"]}",
+        a.body,
+    );
+    try testing.expect(over_shared.flash.consumed);
+
+    // Route errors win, and the stored ones are consumed with the flash.
+    var under_route = try receivedFlash(&.{.{ errors_flash_kind, stored }});
+    var b = response.Response.init(testing.allocator);
+    defer b.deinit();
+    try shared.renderWith(&req, &b, "Home", .{ .errors = .{ .text = "route" } }, .{ .flash = .{ .plugin = &flash, .session = &under_route } });
+    try testing.expect(std.mem.indexOf(u8, b.body, "\"props\":{\"app\":\"zoda\",\"errors\":{\"text\":\"route\"}}") != null);
+    try testing.expect(under_route.flash.consumed);
+
+    // Without the option, stored errors are neither sent nor read.
+    const unused = try receivedFlash(&.{.{ errors_flash_kind, stored }});
+    var c = response.Response.init(testing.allocator);
+    defer c.deinit();
+    try plain.render(&req, &c, "Home", .{});
+    try testing.expectEqualStrings("{\"component\":\"Home\",\"props\":{\"errors\":{}},\"url\":\"/\",\"version\":null}", c.body);
+    try testing.expect(!unused.flash.consumed);
+
+    // The last entry wins; one that is not a JSON object is ignored, so the
+    // default applies, and an errors-only flash sends no `flash` field.
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "{\"text\":\"later\"}", "{\"text\":\"later\"}" },
+        .{ "[1]", "{}" },
+        .{ "{\"text\":", "{}" },
+        .{ "{} {}", "{}" },
+    }) |case| {
+        var state = try receivedFlash(&.{ .{ errors_flash_kind, stored }, .{ errors_flash_kind, case[0] } });
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try plain.renderWith(&req, &res, "Home", .{}, .{ .flash = .{ .plugin = &flash, .session = &state } });
+        var expected: [256]u8 = undefined;
+        try testing.expectEqualStrings(
+            try std.fmt.bufPrint(&expected, "{{\"component\":\"Home\",\"props\":{{\"errors\":{s}}},\"url\":\"/\",\"version\":null}}", .{case[1]}),
+            res.body,
+        );
+    }
+
+    // A prop callback error leaves them unread.
+    const Failing = struct {
+        fn load(_: void, _: std.mem.Allocator) error{Unavailable}!u32 {
+            return error.Unavailable;
+        }
+    };
+    var failed = try receivedFlash(&.{.{ errors_flash_kind, stored }});
+    var d = response.Response.init(testing.allocator);
+    defer d.deinit();
+    try testing.expectError(error.Unavailable, plain.renderWith(&req, &d, "Home", .{ .n = once({}, Failing.load) }, .{
+        .flash = .{ .plugin = &flash, .session = &failed },
+    }));
+    try testing.expect(!failed.dirty and !failed.flash.consumed);
 }

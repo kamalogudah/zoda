@@ -9,7 +9,8 @@
 //! `dist/assets` and renders every page through `zoda.Inertia`; mutations
 //! redirect back with 303 so the client re-fetches the page as JSON. Adding a
 //! todo flashes "Todo added" through `zoda.Flash`, sent as the page's
-//! top-level `flash` on the next render.
+//! top-level `flash` on the next render; a rejected todo redirects back with
+//! its validation errors stored in the session the same way.
 const std = @import("std");
 const zoda = @import("zoda");
 
@@ -123,7 +124,7 @@ pub fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.R
     const store = ctx.plugins.store.value;
     const filter = parseFilter(req);
     if (req.isRoot()) {
-        if (req.isGet()) return renderIndex(ctx, req, res, filter, null);
+        if (req.isGet()) return renderIndex(ctx, req, res, filter);
         if (req.method != .post) return;
         var parsed = ctx.plugins.json.parse(res.allocator, req, struct { text: []const u8 }) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -131,9 +132,8 @@ pub fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.R
         };
         defer parsed.deinit();
         const text = std.mem.trim(u8, parsed.value.text, " \t\r\n");
-        // Re-render with `errors`; Inertia's form helpers read that prop.
-        if (text.len == 0) return renderIndex(ctx, req, res, filter, "Write something first.");
-        if (text.len > max_text_bytes) return renderIndex(ctx, req, res, filter, "Keep it under 200 bytes.");
+        if (text.len == 0) return rejectTodo(ctx, req, res, filter, "Write something first.");
+        if (text.len > max_text_bytes) return rejectTodo(ctx, req, res, filter, "Keep it under 200 bytes.");
         const id = try store.add(text);
         // Shown once, by the render that follows the redirect.
         try ctx.plugins.flash.add(&ctx.state.sessions, "notice", "Todo added");
@@ -156,12 +156,28 @@ pub fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.R
     return inertia.redirect(req, res, backTo(filter));
 }
 
+/// Redirects back to the list with `errors.text` stored in the session, which
+/// the next render sends as `props.errors` once. The form posts with
+/// `errorBag: 'createTodo'`, so they arrive as `errors.createTodo.text`, and
+/// `useForm` reads its own bag. The destination is built from the filter
+/// enum, never from `Referer`.
+fn rejectTodo(
+    ctx: *App.Context,
+    req: *zoda.router.Request,
+    res: *zoda.response.Response,
+    filter: Filter,
+    message: []const u8,
+) !void {
+    const session = &ctx.state.sessions;
+    try ctx.plugins.inertia.redirectWithErrors(req, res, .{ .plugin = &ctx.plugins.flash, .session = session }, backTo(filter), .{ .text = message });
+    return ctx.plugins.sessions.save(session, res);
+}
+
 fn renderIndex(
     ctx: *App.Context,
     req: *zoda.router.Request,
     res: *zoda.response.Response,
     filter: Filter,
-    text_error: ?[]const u8,
 ) !void {
     const requested = parsePage(req);
     const store = ctx.plugins.store.value;
@@ -191,9 +207,8 @@ fn renderIndex(
     const page = @min(requested, last);
     const start = (page - 1) * per_page;
     // `render` copies everything into the response, so the borrowed todo
-    // text only has to live while the lock is held. Without an `errors`
-    // prop, the plugin sends `errors: {}`. `stats` is left out of the page
-    // and computed when the client asks for it right after.
+    // text only has to live while the lock is held. `stats` is left out of
+    // the page and computed when the client asks for it right after.
     const props = .{
         // Matching on `id` drops a duplicate when a todo added meanwhile
         // shifts an item onto the next page.
@@ -206,24 +221,13 @@ fn renderIndex(
         .remaining = remaining,
         .stats = zoda.plugins.inertia.deferred(store, Stats.compute),
     };
-    const inertia = &ctx.plugins.inertia;
     const session = &ctx.state.sessions;
-    // Sends pending flash messages as the page's `flash` and marks them
-    // read; the save below persists that, so they are shown once.
-    const options: zoda.plugins.inertia.RenderOptions = .{
+    // Sends pending flash messages as the page's `flash` and stored
+    // validation errors as `errors` (`{}` when there are none), and marks
+    // them read; the save below persists that, so they are shown once.
+    try ctx.plugins.inertia.renderWith(req, res, "Todos/Index", props, .{
         .flash = .{ .plugin = &ctx.plugins.flash, .session = session },
-    };
-    if (text_error) |message| {
-        try inertia.renderWith(req, res, "Todos/Index", .{
-            .todos = props.todos,
-            .filter = props.filter,
-            .remaining = props.remaining,
-            .stats = props.stats,
-            .errors = .{ .text = message },
-        }, options);
-    } else {
-        try inertia.renderWith(req, res, "Todos/Index", props, options);
-    }
+    });
     return ctx.plugins.sessions.save(session, res);
 }
 
@@ -288,8 +292,8 @@ pub fn main(init: std.process.Init) !void {
     std.crypto.hash.sha2.Sha256.hash(bundle, &digest, .{});
     const version = std.fmt.bytesToHex(digest[0..8], .lower);
 
-    // Sessions only carry flash messages here, so a fresh key per run is
-    // enough: a restart just drops pending messages. A real app loads a
+    // Sessions only carry flash messages and validation errors here, so a
+    // fresh key per run is enough: a restart just drops pending ones. A real app loads a
     // stable secret from its configuration.
     clock_io = io;
     var secret: [32]u8 = undefined;
@@ -424,17 +428,63 @@ test "Inertia visits add, toggle, filter, and delete todos" {
     try std.testing.expect(std.mem.indexOf(u8, all.body, "\"todos\":[{\"id\":1,\"text\":\"Buy milk\",\"done\":true}],\"filter\":\"all\",\"remaining\":0") != null);
 }
 
-test "validation errors re-render the page and stale clients reload" {
+test "validation errors redirect back and show once, and stale clients reload" {
     var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer store.deinit();
     var app = try testApp(&store);
     defer app.deinit();
 
-    var blank = try visit(&app, .post, "/todos", &inertia_json, "{\"text\":\"   \"}");
+    // What `form.post('/todos?filter=active', { errorBag: 'createTodo' })` sends.
+    const form = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-Inertia-Error-Bag", .value = "createTodo" },
+    };
+    var blank = try visit(&app, .post, "/todos?filter=active", &form, "{\"text\":\"   \"}");
     defer blank.deinit();
-    try std.testing.expectEqual(@as(u16, 200), blank.status_code);
-    try std.testing.expect(std.mem.indexOf(u8, blank.body, "\"errors\":{\"text\":\"Write something first.\"}") != null);
+    try std.testing.expectEqual(@as(u16, 303), blank.status_code);
+    try std.testing.expectEqualStrings("/todos?filter=active", (try blank.getHeaderOne("Location")).?);
     try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
+
+    // XHR follows with the same headers; the errors arrive under the bag.
+    var followed: [form.len + 1]zoda.request.Header = undefined;
+    @memcpy(followed[0..form.len], &form);
+    followed[form.len] = .{ .name = "Cookie", .value = (try sessionCookie(&blank)).? };
+    var shown = try visit(&app, .get, "/todos?filter=active", &followed, "");
+    defer shown.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, shown.body, "\"errors\":{\"createTodo\":{\"text\":\"Write something first.\"}}},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown.body, "\"flash\"") == null);
+
+    // The saved cookie drops them, so the next visit has `errors: {}`.
+    const again_headers = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "Cookie", .value = (try sessionCookie(&shown)).? },
+    };
+    var again = try visit(&app, .get, "/todos?filter=active", &again_headers, "");
+    defer again.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, again.body, "\"errors\":{}},") != null);
+    try std.testing.expect((try sessionCookie(&again)) == null);
+
+    // Without a bag, an overlong todo's error is top-level.
+    var long = try visit(&app, .post, "/todos", &inertia_json, "{\"text\":\"" ++ "x" ** (max_text_bytes + 1) ++ "\"}");
+    defer long.deinit();
+    const long_headers = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "Cookie", .value = (try sessionCookie(&long)).? },
+    };
+    var long_shown = try visit(&app, .get, "/todos", &long_headers, "");
+    defer long_shown.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, long_shown.body, "\"errors\":{\"text\":\"Keep it under 200 bytes.\"}}") != null);
+
+    const bad_bag = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-Inertia-Error-Bag", .value = "create todo" },
+    };
+    try std.testing.expectError(error.MalformedErrorBagHeader, visit(&app, .post, "/todos", &bad_bag, "{\"text\":\"\"}"));
 
     var malformed = try visit(&app, .post, "/todos", &inertia_json, "{\"title\":\"x\"}");
     defer malformed.deinit();
@@ -613,9 +663,17 @@ test "adding a todo flashes a notice that the next render shows once" {
     try std.testing.expect(std.mem.indexOf(u8, again.body, "\"flash\"") == null);
     try std.testing.expect((try sessionCookie(&again)) == null);
 
-    // A rejected todo flashes nothing.
+    // A rejected todo stores only its errors, so the page that follows has
+    // no `flash`.
     var blank = try visit(&app, .post, "/todos", &inertia_json, "{\"text\":\" \"}");
     defer blank.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, blank.body, "\"flash\"") == null);
-    try std.testing.expect((try sessionCookie(&blank)) == null);
+    const rejected = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "Cookie", .value = (try sessionCookie(&blank)).? },
+    };
+    var back = try visit(&app, .get, "/todos", &rejected, "");
+    defer back.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, back.body, "\"flash\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, back.body, "\"errors\":{\"text\":\"Write something first.\"}") != null);
 }

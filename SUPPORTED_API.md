@@ -189,8 +189,22 @@ runs inside `zig build test`.
   `flash: {kind: text}` (a later message of a kind replaces an earlier one),
   on every render including partial reloads, leaves the field out when there
   are none, and marks them read only after the response is committed;
-  `sessions.save` after it persists that. Deferred once props, error bags,
-  history encryption, precognition, and SSR are not implemented. See
+  `sessions.save` after it persists that.
+  `redirectWithErrors(req, res, source, path, errors)` stores a struct of
+  validation errors in the session as one `zoda.Flash` message of the
+  reserved kind `errors_flash_kind` and redirects with 303 to the
+  route-supplied local `path` (409 and `X-Inertia-Redirect` for an Inertia
+  request to a path with `#`); `Referer` is never read. On Inertia requests
+  `X-Inertia-Error-Bag` (1 to `max_error_bag_bytes` `[A-Za-z0-9_-]` bytes,
+  else `error.MalformedErrorBagHeader`; repeated,
+  `error.DuplicateErrorBagHeader`; also `errorBag(req)`) nests them under
+  the bag. Header, path, header-limit, and flash-budget
+  (`error.FlashTooLarge`) failures leave the response and session unchanged.
+  The next `renderWith` with `.flash` sends them as `props.errors`, after
+  route `errors` and before shared `errors`, and consumes them with the
+  flash; without stored errors the default stays `errors: {}`. Deferred
+  once props, history encryption, precognition, and SSR are not
+  implemented. See
   [PLUGINS.md](PLUGINS.md#inertiajs).
 - `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
   local-path rules without changing a response.

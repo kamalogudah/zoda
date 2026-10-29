@@ -17,7 +17,9 @@
 
   function add(event) {
     event.preventDefault()
-    form.post(`/todos${query}`, { ...options, onSuccess: () => form.reset() })
+    // A rejected todo redirects back with its errors under this bag, which
+    // `form.errors` reads as `form.errors.text`.
+    form.post(`/todos${query}`, { ...options, errorBag: 'createTodo', onSuccess: () => form.reset() })
   }
 </script>
 

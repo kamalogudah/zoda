@@ -271,7 +271,9 @@ try ctx.plugins.sessions.save(&ctx.state.sessions, res);
   ```
 - **Inertia.** `Inertia.renderWith(..., .{ .flash = ... })` sends the
   received messages as the page's top-level `flash`; see
-  [Inertia.js flash](#flash). `peek` returns the received messages without
+  [Inertia.js flash](#flash). `Inertia.redirectWithErrors` stores
+  validation errors as one message of the reserved kind `inertia-errors`;
+  see [Validation errors](#validation-errors). `peek` returns the received messages without
   consuming them, for integrations that `read` only once they have sent
   them.
 - **Clearing.** `clear` drops received and queued messages. `add` after `clear`
@@ -658,9 +660,11 @@ layout or root id before the first request; `render` checks again.
     version is empty; so an empty configured version never causes a reload
     loop. The check runs inside `render`, so a route that redirects instead
     does not run it.
-  - `props.errors` is always an object: a route `errors` prop wins, then a
-    configured shared `errors`, and otherwise the plugin adds `errors: {}`,
-    as the Laravel adapter does.
+  - `props.errors` is always an object: a route `errors` prop wins, then
+    errors stored by `redirectWithErrors` (with `renderWith`'s `.flash`
+    option; see [Validation errors](#validation-errors)), then a configured
+    shared `errors`, and otherwise the plugin adds `errors: {}`, as the
+    Laravel adapter does.
   - With shared props configured, the page also lists their names in
     `sharedProps`. v3 clients use it to keep shared props during instant
     client-side visits.
@@ -694,6 +698,9 @@ layout or root id before the first request; `render` checks again.
   backslashes, spaces, controls, or bad percent escapes. An Inertia request
   gets 409, `X-Inertia-Location`, and `Vary: X-Inertia`; any other request
   gets a 302/303 `Location`.
+- **`redirectWithErrors(req, res, source, path, errors)`** stores validation
+  errors in the session and redirects back with 303; see
+  [Validation errors](#validation-errors).
 
 ### Partial reloads
 
@@ -1081,7 +1088,8 @@ return ctx.plugins.sessions.save(&ctx.state.sessions, res);
   client's `router.flash(key, value)`; use distinct kinds to show several.
   Text that is not valid UTF-8 is written as an array of byte values, as
   `std.json` does for any string prop. In the HTML shell it is escaped like
-  the rest of the page.
+  the rest of the page. Errors stored by `redirectWithErrors` are sent as
+  `props.errors`, never in `flash`.
 - **Default.** With no messages, or without the option, the field is left
   out; the client reads a missing `flash` as `{}`. `render` never sends it.
 - **Read once.** `renderWith` reads the messages with `Flash.peek` and calls
@@ -1103,6 +1111,77 @@ return ctx.plugins.sessions.save(&ctx.state.sessions, res);
   [Flash messages](#flash-messages)), and the page must still fit
   `max_body_bytes`; script-element escaping can make a message up to six
   times longer.
+
+### Validation errors
+
+The usual Inertia form flow redirects back after a failed submission and
+shows the errors on the GET that follows. `redirectWithErrors` stores them in
+the session through [`zoda.Flash`](#flash-messages), and `renderWith` with
+`.flash` sends them as `props.errors` once:
+
+```zig
+const source: zoda.plugins.inertia.FlashSource = .{
+    .plugin = &ctx.plugins.flash,
+    .session = &ctx.state.sessions,
+};
+
+// POST /todos: on failure, store the errors and go back to the form's page.
+if (text.len == 0) {
+    try ctx.plugins.inertia.redirectWithErrors(req, res, source, "/todos", .{ .text = "Write something first." });
+    return ctx.plugins.sessions.save(&ctx.state.sessions, res);
+}
+
+// GET /todos: send stored errors (and flash), then save to consume them.
+try ctx.plugins.inertia.renderWith(req, res, "Todos/Index", props, .{ .flash = source });
+return ctx.plugins.sessions.save(&ctx.state.sessions, res);
+```
+
+```js
+form.post('/todos', { errorBag: 'createTodo' }) // form.errors.text
+```
+
+- **Errors.** A struct with named fields, serialized with `std.json`, such
+  as `.{ .text = "Required" }` or a type with optional fields; null
+  optional fields are left out, so `struct { text: ?[]const u8 = null }`
+  with nothing set stores `{}`. A `std.json.ArrayHashMap` works for field
+  names known only at run time. Tuples are a compile error.
+- **Destination.** `path` is a local path under the `Response.redirectPath`
+  rules, chosen by the route, usually the form's page. `Referer` is never
+  read, so a request cannot pick where it is sent back to. The status is
+  303, whatever the method, so the client follows with GET. An Inertia
+  request to a path with `#` gets 409 and `X-Inertia-Redirect`, as with
+  `redirect`.
+- **Error bags.** On an Inertia request, `X-Inertia-Error-Bag: name`, which
+  the client sends for `{ errorBag: 'name' }`, nests the errors as
+  `{"name": {...}}`. The client then hands `errors.name` to `onError` and
+  `useForm`, so two forms on one page keep their errors apart. The bag is
+  applied when the errors are stored, so the GET that follows does not
+  need the header. A bag is 1 to `max_error_bag_bytes` (64)
+  `[A-Za-z0-9_-]` bytes; another value returns
+  `error.MalformedErrorBagHeader` and a repeated field
+  `error.DuplicateErrorBagHeader`. Ordinary requests ignore the header.
+  `zoda.plugins.inertia.errorBag(req)` applies the same rules.
+- **Reading.** `renderWith` with `.flash` sends the stored errors as
+  `props.errors` on every render, partial reloads included, since `errors`
+  is always sent. A route `errors` prop still wins; stored errors win over
+  a shared `errors`. They are consumed together with the flash messages,
+  only once the response is committed, so a header, limit, configuration,
+  or prop-callback error, or a version-conflict 409, leaves them unread.
+  Without stored errors, `errors` is `{}` (or the shared value) as usual.
+  `render`, which has no session, never reads them.
+- **Storage.** The errors are one flash message of the reserved kind
+  `errors_flash_kind` (`"inertia-errors"`) whose text is the JSON object;
+  `renderWith` leaves it out of `flash`. Do not add messages of that kind
+  yourself; one whose text is not a JSON object is ignored. The newest one
+  wins if several are pending. Like flash, they are signed but not
+  encrypted, so do not echo secrets in error messages.
+- **Limits and atomicity.** The JSON shares the flash budget of 512 encoded
+  bytes and 8 messages with unread flash messages, minus 17 bytes for the
+  entry; errors that do not fit return `error.FlashTooLarge`. The bag
+  header, the path, an existing `Location` (`error.LocationAlreadySet`),
+  and the response header limits are checked first, so any failure leaves
+  both the response and the session unchanged. Call `sessions.save`
+  afterwards, or the errors are lost with the unsaved session.
 
 ### URL and origin policy
 
@@ -1143,10 +1222,12 @@ origin. A target that starts with `//` or contains `\` is refused with
 ### Interactions
 
 - **Sessions, CSRF, and flash.** Shared-props callbacks receive only the
-  request, not `ctx`, so put session-derived values (the current user,
-  validation `errors`) in route props, and send flash messages with
-  `renderWith` (see [Flash](#flash)). Save the session before `redirect`, and
-  after `renderWith` when it sends flash, so the read is persisted. `csrf.valid` reads `X-CSRF-Token`, not
+  request, not `ctx`, so put session-derived values (the current user) in
+  route props, and send flash messages and redirected validation errors
+  with `renderWith` (see [Flash](#flash) and
+  [Validation errors](#validation-errors)). Save the session before
+  `redirect`, after `redirectWithErrors`, and after `renderWith` when it
+  sends flash, so the read is persisted. `csrf.valid` reads `X-CSRF-Token`, not
   the `X-XSRF-TOKEN` header that Inertia's axios client sends from an
   `XSRF-TOKEN` cookie. Either set `X-CSRF-Token` in your client's request
   headers or pass the submitted value to `csrf.validToken`.
@@ -1168,7 +1249,11 @@ renders with `<Deferred>`, and the `todos` scroll prop paged forward and
 backward with `<InfiniteScroll>` and reset after a toggle. The "Todo added"
 flash was driven in Chrome in all three: shown after the add form's partial
 reload, kept through the deferred `stats` reload, and gone on the next
-visit. The other rows are covered by the plugin's unit tests only.
+visit. So was redirect-back validation: an empty todo posted with
+`errorBag: 'createTodo'` sent `X-Inertia-Error-Bag`, got a 303, and the
+followed GET carried `errors: {"createTodo": {"text": ...}}`, which
+`useForm` showed as `form.errors.text`; the next visit had `errors: {}`.
+The other rows are covered by the plugin's unit tests only.
 
 The features not yet implemented are tracked in
 [#80](https://github.com/kamalogudah/zoda/issues/80), with one issue each.
@@ -1180,6 +1265,7 @@ The features not yet implemented are tracked in
 | JSON page visits, `X-Inertia`, `Vary: X-Inertia` | Implemented |
 | Shared props, route precedence, `sharedProps` list | Implemented |
 | `props.errors` always present | Implemented (`{}` by default) |
+| Session-backed validation errors (redirect back) | Implemented (`redirectWithErrors`, read by `renderWith` with `.flash`): stored through `zoda.Flash`, sent once as `props.errors` after a 303 to a route-supplied local path. Driven in a browser through the example's add form. |
 | Asset version 409 + `X-Inertia-Location` (missing header = empty version) | Implemented |
 | 303 after PUT/PATCH/DELETE/POST | Implemented (`redirect`) |
 | Fragment redirects, 409 + `X-Inertia-Redirect` | Implemented (`redirect` with `#`) |
@@ -1193,7 +1279,7 @@ The features not yet implemented are tracked in
 | Reset (`X-Inertia-Reset`) | Implemented: listed props are sent without merge metadata on partial reloads of the rendered component |
 | Scroll props (`scroll`; `scrollProps`, `X-Inertia-Infinite-Scroll-Merge-Intent`) | Implemented: one page of items per response with route-supplied page numbers; the intent picks `mergeProps` or `prependProps`, and `X-Inertia-Reset` sets `reset`. Driven in a browser through the example's paged todo list. |
 | Once props (`once`, `.as(key)`, `.expiresIn(ms)`; `onceProps`, `X-Inertia-Except-Once-Props`) | Implemented: held keys are listed but not resolved, a partial reload that lists the prop in `-Data` always sends it, and `expiresAt` comes from the injected `now_milliseconds` clock. Covered by unit tests only. Deferred once props are not implemented. |
-| Error bags (`X-Inertia-Error-Bag`) | Not implemented: the header is ignored |
+| Error bags (`X-Inertia-Error-Bag`) | Implemented for `redirectWithErrors`: errors nest under the validated bag name. Route-supplied `errors` props are sent as given. Driven in a browser through the example's `createTodo` bag. |
 | History encryption (`encryptHistory`, `clearHistory`) | Not implemented: never sent, so off |
 | Precognition validation | Not implemented |
 | Server-side rendering | Not implemented |

@@ -26,7 +26,9 @@ const options = { preserveScroll: true, only: ['todos', 'remaining', 'stats'], r
 const query = computed(() => (props.filter === 'all' ? '' : `?filter=${props.filter}`))
 
 function add() {
-  form.post(`/todos${query.value}`, { ...options, onSuccess: () => form.reset() })
+  // A rejected todo redirects back with its errors under this bag, which
+  // `form.errors` reads as `form.errors.text`.
+  form.post(`/todos${query.value}`, { ...options, errorBag: 'createTodo', onSuccess: () => form.reset() })
 }
 </script>
 
