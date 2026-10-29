@@ -39,7 +39,7 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
 | --- | --- | --- |
 | `GET /` | redirect | 302 to `/todos` |
 | `GET /todos[?filter=active\|done][&page=n]` | `render("Todos/Index", …)` | HTML shell on the first visit, the page JSON on Inertia visits; 10 todos per page, newest first |
-| `POST /todos` with `{"text": "…"}` | add | back to the current filter at `#todo-<id>`, or the page again with `errors.text` |
+| `POST /todos` with `{"text": "…"}` | add | flash "Todo added", then back to the current filter at `#todo-<id>`, or the page again with `errors.text` |
 | `PATCH /todos/:id` | toggle | 303 back |
 | `DELETE /todos/:id` | delete | 303 back, or 404 |
 
@@ -89,14 +89,24 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   has `scrollProps.todos.reset: true`, and the list starts again at page 1.
   Filter links are plain GET visits, which remount the page, so they need
   no reset. Drop `manual` to load pages as you scroll instead.
+- **Flash.** Adding a todo queues "Todo added" with `zoda.Flash` and saves
+  the session before redirecting. Every render goes through
+  `renderWith(..., .{ .flash = ... })` and then saves, so the page that
+  follows carries `flash: {"notice": "Todo added"}` once and the saved
+  cookie drops it. The page reads `page.flash.notice` (`usePage().flash` in
+  React and Vue, `page.flash` in Svelte). The add form posts with `only`, so
+  the flash arrives on a partial reload, which the client shows; the next
+  visit has no `flash` and the notice disappears. The deferred `stats`
+  reload does not clear it, because the client keeps its current flash on
+  deferred-props reloads. The session key is random per run, so a restart
+  just drops pending messages.
 - **Asset version.** At startup the server hashes `app.js` into the Inertia
   version. After you rebuild the frontend and restart the server, an open tab
   that sends the old version gets 409 and `X-Inertia-Location` and does a full
   reload, so it never mixes old JavaScript with new props.
 
-The example has no sessions. With sessions you would redirect back after a
-validation error and carry the errors in a flash message, which is the usual
-Inertia pattern. The JSON body parser accepts only
+The session only carries flash messages. Validation errors are still
+rendered directly rather than redirected back through the session. The JSON body parser accepts only
 `Content-Type: application/json`, so a plain cross-site HTML form cannot post
 here. A real app that uses cookies should still add CSRF checks; see
 [PLUGINS.md](../../PLUGINS.md#inertiajs) for how Inertia's `X-XSRF-TOKEN`
@@ -108,5 +118,5 @@ relates to Zoda's CSRF helpers.
 `server.zig`, which dispatch requests without a browser or a built frontend.
 They cover the HTML shell, the JSON page, add, toggle, filter, and delete,
 validation errors, the version conflict, a partial reload of `todos`,
-loading the deferred `stats`, and paging `todos` forward, backward, and
-after a reset.
+loading the deferred `stats`, paging `todos` forward, backward, and
+after a reset, and the "Todo added" flash shown once.

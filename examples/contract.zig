@@ -882,3 +882,79 @@ test "PLUGINS Inertia.js once props example" {
     );
     try std.testing.expectEqual(@as(usize, 3), InertiaBilling.loads);
 }
+
+// PLUGINS.md "Inertia.js" flash: flash on POST, redirect, and send the
+// message as the page's top-level `flash` on the next render, then save.
+const InertiaFlashApp = zoda.app.App(struct {
+    sessions: zoda.Sessions,
+    flash: zoda.Flash = .{},
+    inertia: zoda.Inertia(struct {}),
+});
+
+fn inertiaFlashRoute(ctx: *InertiaFlashApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    const session = &ctx.state.sessions;
+    const inertia = &ctx.plugins.inertia;
+    if (req.onLiteral("todos") and req.isRoot()) {
+        if (req.method == .post) {
+            try ctx.plugins.flash.add(session, "notice", "Todo added");
+            try ctx.plugins.sessions.save(session, res);
+            return inertia.redirect(req, res, "/todos");
+        }
+        try inertia.renderWith(req, res, "Todos/Index", .{}, .{
+            .flash = .{ .plugin = &ctx.plugins.flash, .session = session },
+        });
+        // Persists that the messages were read, so they are sent once.
+        return ctx.plugins.sessions.save(session, res);
+    }
+}
+
+test "PLUGINS Inertia.js flash example" {
+    var app = try InertiaFlashApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{
+            .sessions = .{
+                .keys = &.{.{ .id = 1, .secret = "example-secret-of-at-least-32-bytes!" }},
+                .lifetime_seconds = 3600,
+                .now_seconds = flashClock,
+            },
+            .inertia = .{ .layout = inertia_layout },
+        },
+        .route_fn = inertiaFlashRoute,
+    });
+    defer app.deinit();
+
+    var cookies: [2][zoda.plugins.sessions.max_cookie_bytes]u8 = undefined;
+    const Visit = struct {
+        fn run(a: *const InertiaFlashApp, method: zoda.router.Method, cookie: ?[]const u8, out: []u8) !struct { zoda.response.Response, ?[]const u8 } {
+            var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, "/todos");
+            defer arena.deinit();
+            const headers = [_]zoda.request.Header{
+                .{ .name = "X-Inertia", .value = "true" },
+                .{ .name = "Cookie", .value = cookie orelse "" },
+            };
+            try arena.copyHeaders(if (cookie != null) &headers else headers[0..1]);
+            var req = arena.requestView(method);
+            const res = try a.dispatch(&req);
+            const set_cookie = (try res.getHeaderOne("Set-Cookie")) orelse return .{ res, null };
+            const value = set_cookie[0..std.mem.indexOfScalar(u8, set_cookie, ';').?];
+            @memcpy(out[0..value.len], value);
+            return .{ res, out[0..value.len] };
+        }
+    };
+
+    var posted, const pending = try Visit.run(&app, .post, null, &cookies[0]);
+    defer posted.deinit();
+    try std.testing.expectEqual(@as(u16, 303), posted.status_code);
+
+    var shown, const read = try Visit.run(&app, .get, pending, &cookies[1]);
+    defer shown.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Todos/Index\",\"props\":{\"errors\":{}},\"url\":\"/todos\",\"version\":null,\"flash\":{\"notice\":\"Todo added\"}}",
+        shown.body,
+    );
+
+    var after, const unchanged = try Visit.run(&app, .get, read, &cookies[0]);
+    defer after.deinit();
+    try std.testing.expectEqualStrings("{\"component\":\"Todos/Index\",\"props\":{\"errors\":{}},\"url\":\"/todos\",\"version\":null}", after.body);
+    try std.testing.expect(unchanged == null);
+}

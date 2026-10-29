@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { Deferred, InfiniteScroll, Link, router, useForm } from '@inertiajs/vue3'
+import { Deferred, InfiniteScroll, Link, router, useForm, usePage } from '@inertiajs/vue3'
 
 const props = defineProps({
   app: String,
@@ -17,6 +17,8 @@ const filters = [
   ['done', 'Done'],
 ]
 const form = useForm({ text: '' })
+// The page's top-level `flash`, from `zoda.Flash`; `{}` once it has been shown.
+const page = usePage()
 // Mutations keep this component mounted, so they reset `todos`: the list
 // starts again at page 1 instead of merging into the pages loaded so far.
 const options = { preserveScroll: true, only: ['todos', 'remaining', 'stats'], reset: ['todos'] }
@@ -37,6 +39,7 @@ function add() {
       <button :disabled="form.processing">Add</button>
     </form>
     <p v-if="form.errors.text" class="error">{{ form.errors.text }}</p>
+    <p v-if="page.flash.notice" class="notice" role="status">{{ page.flash.notice }}</p>
 
     <nav>
       <Link

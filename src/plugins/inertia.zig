@@ -68,8 +68,17 @@
 //!   resolves nor sends the prop, since the client still holds it, unless a
 //!   partial reload of the component lists it in `X-Inertia-Partial-Data`.
 //!
-//! Not implemented: top-level `flash`, once deferred props, error bags,
-//! history encryption, precognition, and server-side rendering.
+//! - Flash: `renderWith(..., .{ .flash = .{ .plugin, .session } })` sends the
+//!   messages this request received through `zoda.Flash` as the top-level
+//!   `flash: {kind: text}`, a later message of a kind replacing an earlier
+//!   one, and consumes them once the response is committed. Like the Laravel
+//!   and Rails adapters it does so on every render, partial reloads
+//!   included: the client cannot be told apart from a deferred-props reload,
+//!   whose flash it ignores. A page with no messages has no `flash` field,
+//!   which the client reads as `{}`.
+//!
+//! Not implemented: once deferred props, error bags, history encryption,
+//! precognition, and server-side rendering.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
 //! the current page are the raw origin-form request target, so path and
@@ -85,6 +94,8 @@ const std = @import("std");
 const router = @import("../router.zig");
 const response = @import("../response.zig");
 const http_cache = @import("http_cache.zig");
+const flash_mod = @import("flash.zig");
+const sessions = @import("sessions.zig");
 
 pub const layout_marker = "@inertia";
 pub const html_content_type = "text/html; charset=utf-8";
@@ -572,6 +583,21 @@ fn partialList(req: *const router.Request, name: []const u8) PartialError!?[]con
     return value;
 }
 
+/// Where `renderWith` reads flash messages: the registered `zoda.Flash` and
+/// this request's session state.
+pub const FlashSource = struct {
+    plugin: *const flash_mod.Flash,
+    session: *sessions.Sessions.State,
+};
+
+/// Per-call additions to `render`.
+pub const RenderOptions = struct {
+    /// Sends the messages this request received as the page's top-level
+    /// `flash` and consumes them. Call `Sessions.save` after `renderWith` to
+    /// persist the consumption.
+    flash: ?FlashSource = null,
+};
+
 pub fn Inertia(comptime SharedProps: type) type {
     comptime if (@typeInfo(SharedProps) != .@"struct") @compileError("Inertia shared props must be a struct");
     return struct {
@@ -634,6 +660,21 @@ pub fn Inertia(comptime SharedProps: type) type {
             component: []const u8,
             props: anytype,
         ) Error(@TypeOf(props))!void {
+            return self.renderWith(req, res, component, props, .{});
+        }
+
+        /// `render` with per-call options. With `options.flash`, the page
+        /// carries the received flash messages, which are marked read once
+        /// the response is committed; on an error or a version conflict they
+        /// stay unread.
+        pub fn renderWith(
+            self: *const Self,
+            req: *const router.Request,
+            res: *response.Response,
+            component: []const u8,
+            props: anytype,
+            options: RenderOptions,
+        ) Error(@TypeOf(props))!void {
             comptime {
                 const info = @typeInfo(@TypeOf(props));
                 if (info != .@"struct" or (info.@"struct".is_tuple and info.@"struct".fields.len != 0)) {
@@ -658,7 +699,13 @@ pub fn Inertia(comptime SharedProps: type) type {
             }
             if (component.len == 0) return error.InvalidComponent;
 
-            const page = try self.pageJson(res.allocator, req, partial, once_visit, component, props, url, version);
+            // Partial reloads get flash too: other than deferred-props
+            // reloads, which no header marks, the client fires flash events
+            // for them. A deferred reload follows a full visit that has
+            // already consumed the messages.
+            const flash = options.flash;
+            const messages = if (flash) |source| source.plugin.peek(source.session) else null;
+            const page = try self.pageJson(res.allocator, req, partial, once_visit, component, props, url, version, messages);
             if (inertia) {
                 var committed = false;
                 defer if (!committed) res.allocator.free(page);
@@ -668,17 +715,18 @@ pub fn Inertia(comptime SharedProps: type) type {
                 try addInertiaVary(res);
                 try commitBody(res, response.json_content_type, page);
                 committed = true;
-                return;
+            } else {
+                defer res.allocator.free(page);
+                const body = try self.htmlBody(res, page);
+                var committed = false;
+                defer if (!committed) res.allocator.free(body);
+                try reserveHeaders(res, 0, 0);
+                try addInertiaVary(res);
+                try commitBody(res, html_content_type, body);
+                committed = true;
             }
-
-            defer res.allocator.free(page);
-            const body = try self.htmlBody(res, page);
-            var committed = false;
-            defer if (!committed) res.allocator.free(body);
-            try reserveHeaders(res, 0, 0);
-            try addInertiaVary(res);
-            try commitBody(res, html_content_type, body);
-            committed = true;
+            // Consume only what was sent: nothing above can fail any more.
+            if (flash) |source| _ = source.plugin.read(source.session);
         }
 
         /// Redirects to a local path (the `Response.redirectPath` rules) with
@@ -755,6 +803,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
+            flash: ?flash_mod.Messages,
         ) (error{OutOfMemory} || ScrollError || OnceError || PropsError(SharedProps) || PropsError(@TypeOf(props)))![]u8 {
             const shared: ?SharedProps = switch (self.shared) {
                 .none => null,
@@ -768,7 +817,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var json: std.json.Stringify = .{ .writer = &out.writer };
-            try writePage(&json, arena.allocator(), partial, once_visit, component, shared, props, url, version);
+            try writePage(&json, arena.allocator(), partial, once_visit, component, shared, props, url, version, flash);
             return out.toOwnedSlice();
         }
 
@@ -786,6 +835,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
+            flash: ?flash_mod.Messages,
         ) (error{OutOfMemory} || ScrollError || OnceError || PropsError(SharedProps) || PropsError(@TypeOf(props)))!void {
             const P = @TypeOf(props);
             json.beginObject() catch return error.OutOfMemory;
@@ -825,6 +875,26 @@ pub fn Inertia(comptime SharedProps: type) type {
                     json.write(field.name) catch return error.OutOfMemory;
                 }
                 json.endArray() catch return error.OutOfMemory;
+            }
+            if (flash) |messages| try writeFlash(json, messages);
+            json.endObject() catch return error.OutOfMemory;
+        }
+
+        /// Writes `flash` as `{kind: text}` in the order each kind was last
+        /// added, so a later message of a kind replaces an earlier one, as
+        /// the client's `router.flash(key, value)` does. Leaves the field out
+        /// when there are no messages.
+        fn writeFlash(json: *std.json.Stringify, messages: flash_mod.Messages) error{OutOfMemory}!void {
+            if (messages.count == 0) return;
+            json.objectField("flash") catch return error.OutOfMemory;
+            json.beginObject() catch return error.OutOfMemory;
+            var it = messages;
+            while (it.next()) |message| {
+                var later = it;
+                const replaced = while (later.next()) |next| {
+                    if (std.mem.eql(u8, next.kind, message.kind)) break true;
+                } else false;
+                if (!replaced) try writeField(json, message.kind, message.text);
             }
             json.endObject() catch return error.OutOfMemory;
         }
@@ -2918,4 +2988,253 @@ test "once callback errors propagate and route props override shared once props"
     defer bare.deinit();
     try unset.render(&req, &bare, "Billing", .{});
     try testing.expectEqualStrings("{\"component\":\"Billing\",\"props\":{\"errors\":{}},\"url\":\"/billing\",\"version\":null}", bare.body);
+}
+
+const flash_test_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn flashTestTime() i64 {
+    return 1000;
+}
+
+const flash_test_sessions: sessions.Sessions = .{
+    .keys = &.{.{ .id = 1, .secret = flash_test_secret }},
+    .lifetime_seconds = 300,
+    .now_seconds = flashTestTime,
+};
+
+const FlashTest = struct {
+    const App = @import("../app.zig").App(struct {
+        sessions: sessions.Sessions,
+        flash: flash_mod.Flash = .{},
+        inertia: TestInertia,
+    });
+
+    fn stats(_: void, _: std.mem.Allocator) u32 {
+        return 3;
+    }
+
+    fn route(ctx: *App.Context, req: *router.Request, res: *response.Response) !void {
+        const session = &ctx.state.sessions;
+        const inertia = &ctx.plugins.inertia;
+        if (!req.onLiteral("todos") or !req.isRoot()) return;
+        if (req.method == .post) {
+            try ctx.plugins.flash.add(session, "notice", "Todo added");
+            try ctx.plugins.sessions.save(session, res);
+            return inertia.redirect(req, res, "/todos");
+        }
+        try inertia.renderWith(req, res, "Todos/Index", .{ .stats = deferred({}, stats) }, .{
+            .flash = .{ .plugin = &ctx.plugins.flash, .session = session },
+        });
+        return ctx.plugins.sessions.save(session, res);
+    }
+
+    /// `/denied` short-circuits before the route, so nothing is rendered.
+    fn middleware(_: *const anyopaque, ctx: *App.Context, req: *router.Request, res: *response.Response, next: App.Next) !void {
+        if (req.segments.len == 1 and std.mem.eql(u8, req.segments[0], "denied")) return res.text(403, "denied");
+        return next.call(ctx, req, res);
+    }
+
+    fn app() !App {
+        return App.init(testing.allocator, .{
+            .response_allocator = testing.allocator,
+            .plugins = .{ .sessions = flash_test_sessions, .inertia = .{ .layout = test_layout, .version = .{ .value = "v1" } } },
+            .route_fn = route,
+            .middleware = &.{.{ .config = &.{}, .invoke = middleware }},
+        });
+    }
+
+    const Outcome = struct { status: u16, body: []const u8, cookie: ?[]const u8 };
+
+    /// Dispatches `target` with the cookie and extra headers, copying the
+    /// body and any new session cookie into `out`.
+    fn visit(
+        a: *const App,
+        method: router.Method,
+        comptime target: []const u8,
+        cookie: ?[]const u8,
+        extra: []const router.Header,
+        out: *[2][8192]u8,
+    ) !Outcome {
+        var headers: [8]router.Header = undefined;
+        var n: usize = 0;
+        if (cookie) |value| {
+            headers[0] = .{ .name = "Cookie", .value = value };
+            n = 1;
+        }
+        @memcpy(headers[n..][0..extra.len], extra);
+        n += extra.len;
+        var req: router.Request = .{ .method = method, .segments = &.{target[1..]}, .target = target, .headers = headers[0..n] };
+        var res = try a.dispatch(&req);
+        defer res.deinit();
+        @memcpy(out[0][0..res.body.len], res.body);
+        var outcome: Outcome = .{ .status = res.status_code, .body = out[0][0..res.body.len], .cookie = null };
+        if (try res.getHeaderOne("Set-Cookie")) |set_cookie| {
+            const value = set_cookie[0..std.mem.indexOfScalar(u8, set_cookie, ';').?];
+            @memcpy(out[1][0..value.len], value);
+            outcome.cookie = out[1][0..value.len];
+        }
+        return outcome;
+    }
+
+    const page_head = "{\"component\":\"Todos/Index\",\"props\":{\"errors\":{}},\"url\":\"/todos\",\"version\":\"v1\"," ++
+        "\"deferredProps\":{\"default\":[\"stats\"]}";
+};
+
+test "flash set before a redirect is sent once on the next full visit" {
+    var app = try FlashTest.app();
+    defer app.deinit();
+    var a: [2][8192]u8 = undefined;
+    var b: [2][8192]u8 = undefined;
+    var c: [2][8192]u8 = undefined;
+
+    const added = try FlashTest.visit(&app, .post, "/todos", null, &inertia_headers, &a);
+    try testing.expectEqual(@as(u16, 303), added.status);
+
+    // The followed GET carries the message and consumes it.
+    const shown = try FlashTest.visit(&app, .get, "/todos", added.cookie, &inertia_headers, &b);
+    try testing.expectEqualStrings(FlashTest.page_head ++ ",\"flash\":{\"notice\":\"Todo added\"}}", shown.body);
+    try testing.expect(shown.cookie != null);
+
+    // Afterwards there is no flash field, and nothing to save.
+    const after = try FlashTest.visit(&app, .get, "/todos", shown.cookie, &inertia_headers, &c);
+    try testing.expectEqualStrings(FlashTest.page_head ++ "}", after.body);
+    try testing.expect(after.cookie == null);
+
+    // The HTML shell carries it too, escaped like the rest of the page.
+    const html = try FlashTest.visit(&app, .get, "/todos", added.cookie, &.{}, &c);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"deferredProps\":{\"default\":[\"stats\"]},\"flash\":{\"notice\":\"Todo added\"}}</script>") != null);
+    try testing.expect(html.cookie != null);
+}
+
+test "partial reloads send flash; short circuits, conflicts, and header errors leave it unread" {
+    var app = try FlashTest.app();
+    defer app.deinit();
+    var a: [2][8192]u8 = undefined;
+    var b: [2][8192]u8 = undefined;
+    var c: [2][8192]u8 = undefined;
+
+    const added = try FlashTest.visit(&app, .post, "/todos", null, &inertia_headers, &a);
+    const pending = added.cookie.?;
+
+    // A form posted with `only` is followed by a partial reload, whose
+    // flash the client shows, so it is sent and consumed there.
+    const reload = try FlashTest.visit(&app, .get, "/todos", pending, partialHeaders("Todos/Index", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "stats" },
+    }), &b);
+    try testing.expectEqualStrings(
+        "{\"component\":\"Todos/Index\",\"props\":{\"stats\":3,\"errors\":{}},\"url\":\"/todos\",\"version\":\"v1\",\"flash\":{\"notice\":\"Todo added\"}}",
+        reload.body,
+    );
+    try testing.expect(reload.cookie != null);
+
+    // The deferred `stats` reload that follows a full visit finds nothing
+    // left to send.
+    const deferred_reload = try FlashTest.visit(&app, .get, "/todos", reload.cookie, partialHeaders("Todos/Index", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "stats" },
+    }), &c);
+    try testing.expect(std.mem.indexOf(u8, deferred_reload.body, "\"flash\"") == null);
+    try testing.expect(deferred_reload.cookie == null);
+
+    const denied = try FlashTest.visit(&app, .get, "/denied", pending, &.{}, &b);
+    try testing.expectEqual(@as(u16, 403), denied.status);
+    try testing.expect(denied.cookie == null);
+
+    const stale = try FlashTest.visit(&app, .get, "/todos", pending, &.{.{ .name = "X-Inertia", .value = "true" }}, &b);
+    try testing.expectEqual(@as(u16, 409), stale.status);
+    try testing.expect(stale.cookie == null);
+
+    // Header errors propagate before anything is read.
+    try testing.expectError(error.DuplicateInertiaHeader, FlashTest.visit(&app, .get, "/todos", pending, &.{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia", .value = "true" },
+    }, &b));
+    try testing.expectError(error.MalformedPartialHeader, FlashTest.visit(&app, .get, "/todos", pending, partialHeaders("Todos/Index", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "stats,," },
+    }), &b));
+
+    // The message is still there for the next full visit.
+    const shown = try FlashTest.visit(&app, .get, "/todos", pending, &inertia_headers, &b);
+    try testing.expect(std.mem.endsWith(u8, shown.body, ",\"flash\":{\"notice\":\"Todo added\"}}"));
+}
+
+/// Session state that received `messages`, as loaded from a saved cookie.
+fn receivedFlash(messages: []const [2][]const u8) !sessions.Sessions.State {
+    const plugin: flash_mod.Flash = .{};
+    var empty: router.Request = .{ .method = .get, .segments = &.{} };
+    var state = try flash_test_sessions.initRequest(&empty);
+    for (messages) |message| try plugin.add(&state, message[0], message[1]);
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try flash_test_sessions.save(&state, &res);
+    const set_cookie = res.headers[0].value;
+    const headers = [_]router.Header{.{ .name = "Cookie", .value = set_cookie[0..std.mem.indexOfScalar(u8, set_cookie, ';').?] }};
+    var req: router.Request = .{ .method = .get, .segments = &.{}, .headers = &headers };
+    return flash_test_sessions.initRequest(&req);
+}
+
+test "flash keeps the last message of each kind and its failures leave it unread" {
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const flash: flash_mod.Flash = .{};
+    const req = testRequest(.get, "/", &inertia_headers);
+    var state = try receivedFlash(&.{ .{ "notice", "first" }, .{ "alert", "a \"quoted\" <b>" }, .{ "notice", "second" } });
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try plugin.renderWith(&req, &res, "Home", .{}, .{ .flash = .{ .plugin = &flash, .session = &state } });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Home\",\"props\":{\"errors\":{}},\"url\":\"/\",\"version\":null,\"flash\":{\"alert\":\"a \\\"quoted\\\" <b>\",\"notice\":\"second\"}}",
+        res.body,
+    );
+    try testing.expect(state.dirty and state.flash.consumed);
+
+    // A prop callback error propagates before the messages are read.
+    const Failing = struct {
+        fn load(_: void, _: std.mem.Allocator) error{Unavailable}!u32 {
+            return error.Unavailable;
+        }
+    };
+    var failed = try receivedFlash(&.{.{ "notice", "kept" }});
+    try testing.expectError(error.Unavailable, plugin.renderWith(&req, &res, "Home", .{ .n = once({}, Failing.load) }, .{
+        .flash = .{ .plugin = &flash, .session = &failed },
+    }));
+    try testing.expect(!failed.dirty and !failed.flash.consumed);
+}
+
+test "flash counts toward the body limit and a failure leaves it unread" {
+    const plugin: TestInertia = .{ .layout = "@inertia" };
+    const flash: flash_mod.Flash = .{};
+    const ordinary = testRequest(.get, "/", &.{});
+    // The largest flash: one message of every remaining byte, each of which
+    // the script element escapes to six.
+    const text = "<" ** (flash_mod.max_bytes - 4);
+    const prefix = "<script data-page=\"app\" type=\"application/json\">{\"component\":\"Home\",\"props\":{\"errors\":{}},\"url\":\"/\",\"version\":null,\"flash\":{\"n\":\"";
+    const suffix = "\"}}</script><div id=\"app\"></div>";
+    const size = prefix.len + text.len * "\\u003c".len + suffix.len;
+
+    var too_small = response.Response.initWithLimits(testing.allocator, .{ .max_body_bytes = size - 1 });
+    defer too_small.deinit();
+    var state = try receivedFlash(&.{.{ "n", text }});
+    try testing.expectError(error.BodyTooLarge, plugin.renderWith(&ordinary, &too_small, "Home", .{}, .{
+        .flash = .{ .plugin = &flash, .session = &state },
+    }));
+    try testing.expectEqual(@as(usize, 0), too_small.body.len);
+    try testing.expect(!state.dirty and !state.flash.consumed);
+
+    var exact = response.Response.initWithLimits(testing.allocator, .{ .max_body_bytes = size });
+    defer exact.deinit();
+    try plugin.renderWith(&ordinary, &exact, "Home", .{}, .{ .flash = .{ .plugin = &flash, .session = &state } });
+    try testing.expectEqual(size, exact.body.len);
+    try testing.expect(std.mem.startsWith(u8, exact.body, prefix ++ "\\u003c"));
+    try testing.expect(state.dirty and state.flash.consumed);
+
+    // The JSON form, which leaves `<` as is, is limited the same way.
+    const inertia = testRequest(.get, "/", &inertia_headers);
+    const json_size = "{\"component\":\"Home\",\"props\":{\"errors\":{}},\"url\":\"/\",\"version\":null,\"flash\":{\"n\":\"".len + text.len + "\"}}".len;
+    var json = response.Response.initWithLimits(testing.allocator, .{ .max_body_bytes = json_size - 1 });
+    defer json.deinit();
+    var big = try receivedFlash(&.{.{ "n", text }});
+    try testing.expectError(error.BodyTooLarge, plugin.renderWith(&inertia, &json, "Home", .{}, .{
+        .flash = .{ .plugin = &flash, .session = &big },
+    }));
+    try testing.expect(!big.dirty and !big.flash.consumed);
+    try testing.expectEqual(@as(usize, 0), json.header_count);
 }

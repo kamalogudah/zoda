@@ -1,5 +1,5 @@
 <script>
-  import { Deferred, InfiniteScroll, Link, router, useForm } from '@inertiajs/svelte'
+  import { Deferred, InfiniteScroll, Link, page, router, useForm } from '@inertiajs/svelte'
 
   let { app, framework, todos, filter, remaining, stats } = $props()
 
@@ -31,6 +31,10 @@
   </form>
   {#if form.errors.text}
     <p class="error">{form.errors.text}</p>
+  {/if}
+  <!-- The page's top-level `flash`, from `zoda.Flash`; `{}` once it has been shown. -->
+  {#if page.flash?.notice}
+    <p class="notice" role="status">{page.flash.notice}</p>
   {/if}
 
   <nav>

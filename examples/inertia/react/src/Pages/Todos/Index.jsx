@@ -1,4 +1,4 @@
-import { Deferred, InfiniteScroll, Link, router, useForm } from '@inertiajs/react'
+import { Deferred, InfiniteScroll, Link, router, useForm, usePage } from '@inertiajs/react'
 
 const filters = [
   ['all', 'All'],
@@ -8,6 +8,8 @@ const filters = [
 
 export default function Index({ app, framework, todos, filter, remaining, stats }) {
   const form = useForm({ text: '' })
+  // The page's top-level `flash`, from `zoda.Flash`; `{}` once it has been shown.
+  const { flash } = usePage()
   // Mutations carry the filter so the server's 303 lands on the same view.
   const query = filter === 'all' ? '' : `?filter=${filter}`
   // They also keep this component mounted, so reset `todos`: the list
@@ -37,6 +39,11 @@ export default function Index({ app, framework, todos, filter, remaining, stats 
         <button disabled={form.processing}>Add</button>
       </form>
       {form.errors.text && <p className="error">{form.errors.text}</p>}
+      {flash.notice && (
+        <p className="notice" role="status">
+          {flash.notice}
+        </p>
+      )}
 
       <nav>
         {filters.map(([value, label]) => (

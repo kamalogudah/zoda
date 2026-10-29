@@ -6,6 +6,7 @@
   --line: #e3e1da;
   --accent: #d4532b;
   --error: #b3261e;
+  --ok: #2e6b3a;
   color-scheme: light dark;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
@@ -19,6 +20,7 @@
     --line: #34332e;
     --accent: #f07a50;
     --error: #ff8a80;
+    --ok: #8fd19e;
   }
 }
 
@@ -81,6 +83,12 @@ form.new button:disabled { opacity: 0.6; }
 
 .error {
   color: var(--error);
+  margin: 0.5rem 0 0;
+  font-size: 0.9rem;
+}
+
+.notice {
+  color: var(--ok);
   margin: 0.5rem 0 0;
   font-size: 0.9rem;
 }

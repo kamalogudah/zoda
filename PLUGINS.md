@@ -269,6 +269,11 @@ try ctx.plugins.sessions.save(&ctx.state.sessions, res);
       return res.text(503, "unavailable");
   };
   ```
+- **Inertia.** `Inertia.renderWith(..., .{ .flash = ... })` sends the
+  received messages as the page's top-level `flash`; see
+  [Inertia.js flash](#flash). `peek` returns the received messages without
+  consuming them, for integrations that `read` only once they have sent
+  them.
 - **Clearing.** `clear` drops received and queued messages. `add` after `clear`
   keeps a cookie with an empty payload, so a logout page can still show a
   notice.
@@ -1050,6 +1055,55 @@ return ctx.plugins.inertia.render(req, res, "Billing/Plans", .{
   `prepend`, `deepMerge`, `scroll`, or `always`. Deferred once props
   (Laravel's `Inertia::defer(...)->once()`) are not implemented.
 
+### Flash
+
+`renderWith` is `render` with per-call options. Its `.flash` option sends the
+messages this request received through [`zoda.Flash`](#flash-messages) as
+the page's top-level `flash`, which v3 clients expose as `page.flash` and
+pass to `flash` events and `onFlash` callbacks:
+
+```zig
+// POST /todos: queue the message, save, and redirect as usual.
+try ctx.plugins.flash.add(&ctx.state.sessions, "notice", "Todo added");
+try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+return ctx.plugins.inertia.redirect(req, res, "/todos");
+
+// GET /todos: send pending messages, then save to consume them.
+try ctx.plugins.inertia.renderWith(req, res, "Todos/Index", props, .{
+    .flash = .{ .plugin = &ctx.plugins.flash, .session = &ctx.state.sessions },
+});
+return ctx.plugins.sessions.save(&ctx.state.sessions, res);
+```
+
+- **Shape.** `"flash": {"notice": "Todo added"}`, after every other page
+  field: one `kind: text` entry per kind, in the order each kind was last
+  added. A later message of a kind replaces an earlier one, like the
+  client's `router.flash(key, value)`; use distinct kinds to show several.
+  Text that is not valid UTF-8 is written as an array of byte values, as
+  `std.json` does for any string prop. In the HTML shell it is escaped like
+  the rest of the page.
+- **Default.** With no messages, or without the option, the field is left
+  out; the client reads a missing `flash` as `{}`. `render` never sends it.
+- **Read once.** `renderWith` reads the messages with `Flash.peek` and calls
+  `Flash.read` only after the response is committed, so a header, limit,
+  configuration, or prop-callback error, or a version-conflict 409, leaves
+  them unread. As with any `read`, the consumption persists only through
+  the `sessions.save` that follows `renderWith`; without it the browser
+  keeps the old cookie and gets the messages again. A short circuit that
+  never renders leaves them for the next page.
+- **Partial reloads.** Flash is sent and consumed on every render, partial
+  reloads included, as the Laravel and Rails adapters do. A form posted
+  with `only` is followed by a partial reload, and the v3 client shows its
+  flash. The one exception is the client's deferred-props reload, whose
+  flash it ignores; no header marks it, so the server cannot skip it. That
+  reload comes right after a full visit that has already consumed the
+  messages, so it only loses a message queued in between, for example by
+  another tab. A prefetch is an ordinary visit and consumes them too.
+- **Limits.** Flash holds at most 8 messages and 512 encoded bytes (see
+  [Flash messages](#flash-messages)), and the page must still fit
+  `max_body_bytes`; script-element escaping can make a message up to six
+  times longer.
+
 ### URL and origin policy
 
 The page `url` and the conflict's `X-Inertia-Location` are the raw
@@ -1089,9 +1143,10 @@ origin. A target that starts with `//` or contains `\` is refused with
 ### Interactions
 
 - **Sessions, CSRF, and flash.** Shared-props callbacks receive only the
-  request, not `ctx`, so put session-derived values (the current user, flash
-  messages, validation `errors`) in route props. Save the session before
-  `render` or `redirect` as usual. `csrf.valid` reads `X-CSRF-Token`, not
+  request, not `ctx`, so put session-derived values (the current user,
+  validation `errors`) in route props, and send flash messages with
+  `renderWith` (see [Flash](#flash)). Save the session before `redirect`, and
+  after `renderWith` when it sends flash, so the read is persisted. `csrf.valid` reads `X-CSRF-Token`, not
   the `X-XSRF-TOKEN` header that Inertia's axios client sends from an
   `XSRF-TOKEN` cookie. Either set `X-CSRF-Token` in your client's request
   headers or pass the submitted value to `csrf.validToken`.
@@ -1110,8 +1165,10 @@ and `@inertiajs/vue3` 3.9.1. The three frontends in
 through the script-element page, JSON visits, shared props, `errors`, 303
 and fragment redirects, filter links, the deferred `stats` prop that each
 renders with `<Deferred>`, and the `todos` scroll prop paged forward and
-backward with `<InfiniteScroll>` and reset after a toggle. The other rows are covered by the plugin's
-unit tests only.
+backward with `<InfiniteScroll>` and reset after a toggle. The "Todo added"
+flash was driven in Chrome in all three: shown after the add form's partial
+reload, kept through the deferred `stats` reload, and gone on the next
+visit. The other rows are covered by the plugin's unit tests only.
 
 The features not yet implemented are tracked in
 [#80](https://github.com/kamalogudah/zoda/issues/80), with one issue each.
@@ -1129,7 +1186,7 @@ The features not yet implemented are tracked in
 | External and full-page visits, 409 + `X-Inertia-Location` | Implemented (`location`) |
 | Prefetching (`Purpose: prefetch`) | Not special-cased: a prefetch is an ordinary Inertia GET and gets a full response. Not exercised by the example. |
 | Partial reloads (`X-Inertia-Partial-Data`, `-Component`, `-Except`) | Implemented, top-level names only (dot paths select the whole top-level prop). Driven in a browser through deferred loading (`only`); `except` is covered by unit tests only. |
-| Top-level `flash` | Not implemented: the client defaults it to `{}`. Pass flash messages as props, as the example's README describes. |
+| Top-level `flash` | Implemented (`renderWith` with `.flash`): `zoda.Flash` messages as `{kind: text}`, consumed once the response is committed and left out when empty. Sent on partial reloads too; the client ignores it only on deferred-props reloads. Driven in a browser through the example's "Todo added" notice. |
 | Optional props (`optional`) and always props (`always`) | Implemented |
 | Deferred props (`deferred`, `deferredGroup`, `deferredProps`) | Implemented, including groups and shared deferred props |
 | Merge props (`merge`, `prepend`, `deepMerge`, `matchOn`; `mergeProps`, `prependProps`, `deepMergeProps`, `matchPropsOn`) | Implemented, including optional, deferred, and shared merge props |

@@ -77,8 +77,9 @@ Partial reloads with `optional` and `always` props followed
 ([#69](https://github.com/kamalogudah/zoda/issues/69)), then deferred props
 ([#70](https://github.com/kamalogudah/zoda/issues/70)), merge props with
 reset ([#71](https://github.com/kamalogudah/zoda/issues/71)), scroll
-props ([#72](https://github.com/kamalogudah/zoda/issues/72)), and once
-props ([#73](https://github.com/kamalogudah/zoda/issues/73)); the remaining
+props ([#72](https://github.com/kamalogudah/zoda/issues/72)), once
+props ([#73](https://github.com/kamalogudah/zoda/issues/73)), and top-level
+flash from `zoda.Flash` ([#74](https://github.com/kamalogudah/zoda/issues/74)); the remaining
 deferred features are listed in
 [PLUGINS.md](PLUGINS.md#supported-protocol-features).
 

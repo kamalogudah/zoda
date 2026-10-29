@@ -183,9 +183,14 @@ runs inside `zig build test`.
   `expiresAt` above `max_once_expires_at` returns `error.InvalidOnceTime`.
   Lists (including `X-Inertia-Reset` and `X-Inertia-Except-Once-Props`) are
   bounded by `max_partial_props` and `max_partial_bytes`; malformed,
-  oversized, or duplicate partial headers return errors. Top-level `flash`,
-  deferred once props, error bags, history encryption, precognition, and SSR
-  are not implemented. See
+  oversized, or duplicate partial headers return errors.
+  `renderWith(req, res, component, props, .{ .flash = .{ .plugin, .session } })`
+  sends the `zoda.Flash` messages the request received as the top-level
+  `flash: {kind: text}` (a later message of a kind replaces an earlier one),
+  on every render including partial reloads, leaves the field out when there
+  are none, and marks them read only after the response is committed;
+  `sessions.save` after it persists that. Deferred once props, error bags,
+  history encryption, precognition, and SSR are not implemented. See
   [PLUGINS.md](PLUGINS.md#inertiajs).
 - `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
   local-path rules without changing a response.
@@ -277,7 +282,8 @@ issuance require an explicit `sessions.save` before returning; cleanup never
 persists. `zoda.Flash` stores at most 8 messages / 512 encoded bytes in the
 same signed (not encrypted) cookie. `add` queues a message for the next
 request. `read` returns this request's messages and marks them consumed for
-the next `save`. Without a save, they are shown again. `reset` undoes this
+the next `save`. Without a save, they are shown again. `peek` returns them
+without consuming them. `reset` undoes this
 request's flash changes before a recovery save. Call `csrf.valid` before protected actions and reject duplicate form
 tokens before `validToken`. See the [README](PLUGINS.md#cookie-sessions) for
 rotation and cookie behavior.

@@ -120,6 +120,13 @@ pub const Flash = struct {
         return .{ .bytes = store.incoming[0..store.incoming_len], .count = store.incoming_count };
     }
 
+    /// Returns the messages this request received without consuming them.
+    /// For integrations, such as `Inertia.renderWith`, that call `read` only
+    /// once the messages are sent.
+    pub fn peek(_: *const Flash, state: *const sessions.Sessions.State) Messages {
+        return .{ .bytes = state.flash.incoming[0..state.flash.incoming_len], .count = state.flash.incoming_count };
+    }
+
     /// Restores what this request received: un-consumes incoming messages and
     /// drops queued ones. Recovery middleware calls this before replacing a
     /// failed response and saving. The session stays dirty if it already was.

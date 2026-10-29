@@ -7,7 +7,9 @@
 //! dozen samples, and are shown newest first, a page at a time, through
 //! `<InfiniteScroll>`. The server serves the chosen frontend's built
 //! `dist/assets` and renders every page through `zoda.Inertia`; mutations
-//! redirect back with 303 so the client re-fetches the page as JSON.
+//! redirect back with 303 so the client re-fetches the page as JSON. Adding a
+//! todo flashes "Todo added" through `zoda.Flash`, sent as the page's
+//! top-level `flash` on the next render.
 const std = @import("std");
 const zoda = @import("zoda");
 
@@ -91,6 +93,8 @@ pub const Shared = struct { app: []const u8, framework: []const u8 };
 
 pub const Plugins = struct {
     inertia: zoda.Inertia(Shared),
+    sessions: zoda.Sessions,
+    flash: zoda.Flash = .{},
     json: zoda.JsonParser = .{ .max_body_bytes = 4096 },
     store: struct { value: *Store },
 };
@@ -131,6 +135,9 @@ pub fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.R
         if (text.len == 0) return renderIndex(ctx, req, res, filter, "Write something first.");
         if (text.len > max_text_bytes) return renderIndex(ctx, req, res, filter, "Keep it under 200 bytes.");
         const id = try store.add(text);
+        // Shown once, by the render that follows the redirect.
+        try ctx.plugins.flash.add(&ctx.state.sessions, "notice", "Todo added");
+        try ctx.plugins.sessions.save(&ctx.state.sessions, res);
         // The fragment scrolls to the new item. Inertia requests get it as
         // 409 + `X-Inertia-Redirect`, because XHR drops followed fragments.
         var buffer: [64]u8 = undefined;
@@ -200,16 +207,24 @@ fn renderIndex(
         .stats = zoda.plugins.inertia.deferred(store, Stats.compute),
     };
     const inertia = &ctx.plugins.inertia;
+    const session = &ctx.state.sessions;
+    // Sends pending flash messages as the page's `flash` and marks them
+    // read; the save below persists that, so they are shown once.
+    const options: zoda.plugins.inertia.RenderOptions = .{
+        .flash = .{ .plugin = &ctx.plugins.flash, .session = session },
+    };
     if (text_error) |message| {
-        return inertia.render(req, res, "Todos/Index", .{
+        try inertia.renderWith(req, res, "Todos/Index", .{
             .todos = props.todos,
             .filter = props.filter,
             .remaining = props.remaining,
             .stats = props.stats,
             .errors = .{ .text = message },
-        });
+        }, options);
+    } else {
+        try inertia.renderWith(req, res, "Todos/Index", props, options);
     }
-    return inertia.render(req, res, "Todos/Index", props);
+    return ctx.plugins.sessions.save(session, res);
 }
 
 /// The `?page=` that `<InfiniteScroll>` sends; anything but a positive
@@ -236,6 +251,13 @@ fn backTo(filter: Filter) []const u8 {
 }
 
 const frameworks = [_][]const u8{ "react", "svelte", "vue" };
+
+/// The session clock reads the wall clock through the `Io` that `main` sets.
+var clock_io: std.Io = undefined;
+
+fn unixSeconds() i64 {
+    return std.Io.Clock.real.now(clock_io).toSeconds();
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -266,6 +288,13 @@ pub fn main(init: std.process.Init) !void {
     std.crypto.hash.sha2.Sha256.hash(bundle, &digest, .{});
     const version = std.fmt.bytesToHex(digest[0..8], .lower);
 
+    // Sessions only carry flash messages here, so a fresh key per run is
+    // enough: a restart just drops pending messages. A real app loads a
+    // stable secret from its configuration.
+    clock_io = io;
+    var secret: [32]u8 = undefined;
+    try std.Io.randomSecure(io, &secret);
+
     var store = Store{ .allocator = allocator, .io = io };
     defer store.deinit();
     for (1..sample_count + 1) |n| {
@@ -287,6 +316,7 @@ pub fn main(init: std.process.Init) !void {
                 .version = .{ .value = &version },
                 .shared = .{ .value = .{ .app = "Zoda", .framework = framework } },
             },
+            .sessions = .{ .keys = &.{.{ .id = 1, .secret = &secret }}, .lifetime_seconds = 60 * 60, .now_seconds = unixSeconds },
             .store = .{ .value = &store },
         },
         .route_fn = route,
@@ -302,11 +332,16 @@ pub fn main(init: std.process.Init) !void {
     try zoda.server.serve(App, allocator, io, &listener, &app, .{});
 }
 
+fn testClock() i64 {
+    return 1000;
+}
+
 fn testApp(store: *Store) !App {
     return App.init(std.testing.allocator, .{
         .response_allocator = std.testing.allocator,
         .plugins = .{
             .inertia = .{ .layout = layout, .version = .{ .value = "v1" }, .shared = .{ .value = .{ .app = "Zoda", .framework = "test" } } },
+            .sessions = .{ .keys = &.{.{ .id = 1, .secret = "x" ** 32 }}, .lifetime_seconds = 300, .now_seconds = testClock },
             .store = .{ .value = store },
         },
         .route_fn = route,
@@ -530,4 +565,57 @@ test "<InfiniteScroll> pages through todos newest first and resets after a chang
     try std.testing.expect(std.mem.indexOf(u8, back.body, "\"remaining\":11,\"stats\":{\"total\":12,\"done\":1},\"errors\":{}},") != null);
     try std.testing.expect(std.mem.indexOf(u8, back.body, "\"mergeProps\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, back.body, "\"nextPage\":2,\"currentPage\":1,\"reset\":true") != null);
+}
+
+/// The session cookie a response sets, without its attributes.
+fn sessionCookie(res: *const zoda.response.Response) !?[]const u8 {
+    const set_cookie = (try res.getHeaderOne("Set-Cookie")) orelse return null;
+    return set_cookie[0..std.mem.indexOfScalar(u8, set_cookie, ';').?];
+}
+
+test "adding a todo flashes a notice that the next render shows once" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+
+    // The form posts with `only` and `reset`, which XHR repeats on the GET
+    // that follows the redirect, so that partial reload carries the flash.
+    const form = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "todos,remaining,stats" },
+        .{ .name = "X-Inertia-Reset", .value = "todos" },
+    };
+    var created = try visit(&app, .post, "/todos", &form, "{\"text\":\"Buy milk\"}");
+    defer created.deinit();
+    try std.testing.expectEqualStrings("/todos#todo-1", (try created.getHeaderOne("X-Inertia-Redirect")).?);
+    const pending = (try sessionCookie(&created)).?;
+
+    var with_cookie: [form.len + 1]zoda.request.Header = undefined;
+    @memcpy(with_cookie[0..form.len], &form);
+    with_cookie[form.len] = .{ .name = "Cookie", .value = pending };
+    var shown = try visit(&app, .get, "/todos", &with_cookie, "");
+    defer shown.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, shown.body, ",\"flash\":{\"notice\":\"Todo added\"}}"));
+    const read = (try sessionCookie(&shown)).?;
+
+    // The saved cookie no longer holds the message.
+    const again_headers = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "Cookie", .value = read },
+    };
+    var again = try visit(&app, .get, "/todos", &again_headers, "");
+    defer again.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, again.body, "\"flash\"") == null);
+    try std.testing.expect((try sessionCookie(&again)) == null);
+
+    // A rejected todo flashes nothing.
+    var blank = try visit(&app, .post, "/todos", &inertia_json, "{\"text\":\" \"}");
+    defer blank.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, blank.body, "\"flash\"") == null);
+    try std.testing.expect((try sessionCookie(&blank)) == null);
 }
