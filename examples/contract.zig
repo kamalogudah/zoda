@@ -1100,3 +1100,55 @@ test "PLUGINS Inertia.js history encryption example" {
         missing.body,
     );
 }
+
+// PLUGINS.md "Inertia.js" precognition: the submit route validates, then
+// answers a precognitive request before storing anything.
+fn inertiaPrecognitionRoute(ctx: *InertiaApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    if (!req.onLiteral("todos") or !req.isRoot() or req.method != .post) return;
+    const text = req.body;
+    const problem: ?[]const u8 = if (text.len == 0) "Write something first." else null;
+    if (try zoda.plugins.inertia.precognition(req) != null) {
+        return ctx.plugins.inertia.answerPrecognition(req, res, .{ .text = problem });
+    }
+    if (problem != null) return res.text(422, "invalid");
+    return res.text(201, "stored");
+}
+
+test "PLUGINS Inertia.js precognition example" {
+    var app = try InertiaApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{ .inertia = .{ .layout = inertia_layout } },
+        .route_fn = inertiaPrecognitionRoute,
+    });
+    defer app.deinit();
+    const Visit = struct {
+        fn run(a: *const InertiaApp, headers: []const zoda.request.Header, body: []const u8) !zoda.response.Response {
+            var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, "/todos");
+            defer arena.deinit();
+            try arena.copyHeaders(headers);
+            try arena.copyBody(body);
+            var req = arena.requestView(.post);
+            return a.dispatch(&req);
+        }
+    };
+    const precognitive = [_]zoda.request.Header{
+        .{ .name = "Precognition", .value = "true" },
+        .{ .name = "Precognition-Validate-Only", .value = "text" },
+    };
+
+    var invalid = try Visit.run(&app, &precognitive, "");
+    defer invalid.deinit();
+    try std.testing.expectEqual(@as(u16, 422), invalid.status_code);
+    try std.testing.expectEqualStrings("{\"errors\":{\"text\":\"Write something first.\"}}", invalid.body);
+    try std.testing.expectEqualStrings("Precognition", (try invalid.getHeaderOne("Vary")).?);
+
+    var valid = try Visit.run(&app, &precognitive, "Buy milk");
+    defer valid.deinit();
+    try std.testing.expectEqual(@as(u16, 204), valid.status_code);
+    try std.testing.expectEqualStrings("true", (try valid.getHeaderOne("Precognition-Success")).?);
+
+    var submitted = try Visit.run(&app, &.{}, "Buy milk");
+    defer submitted.deinit();
+    try std.testing.expectEqual(@as(u16, 201), submitted.status_code);
+    try std.testing.expect((try submitted.getHeaderOne("Precognition")) == null);
+}

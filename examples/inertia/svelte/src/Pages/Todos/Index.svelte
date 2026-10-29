@@ -8,7 +8,9 @@
     ['active', 'Active'],
     ['done', 'Done'],
   ]
-  const form = useForm({ text: '' })
+  // Leaving the field asks the server to validate it (precognition), which
+  // answers 422 with `errors.text` or 204 without adding the todo.
+  const form = useForm({ text: '' }).withPrecognition('post', '/todos')
   // Mutations keep this component mounted, so they reset `todos`: the list
   // starts again at page 1 instead of merging into the pages loaded so far.
   const options = { preserveScroll: true, only: ['todos', 'remaining', 'stats'], reset: ['todos'] }
@@ -28,7 +30,15 @@
 
   <form class="new" onsubmit={add}>
     <!-- svelte-ignore a11y_autofocus -->
-    <input type="text" bind:value={form.text} placeholder="What needs doing?" aria-label="New todo" autofocus />
+    <input
+      type="text"
+      bind:value={form.text}
+      onblur={() => form.validate('text')}
+      aria-invalid={form.invalid('text')}
+      placeholder="What needs doing?"
+      aria-label="New todo"
+      autofocus
+    />
     <button disabled={form.processing}>Add</button>
   </form>
   {#if form.errors.text}

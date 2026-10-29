@@ -92,8 +92,15 @@
 //!   next `renderWith` with `.flash`, so a logout can redirect first. Each
 //!   field is left out when false, which the client reads as false.
 //!
-//! Not implemented: once deferred props, precognition, and server-side
-//! rendering.
+//! - Precognition: `precognition(req)` reads `Precognition: true` and its
+//!   `Precognition-Validate-Only` list. The route validates, then
+//!   `answerPrecognition(req, res, errors)` answers before any side effect:
+//!   422 with `{"errors": {...}}` holding the listed fields' errors, or 204
+//!   with `Precognition-Success: true` when none are left. Both send
+//!   `Precognition: true` and `Vary: Precognition`, the contract of
+//!   laravel-precognition, which `useForm(...).withPrecognition()` uses.
+//!
+//! Not implemented: once deferred props and server-side rendering.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
 //! the current page are the raw origin-form request target, so path and
@@ -126,6 +133,10 @@ pub const max_partial_bytes = 1024;
 pub const max_once_expires_at: i64 = (1 << 53) - 1;
 /// Most bytes in an `X-Inertia-Error-Bag` value.
 pub const max_error_bag_bytes = 64;
+/// Most names one `Precognition-Validate-Only` field may list.
+pub const max_precognition_fields = 64;
+/// Most bytes in one `Precognition-Validate-Only` value.
+pub const max_precognition_bytes = 1024;
 /// The `zoda.Flash` kind that holds the errors `redirectWithErrors` stores.
 /// `renderWith` leaves it out of the page's `flash`; do not add messages of
 /// this kind yourself.
@@ -142,6 +153,12 @@ pub const OnceError = error{ OnceClockNotConfigured, InvalidOnceTime };
 pub const ConfigError = error{ InvalidLayout, InvalidRootId };
 pub const TargetError = error{ MissingRequestTarget, UnsafeRequestTarget };
 pub const ErrorBagError = error{ DuplicateErrorBagHeader, MalformedErrorBagHeader };
+pub const PrecognitionError = error{ DuplicatePrecognitionHeader, MalformedPrecognitionHeader, PrecognitionHeaderTooLarge };
+pub const PrecognitionResponseError = PrecognitionError || response.HeaderError || error{
+    BodyTooLarge,
+    NotPrecognitive,
+    PrecognitionAlreadySet,
+};
 pub const RenderError = HeaderError || PartialError || ScrollError || OnceError || ConfigError || TargetError || response.HeaderError || error{
     BodyTooLarge,
     InvalidComponent,
@@ -182,6 +199,76 @@ pub fn errorBag(req: *const router.Request) ErrorBagError!?[]const u8 {
         if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return error.MalformedErrorBagHeader;
     }
     return bag;
+}
+
+/// A precognitive request: the client asks the route to validate its input
+/// and answer, without acting on it.
+pub const Precognition = struct {
+    /// The validated `Precognition-Validate-Only` list, possibly empty, or
+    /// null when every field is validated.
+    only: ?[]const u8 = null,
+
+    /// Whether the client asked for `name`'s errors: every field without
+    /// `Precognition-Validate-Only`, else a listed name, where a listed `*`
+    /// segment matches any one segment of `name`.
+    pub fn validates(self: Precognition, name: []const u8) bool {
+        const list = self.only orelse return true;
+        if (list.len == 0) return false;
+        var items = std.mem.splitScalar(u8, list, ',');
+        while (items.next()) |item| {
+            var want = std.mem.splitScalar(u8, item, '.');
+            var have = std.mem.splitScalar(u8, name, '.');
+            while (true) {
+                const w = want.next();
+                const h = have.next();
+                if (w == null and h == null) return true;
+                if (w == null or h == null) break;
+                if (!std.mem.eql(u8, w.?, "*") and !std.mem.eql(u8, w.?, h.?)) break;
+            }
+        }
+        return false;
+    }
+};
+
+/// Reads a precognitive request. Exactly one `Precognition` field with the
+/// value `true` qualifies, as for `X-Inertia`. Its
+/// `Precognition-Validate-Only` may be empty, which validates nothing, or
+/// list 1 to `max_precognition_fields` comma-separated names in at most
+/// `max_precognition_bytes`; a name is dot-separated non-empty segments of
+/// `[A-Za-z0-9_$-]` or `*`. It is read only on precognitive requests. A
+/// repeated field or any other value is an error.
+pub fn precognition(req: *const router.Request) PrecognitionError!?Precognition {
+    const value = req.getHeaderOne("Precognition") catch return error.DuplicatePrecognitionHeader;
+    const raw = value orelse return null;
+    if (!std.mem.eql(u8, raw, "true")) return error.MalformedPrecognitionHeader;
+    const only = (req.getHeaderOne("Precognition-Validate-Only") catch return error.DuplicatePrecognitionHeader) orelse return .{};
+    if (only.len == 0) return .{ .only = only };
+    if (only.len > max_precognition_bytes) return error.PrecognitionHeaderTooLarge;
+    var count: usize = 0;
+    var items = std.mem.splitScalar(u8, only, ',');
+    while (items.next()) |item| {
+        count += 1;
+        if (count > max_precognition_fields) return error.PrecognitionHeaderTooLarge;
+        var segments = std.mem.splitScalar(u8, item, '.');
+        while (segments.next()) |segment| {
+            if (segment.len == 0) return error.MalformedPrecognitionHeader;
+            if (std.mem.eql(u8, segment, "*")) continue;
+            for (segment) |c| {
+                if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '$')) return error.MalformedPrecognitionHeader;
+            }
+        }
+    }
+    return .{ .only = only };
+}
+
+/// Adds `Vary: Precognition`, which `answerPrecognition` sends itself. Call
+/// it on the ordinary responses of a route that answers precognitive GETs,
+/// so a cache never serves one in place of the other.
+pub fn varyOnPrecognition(res: *response.Response) response.HeaderError!void {
+    http_cache.addVary(res, "Precognition") catch |err| switch (err) {
+        error.InvalidVary => unreachable,
+        else => |e| return e,
+    };
 }
 
 /// How a prop takes part in partial reloads.
@@ -873,6 +960,73 @@ pub fn Inertia(comptime SharedProps: type) type {
             try source.plugin.add(source.session, history_flash_kind, "");
         }
 
+        /// Answers a precognitive request with `errors`, a struct such as
+        /// `.{ .text = "Required" }` or one of `?[]const u8` fields, keeping
+        /// only the fields the client asked for (`Precognition.validates`)
+        /// and leaving out null optional ones. Any left: 422 with
+        /// `{"errors": {...}}` as JSON. None: 204 with
+        /// `Precognition-Success: true`. Both add `Precognition: true` and
+        /// `Vary: Precognition`. Call it after validating and before any side
+        /// effect, and return. A request that is not precognitive is
+        /// `error.NotPrecognitive`; header, limit, and repeated-answer
+        /// (`error.PrecognitionAlreadySet`) failures leave the response
+        /// unchanged.
+        pub fn answerPrecognition(
+            _: *const Self,
+            req: *const router.Request,
+            res: *response.Response,
+            errors: anytype,
+        ) PrecognitionResponseError!void {
+            const E = @TypeOf(errors);
+            comptime {
+                const info = @typeInfo(E);
+                if (info != .@"struct" or (info.@"struct".is_tuple and info.@"struct".fields.len != 0)) {
+                    @compileError("Inertia errors must be a struct with named fields");
+                }
+            }
+            const request = (try precognition(req)) orelse return error.NotPrecognitive;
+            var existing = res.getAllHeaders("Precognition");
+            if (existing.next() != null) return error.PrecognitionAlreadySet;
+
+            var out: std.Io.Writer.Allocating = .init(res.allocator);
+            defer out.deinit();
+            var json: std.json.Stringify = .{ .writer = &out.writer };
+            var sent: usize = 0;
+            json.beginObject() catch return error.OutOfMemory;
+            json.objectField("errors") catch return error.OutOfMemory;
+            json.beginObject() catch return error.OutOfMemory;
+            inline for (std.meta.fields(E)) |field| {
+                const value = @field(errors, field.name);
+                const present = if (comptime @typeInfo(field.type) == .optional) value != null else true;
+                if (present and request.validates(field.name)) {
+                    json.objectField(field.name) catch return error.OutOfMemory;
+                    json.write(value) catch return error.OutOfMemory;
+                    sent += 1;
+                }
+            }
+            json.endObject() catch return error.OutOfMemory;
+            json.endObject() catch return error.OutOfMemory;
+
+            const precognition_bytes = "Precognition".len + "true".len;
+            if (sent == 0) {
+                try reserveWithVary(res, 2, precognition_bytes + "Precognition-Success".len + "true".len, "Precognition");
+                try res.setHeader("Precognition", "true");
+                try res.setHeader("Precognition-Success", "true");
+                try varyOnPrecognition(res);
+                emptyBody(res, 204);
+                return;
+            }
+            if (out.written().len > res.limits.max_body_bytes) return error.BodyTooLarge;
+            try reserveWithVary(res, 1, precognition_bytes, "Precognition");
+            const body = try out.toOwnedSlice();
+            var committed = false;
+            defer if (!committed) res.allocator.free(body);
+            try res.setHeader("Precognition", "true");
+            try varyOnPrecognition(res);
+            try commitBody(res, 422, response.json_content_type, body);
+            committed = true;
+        }
+
         fn encodeErrors(json: *std.json.Stringify, bag: ?[]const u8, errors: anytype) std.json.Stringify.Error!void {
             if (bag) |name| {
                 try json.beginObject();
@@ -1493,9 +1647,14 @@ fn sendRedirect(req: *const router.Request, res: *response.Response, status: res
 /// X-Inertia`, fit the response header limits, so a limit failure never
 /// leaves some Inertia headers behind.
 fn reserveHeaders(res: *const response.Response, count: usize, bytes: usize) response.HeaderError!void {
-    const vary: usize = if (listsInertiaVary(res)) 0 else 1;
+    return reserveWithVary(res, count, bytes, "X-Inertia");
+}
+
+/// `reserveHeaders` for a possible `Vary: vary_name`.
+fn reserveWithVary(res: *const response.Response, count: usize, bytes: usize, vary_name: []const u8) response.HeaderError!void {
+    const vary: usize = if (listsVary(res, vary_name)) 0 else 1;
     if (res.header_count + count + vary > res.limits.max_headers) return error.TooManyHeaders;
-    const vary_bytes = vary * ("Vary".len + "X-Inertia".len);
+    const vary_bytes = vary * ("Vary".len + vary_name.len);
     if (res.header_bytes_used + bytes + vary_bytes > res.limits.header_bytes) return error.HeaderBytesExceeded;
 }
 
@@ -1506,13 +1665,13 @@ fn addInertiaVary(res: *response.Response) response.HeaderError!void {
     };
 }
 
-fn listsInertiaVary(res: *const response.Response) bool {
+fn listsVary(res: *const response.Response, vary_name: []const u8) bool {
     var it = res.getAllHeaders("Vary");
     while (it.next()) |value| {
         var members = std.mem.splitScalar(u8, value, ',');
         while (members.next()) |member| {
             const name = std.mem.trim(u8, member, " \t");
-            if (std.mem.eql(u8, name, "*") or std.ascii.eqlIgnoreCase(name, "X-Inertia")) return true;
+            if (std.mem.eql(u8, name, "*") or std.ascii.eqlIgnoreCase(name, vary_name)) return true;
         }
     }
     return false;
@@ -3860,4 +4019,175 @@ test "clearHistoryOnNextRender sends clearHistory once on the page after a redir
     try plugin.renderWith(&testRequest(.get, "/", &inertia_headers), &res, "Home", .{}, .{ .flash = .{ .plugin = &flash, .session = &received } });
     try testing.expectEqualStrings("{\"component\":\"Home\",\"props\":{\"errors\":{}},\"url\":\"/\",\"version\":null,\"clearHistory\":true}", res.body);
     try testing.expect(received.flash.consumed);
+}
+
+fn precognitionRequest(comptime extra: []const router.Header) router.Request {
+    const headers = [_]router.Header{.{ .name = "Precognition", .value = "true" }} ++ extra[0..extra.len].*;
+    return testRequest(.post, "/todos", &headers);
+}
+
+const FieldErrors = struct { text: ?[]const u8 = null, due: ?[]const u8 = null };
+
+test "a valid precognitive request gets 204 with Precognition-Success" {
+    const plugin: TestInertia = .{ .layout = test_layout };
+    inline for (.{ FieldErrors{}, struct {}{} }) |errors| {
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try res.text(200, "replaced");
+        try plugin.answerPrecognition(&precognitionRequest(&.{}), &res, errors);
+        try testing.expectEqual(@as(u16, 204), res.status_code);
+        try testing.expectEqualStrings("", res.body);
+        try testing.expectEqualStrings("", res.content_type);
+        try testing.expectEqualStrings("true", (try res.getHeaderOne("Precognition")).?);
+        try testing.expectEqualStrings("true", (try res.getHeaderOne("Precognition-Success")).?);
+        try testing.expectEqualStrings("Precognition", (try res.getHeaderOne("Vary")).?);
+    }
+}
+
+test "an invalid precognitive request gets 422 with the errors as JSON" {
+    const plugin: TestInertia = .{ .layout = test_layout };
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try plugin.answerPrecognition(&precognitionRequest(&.{}), &res, FieldErrors{ .text = "Write <something>", .due = "Pick a date" });
+    try testing.expectEqual(@as(u16, 422), res.status_code);
+    try testing.expectEqualStrings(response.json_content_type, res.content_type);
+    try testing.expectEqualStrings("{\"errors\":{\"text\":\"Write <something>\",\"due\":\"Pick a date\"}}", res.body);
+    try testing.expectEqualStrings("true", (try res.getHeaderOne("Precognition")).?);
+    try testing.expect(try res.getHeaderOne("Precognition-Success") == null);
+    try testing.expectEqualStrings("Precognition", (try res.getHeaderOne("Vary")).?);
+
+    // Null fields are left out; lists of messages are sent as given.
+    var some = response.Response.init(testing.allocator);
+    defer some.deinit();
+    try plugin.answerPrecognition(&precognitionRequest(&.{}), &some, .{ .text = @as(?[]const u8, null), .@"items.0.name" = &[_][]const u8{ "Required", "Too short" } });
+    try testing.expectEqualStrings("{\"errors\":{\"items.0.name\":[\"Required\",\"Too short\"]}}", some.body);
+}
+
+test "Precognition-Validate-Only keeps only the listed fields' errors" {
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const errors = .{ .text = "Required", .due = "Pick a date", .@"items.0.name" = "Required", .@"items.1.name" = "Required" };
+    const cases = .{
+        .{ "text", "{\"errors\":{\"text\":\"Required\"}}" },
+        .{ "due,text", "{\"errors\":{\"text\":\"Required\",\"due\":\"Pick a date\"}}" },
+        .{ "items.*.name", "{\"errors\":{\"items.0.name\":\"Required\",\"items.1.name\":\"Required\"}}" },
+        .{ "items.1.name,nope", "{\"errors\":{\"items.1.name\":\"Required\"}}" },
+    };
+    inline for (cases) |case| {
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try plugin.answerPrecognition(&precognitionRequest(&.{.{ .name = "Precognition-Validate-Only", .value = case[0] }}), &res, errors);
+        try testing.expectEqual(@as(u16, 422), res.status_code);
+        try testing.expectEqualStrings(case[1], res.body);
+    }
+    // Errors only for unlisted fields, or an empty list, mean success.
+    inline for (.{ "notes", "items", "items.0", "" }) |only| {
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try plugin.answerPrecognition(&precognitionRequest(&.{.{ .name = "Precognition-Validate-Only", .value = only }}), &res, errors);
+        try testing.expectEqual(@as(u16, 204), res.status_code);
+        try testing.expectEqualStrings("true", (try res.getHeaderOne("Precognition-Success")).?);
+    }
+
+    const p = (try precognition(&precognitionRequest(&.{.{ .name = "Precognition-Validate-Only", .value = "a.*,b" }}))).?;
+    try testing.expect(p.validates("b") and p.validates("a.x") and !p.validates("a") and !p.validates("a.x.y") and !p.validates("bb"));
+    try testing.expect((Precognition{}).validates("anything"));
+}
+
+test "non-precognitive requests are unaffected and cannot be answered" {
+    const plugin: TestInertia = .{ .layout = test_layout };
+    // `Precognition-Validate-Only` alone is not read, even when malformed.
+    const plain = testRequest(.post, "/todos", &.{.{ .name = "Precognition-Validate-Only", .value = "bad name" }});
+    try testing.expect(try precognition(&plain) == null);
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try res.text(200, "keep");
+    try testing.expectError(error.NotPrecognitive, plugin.answerPrecognition(&plain, &res, FieldErrors{ .text = "Required" }));
+    try testing.expectEqualStrings("keep", res.body);
+    try testing.expectEqual(@as(usize, 0), res.header_count);
+
+    // Rendering ignores the header and adds no Precognition fields.
+    var page = response.Response.init(testing.allocator);
+    defer page.deinit();
+    try plugin.render(&precognitionRequest(&.{}), &page, "Home", .{});
+    try testing.expectEqual(@as(u16, 200), page.status_code);
+    try testing.expect(try page.getHeaderOne("Precognition") == null);
+    try testing.expectEqualStrings("X-Inertia", (try page.getHeaderOne("Vary")).?);
+}
+
+test "malformed, duplicate, and oversized precognition headers fail without changing the response" {
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const too_many = "a," ** max_precognition_fields ++ "a";
+    const too_long = "a" ** (max_precognition_bytes + 1);
+    const cases = .{
+        .{ &[_]router.Header{.{ .name = "Precognition", .value = "false" }}, error.MalformedPrecognitionHeader },
+        .{ &[_]router.Header{.{ .name = "Precognition", .value = "TRUE" }}, error.MalformedPrecognitionHeader },
+        .{ &[_]router.Header{ .{ .name = "Precognition", .value = "true" }, .{ .name = "precognition", .value = "true" } }, error.DuplicatePrecognitionHeader },
+        .{ &[_]router.Header{ .{ .name = "Precognition", .value = "true" }, .{ .name = "Precognition-Validate-Only", .value = "a" }, .{ .name = "Precognition-Validate-Only", .value = "b" } }, error.DuplicatePrecognitionHeader },
+        .{ &[_]router.Header{ .{ .name = "Precognition", .value = "true" }, .{ .name = "Precognition-Validate-Only", .value = "a, b" } }, error.MalformedPrecognitionHeader },
+        .{ &[_]router.Header{ .{ .name = "Precognition", .value = "true" }, .{ .name = "Precognition-Validate-Only", .value = "a,,b" } }, error.MalformedPrecognitionHeader },
+        .{ &[_]router.Header{ .{ .name = "Precognition", .value = "true" }, .{ .name = "Precognition-Validate-Only", .value = "a..b" } }, error.MalformedPrecognitionHeader },
+        .{ &[_]router.Header{ .{ .name = "Precognition", .value = "true" }, .{ .name = "Precognition-Validate-Only", .value = "user[name]" } }, error.MalformedPrecognitionHeader },
+        .{ &[_]router.Header{ .{ .name = "Precognition", .value = "true" }, .{ .name = "Precognition-Validate-Only", .value = "a.b*" } }, error.MalformedPrecognitionHeader },
+        .{ &[_]router.Header{ .{ .name = "Precognition", .value = "true" }, .{ .name = "Precognition-Validate-Only", .value = too_many } }, error.PrecognitionHeaderTooLarge },
+        .{ &[_]router.Header{ .{ .name = "Precognition", .value = "true" }, .{ .name = "Precognition-Validate-Only", .value = too_long } }, error.PrecognitionHeaderTooLarge },
+    };
+    inline for (cases) |case| {
+        const req = testRequest(.post, "/todos", case[0]);
+        try testing.expectError(case[1], precognition(&req));
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try res.text(200, "keep");
+        try testing.expectError(case[1], plugin.answerPrecognition(&req, &res, FieldErrors{ .text = "Required" }));
+        try testing.expectEqual(@as(u16, 200), res.status_code);
+        try testing.expectEqualStrings("keep", res.body);
+        try testing.expectEqual(@as(usize, 0), res.header_count);
+    }
+    // The limits themselves are accepted.
+    const at_limit = "a," ** (max_precognition_fields - 1) ++ "a";
+    try testing.expect(try precognition(&precognitionRequest(&.{.{ .name = "Precognition-Validate-Only", .value = at_limit }})) != null);
+}
+
+test "precognition answers keep one Vary member, fit the limits, and answer once" {
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const req = precognitionRequest(&.{});
+
+    // An existing `Vary: Precognition` or `*` is not repeated.
+    inline for (.{ "precognition", "*" }) |vary| {
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try res.setHeader("Vary", vary);
+        try plugin.answerPrecognition(&req, &res, FieldErrors{ .text = "Required" });
+        var it = res.getAllHeaders("Vary");
+        try testing.expectEqualStrings(vary, it.next().?);
+        try testing.expect(it.next() == null);
+    }
+    var ordinary = response.Response.init(testing.allocator);
+    defer ordinary.deinit();
+    try varyOnPrecognition(&ordinary);
+    try varyOnPrecognition(&ordinary);
+    try testing.expectEqual(@as(usize, 1), ordinary.header_count);
+
+    // A second answer is refused.
+    var twice = response.Response.init(testing.allocator);
+    defer twice.deinit();
+    try plugin.answerPrecognition(&req, &twice, FieldErrors{});
+    try testing.expectError(error.PrecognitionAlreadySet, plugin.answerPrecognition(&req, &twice, FieldErrors{ .text = "Required" }));
+    try testing.expectEqual(@as(u16, 204), twice.status_code);
+
+    // Header and body limits are checked before anything changes.
+    const limited = .{
+        .{ response.Limits{ .max_headers = 2 }, FieldErrors{}, error.TooManyHeaders },
+        .{ response.Limits{ .header_bytes = 40 }, FieldErrors{}, error.HeaderBytesExceeded },
+        .{ response.Limits{ .max_headers = 1 }, FieldErrors{ .text = "Required" }, error.TooManyHeaders },
+        .{ response.Limits{ .max_body_bytes = 20 }, FieldErrors{ .text = "Required" }, error.BodyTooLarge },
+    };
+    inline for (limited) |case| {
+        var res = response.Response.initWithLimits(testing.allocator, case[0]);
+        defer res.deinit();
+        try res.text(200, "keep");
+        try testing.expectError(case[2], plugin.answerPrecognition(&req, &res, case[1]));
+        try testing.expectEqual(@as(u16, 200), res.status_code);
+        try testing.expectEqualStrings("keep", res.body);
+        try testing.expectEqual(@as(usize, 0), res.header_count);
+    }
 }

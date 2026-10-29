@@ -16,7 +16,9 @@ const filters = [
   ['active', 'Active'],
   ['done', 'Done'],
 ]
-const form = useForm({ text: '' })
+// Leaving the field asks the server to validate it (precognition), which
+// answers 422 with `errors.text` or 204 without adding the todo.
+const form = useForm({ text: '' }).withPrecognition('post', '/todos')
 // The page's top-level `flash`, from `zoda.Flash`; `{}` once it has been shown.
 const page = usePage()
 // Mutations keep this component mounted, so they reset `todos`: the list
@@ -37,7 +39,15 @@ function add() {
     <h1>{{ app }} todos <small>{{ framework }}</small></h1>
 
     <form class="new" @submit.prevent="add">
-      <input v-model="form.text" type="text" placeholder="What needs doing?" aria-label="New todo" autofocus />
+      <input
+        v-model="form.text"
+        type="text"
+        placeholder="What needs doing?"
+        aria-label="New todo"
+        :aria-invalid="form.invalid('text')"
+        autofocus
+        @blur="form.validate('text')"
+      />
       <button :disabled="form.processing">Add</button>
     </form>
     <p v-if="form.errors.text" class="error">{{ form.errors.text }}</p>

@@ -12,7 +12,9 @@
 //! top-level `flash` on the next render; a rejected todo redirects back with
 //! its validation errors stored in the session the same way. Every page asks
 //! the client to encrypt the copy it keeps in browser history, and "Forget
-//! history" redirects to a page that clears it.
+//! history" redirects to a page that clears it. The add form validates as you
+//! type through Inertia's precognition support, which the same route answers
+//! without adding anything.
 const std = @import("std");
 const zoda = @import("zoda");
 
@@ -138,8 +140,13 @@ pub fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.R
         };
         defer parsed.deinit();
         const text = std.mem.trim(u8, parsed.value.text, " \t\r\n");
-        if (text.len == 0) return rejectTodo(ctx, req, res, filter, "Write something first.");
-        if (text.len > max_text_bytes) return rejectTodo(ctx, req, res, filter, "Keep it under 200 bytes.");
+        const problem = textProblem(text);
+        // Live validation from `useForm(...).withPrecognition()`: answer 422
+        // or 204 now, before the todo is added.
+        if (try zoda.plugins.inertia.precognition(req) != null) {
+            return inertia.answerPrecognition(req, res, .{ .text = problem });
+        }
+        if (problem) |message| return rejectTodo(ctx, req, res, filter, message);
         const id = try store.add(text);
         // Shown once, by the render that follows the redirect.
         try ctx.plugins.flash.add(&ctx.state.sessions, "notice", "Todo added");
@@ -160,6 +167,13 @@ pub fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.R
     };
     if (!found) return res.text(404, "Todo not found");
     return inertia.redirect(req, res, backTo(filter));
+}
+
+/// Why `text` cannot be a todo, or null when it can.
+fn textProblem(text: []const u8) ?[]const u8 {
+    if (text.len == 0) return "Write something first.";
+    if (text.len > max_text_bytes) return "Keep it under 200 bytes.";
+    return null;
 }
 
 /// Redirects back to the list with `errors.text` stored in the session, which
@@ -522,6 +536,51 @@ test "validation errors redirect back and show once, and stale clients reload" {
     defer stale.deinit();
     try std.testing.expectEqual(@as(u16, 409), stale.status_code);
     try std.testing.expectEqualStrings("/todos?filter=done", (try stale.getHeaderOne("X-Inertia-Location")).?);
+}
+
+test "precognitive posts validate the todo without adding it" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+
+    // What `form.validate('text')` sends after `withPrecognition('post', '/todos')`.
+    const precognitive = [_]zoda.request.Header{
+        .{ .name = "Precognition", .value = "true" },
+        .{ .name = "Precognition-Validate-Only", .value = "text" },
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    var blank = try visit(&app, .post, "/todos", &precognitive, "{\"text\":\"  \"}");
+    defer blank.deinit();
+    try std.testing.expectEqual(@as(u16, 422), blank.status_code);
+    try std.testing.expectEqualStrings("{\"errors\":{\"text\":\"Write something first.\"}}", blank.body);
+    try std.testing.expectEqualStrings("true", (try blank.getHeaderOne("Precognition")).?);
+    try std.testing.expectEqualStrings("Precognition", (try blank.getHeaderOne("Vary")).?);
+    try std.testing.expect((try sessionCookie(&blank)) == null);
+
+    var valid = try visit(&app, .post, "/todos", &precognitive, "{\"text\":\"Buy milk\"}");
+    defer valid.deinit();
+    try std.testing.expectEqual(@as(u16, 204), valid.status_code);
+    try std.testing.expectEqualStrings("true", (try valid.getHeaderOne("Precognition-Success")).?);
+
+    // A field the client did not ask about is not reported.
+    const other_field = [_]zoda.request.Header{
+        .{ .name = "Precognition", .value = "true" },
+        .{ .name = "Precognition-Validate-Only", .value = "due" },
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    var unlisted = try visit(&app, .post, "/todos", &other_field, "{\"text\":\"\"}");
+    defer unlisted.deinit();
+    try std.testing.expectEqual(@as(u16, 204), unlisted.status_code);
+    try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
+
+    const duplicate = [_]zoda.request.Header{
+        .{ .name = "Precognition", .value = "true" },
+        .{ .name = "Precognition", .value = "true" },
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    try std.testing.expectError(error.DuplicatePrecognitionHeader, visit(&app, .post, "/todos", &duplicate, "{\"text\":\"x\"}"));
+    try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
 }
 
 test "router.reload({ only: ['todos'] }) returns only todos and errors" {

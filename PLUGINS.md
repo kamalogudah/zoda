@@ -1272,6 +1272,62 @@ return ctx.plugins.sessions.save(&ctx.state.sessions, res);
   stay readable; it is not a substitute for ending the session or for
   `Cache-Control: no-store` on private pages.
 
+### Precognition
+
+`useForm(...).withPrecognition(method, url)` validates a form live: each
+`form.validate('field')` sends the form data to `url` with
+`Precognition: true` and `Precognition-Validate-Only` naming the fields the
+user has touched. The route runs its validation and answers before doing
+anything, then the client shows the errors in `form.errors`. The contract
+is laravel-precognition's (2.1.1, bundled by `@inertiajs/core` 3.9.1).
+
+```zig
+// POST /todos: the same route answers precognition and real submits.
+const problem: ?[]const u8 = if (text.len == 0) "Write something first." else null;
+if (try zoda.plugins.inertia.precognition(req) != null) {
+    // 422 {"errors":{"text":...}} or 204; nothing is stored.
+    return ctx.plugins.inertia.answerPrecognition(req, res, .{ .text = problem });
+}
+if (problem) |message| return ctx.plugins.inertia.redirectWithErrors(req, res, source, "/todos", .{ .text = message });
+```
+
+```jsx
+const form = useForm({ text: '' }).withPrecognition('post', '/todos')
+<input value={form.data.text} onChange={(e) => form.setData('text', e.target.value)} onBlur={() => form.validate('text')} />
+```
+
+- **Detecting.** `precognition(req)` returns null unless the request has
+  exactly one `Precognition: true`; a repeated field is
+  `error.DuplicatePrecognitionHeader` and any other value
+  `error.MalformedPrecognitionHeader`, like `X-Inertia`. Only then is
+  `Precognition-Validate-Only` read: absent, every field is validated;
+  empty, which the client sends when nothing is touched, none is; else 1 to
+  `max_precognition_fields` (64) comma-separated names in at most
+  `max_precognition_bytes` (1024), each dot-separated non-empty segments of
+  `[A-Za-z0-9_$-]` or `*`. Repeated, malformed, or oversized lists return
+  `DuplicatePrecognitionHeader`, `MalformedPrecognitionHeader`, or
+  `PrecognitionHeaderTooLarge`. `Precognition.validates(name)` reports
+  whether a field was asked for, so a route can skip costly checks.
+- **Answering.** `answerPrecognition(req, res, errors)` takes the same
+  kind of struct as `redirectWithErrors`. It keeps the fields that
+  `validates` accepts, leaving out null optional fields; a `*` segment
+  matches any one segment, so `items.*.name` keeps `.@"items.0.name"`. If
+  any are left, it sends 422 with `{"errors": {...}}` as JSON (a string or
+  a list of strings per field; the client takes the first); otherwise 204
+  with `Precognition-Success: true`. Both add `Precognition: true`, which
+  the client requires, and `Vary: Precognition`. Error bags do not apply.
+- **No side effects.** Call it after validating and before writing
+  anything, and return. A non-precognitive request gets
+  `error.NotPrecognitive`, so a route cannot answer a real submit by
+  mistake; a second answer gets `error.PrecognitionAlreadySet`. Header,
+  limit, and body-size failures leave the response unchanged. `render` and
+  the redirects ignore `Precognition`.
+- **Caching.** A route that answers precognitive GETs should call
+  `varyOnPrecognition(res)` on its ordinary responses too, so a cache
+  never serves a 204 for a page or the reverse.
+- **Not covered.** File validation (`validateFiles`) needs multipart
+  bodies, which `zoda.JsonParser` does not read.
+
 ### URL and origin policy
 
 The page `url` and the conflict's `X-Inertia-Location` are the raw
@@ -1345,7 +1401,11 @@ followed GET carried `errors: {"createTodo": {"text": ...}}`, which
 History encryption was driven in Chrome in all three: `history.state.page`
 was an encrypted `ArrayBuffer`, Back before "Forget history" restored the
 previous page with no request, and Back after it fetched the page from the
-server again. The other rows are covered by the plugin's unit tests only.
+server again. Precognition was driven in Chrome with the React frontend:
+leaving the add field blank and blurring it sent a precognitive POST that
+got 422 and showed "Write something first." before any submit, and a valid
+value got 204 and cleared it, with no todo added. The other rows are
+covered by the plugin's unit tests only.
 
 The features not yet implemented are tracked in
 [#80](https://github.com/kamalogudah/zoda/issues/80), with one issue each.
@@ -1375,5 +1435,5 @@ The features not yet implemented are tracked in
 | History encryption (`encryptHistory`, `clearHistory`) | Implemented: `encrypt_history` (instance) with a per-render override, `.clear_history`, and `clearHistoryOnNextRender` for a page reached through a redirect. Fields are sent only when true. Driven in a browser through the example's "Forget history" button. |
 | `preserveFragment` | Implemented (`renderWith` with `.preserve_fragment`). Covered by unit tests only. |
 | Error pages with a non-200 status | Implemented (`renderWith` with `.status`, 200–299 except 204/205, or 400–599) |
-| Precognition validation | Not implemented |
+| Precognition (`Precognition`, `Precognition-Validate-Only`, `Precognition-Success`) | Implemented (`precognition`, `answerPrecognition`): 422 with the listed fields' `errors` or 204, both with `Precognition: true` and `Vary: Precognition`. Driven in a browser through the example's add form in React. |
 | Server-side rendering | Not implemented |

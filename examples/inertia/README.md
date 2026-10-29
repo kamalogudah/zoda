@@ -40,6 +40,7 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
 | `GET /` | redirect | 302 to `/todos` |
 | `GET /todos[?filter=active\|done][&page=n]` | `render("Todos/Index", …)` | HTML shell on the first visit, the page JSON on Inertia visits; 10 todos per page, newest first |
 | `POST /todos` with `{"text": "…"}` | add | flash "Todo added", then back to the current filter at `#todo-<id>`; or store `errors.text` and 303 back to the current filter |
+| `POST /todos` with `Precognition: true` | validate only | 422 with `errors.text`, or 204; nothing is added |
 | `PATCH /todos/:id` | toggle | 303 back |
 | `DELETE /todos/:id` | delete | 303 back, or 404 |
 | `DELETE /history` | forget history | flash "History cleared", ask the next page to clear history, then 303 back |
@@ -71,6 +72,14 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   them as `props.errors` and the save after it drops them; the client
   hands `errors.createTodo` to `useForm`, which shows
   `form.errors.text`. The next visit has `errors: {}` again.
+- **Live validation.** The add form is
+  `useForm({ text: '' }).withPrecognition('post', '/todos')`, and leaving
+  the field calls `form.validate('text')`. The client posts the form with
+  `Precognition: true` and `Precognition-Validate-Only: text`; the route
+  runs the same check as a real submit, then `answerPrecognition` sends
+  422 with `{"errors": {"text": "…"}}` or 204 before anything is added.
+  The client shows the error as `form.errors.text` and marks the input
+  `aria-invalid`. Type some spaces and click away to see it.
 - **Partial reloads.** `router.reload({ only: ['todos'] })` sends
   `X-Inertia-Partial-Component: Todos/Index` and
   `X-Inertia-Partial-Data: todos`, and the server answers with only `todos`
@@ -137,5 +146,6 @@ relates to Zoda's CSRF helpers.
 They cover the HTML shell, the JSON page, add, toggle, filter, and delete,
 redirect-back validation errors in the `createTodo` bag shown once, the version conflict, a partial reload of `todos`,
 loading the deferred `stats`, paging `todos` forward, backward, and
-after a reset, the "Todo added" flash shown once, and "Forget history"
-sending `clearHistory` once.
+after a reset, the "Todo added" flash shown once, "Forget history"
+sending `clearHistory` once, and precognitive posts answered with 422 or
+204 without adding a todo.

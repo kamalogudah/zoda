@@ -7,7 +7,9 @@ const filters = [
 ]
 
 export default function Index({ app, framework, todos, filter, remaining, stats }) {
-  const form = useForm({ text: '' })
+  // Leaving the field asks the server to validate it (precognition), which
+  // answers 422 with `errors.text` or 204 without adding the todo.
+  const form = useForm({ text: '' }).withPrecognition('post', '/todos')
   // The page's top-level `flash`, from `zoda.Flash`; `{}` once it has been shown.
   const { flash } = usePage()
   // Mutations carry the filter so the server's 303 lands on the same view.
@@ -34,6 +36,8 @@ export default function Index({ app, framework, todos, filter, remaining, stats 
           type="text"
           value={form.data.text}
           onChange={(event) => form.setData('text', event.target.value)}
+          onBlur={() => form.validate('text')}
+          aria-invalid={form.invalid('text')}
           placeholder="What needs doing?"
           aria-label="New todo"
           autoFocus

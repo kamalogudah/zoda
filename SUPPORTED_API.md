@@ -213,8 +213,22 @@ runs inside `zig build test`.
   one queued, so the next `renderWith` with `.flash` sends
   `clearHistory: true` and consumes it; it is never sent in `flash`.
   History encryption needs a secure context (HTTPS or localhost) and does
-  not hide props from the server or from script on the page. Deferred
-  once props, precognition, and SSR are not implemented. See
+  not hide props from the server or from script on the page.
+  `zoda.plugins.inertia.precognition(req)` returns null without exactly one
+  `Precognition: true` (repeated, `error.DuplicatePrecognitionHeader`;
+  other values, `error.MalformedPrecognitionHeader`) and otherwise a
+  `Precognition` whose `only` is the validated `Precognition-Validate-Only`
+  (null when absent, empty to validate nothing, else at most
+  `max_precognition_fields` names in `max_precognition_bytes`, else
+  `error.PrecognitionHeaderTooLarge`) and whose `validates(name)` matches
+  listed names with `*` segments. `answerPrecognition(req, res, errors)`
+  keeps the requested non-null fields of the errors struct and sends 422
+  with `{"errors": {...}}`, or 204 with `Precognition-Success: true` when
+  none are left, both with `Precognition: true` and `Vary: Precognition`;
+  `error.NotPrecognitive` and `error.PrecognitionAlreadySet` guard misuse,
+  and header, limit, and body failures leave the response unchanged.
+  `varyOnPrecognition(res)` adds `Vary: Precognition` to ordinary
+  responses. Deferred once props and SSR are not implemented. See
   [PLUGINS.md](PLUGINS.md#inertiajs).
 - `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
   local-path rules without changing a response.
