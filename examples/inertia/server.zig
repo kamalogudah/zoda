@@ -10,7 +10,9 @@
 //! redirect back with 303 so the client re-fetches the page as JSON. Adding a
 //! todo flashes "Todo added" through `zoda.Flash`, sent as the page's
 //! top-level `flash` on the next render; a rejected todo redirects back with
-//! its validation errors stored in the session the same way.
+//! its validation errors stored in the session the same way. Every page asks
+//! the client to encrypt the copy it keeps in browser history, and "Forget
+//! history" redirects to a page that clears it.
 const std = @import("std");
 const zoda = @import("zoda");
 
@@ -119,10 +121,14 @@ pub const layout =
 pub fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
     const inertia = &ctx.plugins.inertia;
     if (req.isRoot() and req.isGet()) return inertia.redirect(req, res, "/todos");
+    const filter = parseFilter(req);
+    if (req.onLiteral("history")) {
+        if (!req.isRoot() or req.method != .delete) return;
+        return forgetHistory(ctx, req, res, filter);
+    }
     if (!req.onLiteral("todos")) return;
 
     const store = ctx.plugins.store.value;
-    const filter = parseFilter(req);
     if (req.isRoot()) {
         if (req.isGet()) return renderIndex(ctx, req, res, filter);
         if (req.method != .post) return;
@@ -171,6 +177,23 @@ fn rejectTodo(
     const session = &ctx.state.sessions;
     try ctx.plugins.inertia.redirectWithErrors(req, res, .{ .plugin = &ctx.plugins.flash, .session = session }, backTo(filter), .{ .text = message });
     return ctx.plugins.sessions.save(session, res);
+}
+
+/// Asks the page the redirect lands on to send `clearHistory: true`. The
+/// client then deletes its history key, so Back to a page seen before makes
+/// it fetch that page again instead of decrypting the stored copy. A real
+/// app does this when logging out.
+fn forgetHistory(
+    ctx: *App.Context,
+    req: *zoda.router.Request,
+    res: *zoda.response.Response,
+    filter: Filter,
+) !void {
+    const session = &ctx.state.sessions;
+    try ctx.plugins.inertia.clearHistoryOnNextRender(.{ .plugin = &ctx.plugins.flash, .session = session });
+    try ctx.plugins.flash.add(session, "notice", "History cleared");
+    try ctx.plugins.sessions.save(session, res);
+    return ctx.plugins.inertia.redirect(req, res, backTo(filter));
 }
 
 fn renderIndex(
@@ -222,9 +245,10 @@ fn renderIndex(
         .stats = zoda.plugins.inertia.deferred(store, Stats.compute),
     };
     const session = &ctx.state.sessions;
-    // Sends pending flash messages as the page's `flash` and stored
-    // validation errors as `errors` (`{}` when there are none), and marks
-    // them read; the save below persists that, so they are shown once.
+    // Sends pending flash messages as the page's `flash`, stored validation
+    // errors as `errors` (`{}` when there are none), and a pending history
+    // clear as `clearHistory`, and marks them read; the save below persists
+    // that, so they are sent once.
     try ctx.plugins.inertia.renderWith(req, res, "Todos/Index", props, .{
         .flash = .{ .plugin = &ctx.plugins.flash, .session = session },
     });
@@ -319,6 +343,9 @@ pub fn main(init: std.process.Init) !void {
                 .layout = layout,
                 .version = .{ .value = &version },
                 .shared = .{ .value = .{ .app = "Zoda", .framework = framework } },
+                // The client encrypts with Web Crypto, which needs HTTPS or
+                // localhost, where this example runs.
+                .encrypt_history = true,
             },
             .sessions = .{ .keys = &.{.{ .id = 1, .secret = &secret }}, .lifetime_seconds = 60 * 60, .now_seconds = unixSeconds },
             .store = .{ .value = &store },
@@ -344,7 +371,7 @@ fn testApp(store: *Store) !App {
     return App.init(std.testing.allocator, .{
         .response_allocator = std.testing.allocator,
         .plugins = .{
-            .inertia = .{ .layout = layout, .version = .{ .value = "v1" }, .shared = .{ .value = .{ .app = "Zoda", .framework = "test" } } },
+            .inertia = .{ .layout = layout, .version = .{ .value = "v1" }, .shared = .{ .value = .{ .app = "Zoda", .framework = "test" } }, .encrypt_history = true },
             .sessions = .{ .keys = &.{.{ .id = 1, .secret = "x" ** 32 }}, .lifetime_seconds = 300, .now_seconds = testClock },
             .store = .{ .value = store },
         },
@@ -386,7 +413,7 @@ test "first visit renders the HTML shell with the page object" {
     try std.testing.expectEqual(@as(u16, 200), page.status_code);
     try std.testing.expect(std.mem.indexOf(u8, page.body, "<script type=\"module\" src=\"/assets/app.js\"></script>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page.body,
-        \\<script data-page="app" type="application/json">{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[],"filter":"all","remaining":0,"errors":{}},"url":"/todos","version":"v1","mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}</script><div id="app"></div>
+        \\<script data-page="app" type="application/json">{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[],"filter":"all","remaining":0,"errors":{}},"url":"/todos","version":"v1","encryptHistory":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}</script><div id="app"></div>
     ) != null);
 }
 
@@ -413,7 +440,7 @@ test "Inertia visits add, toggle, filter, and delete todos" {
     defer active.deinit();
     try std.testing.expectEqualStrings("true", (try active.getHeaderOne("X-Inertia")).?);
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[{"id":2,"text":"Walk <dog>","done":false}],"filter":"active","remaining":1,"errors":{}},"url":"/todos?filter=active","version":"v1","mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[{"id":2,"text":"Walk <dog>","done":false}],"filter":"active","remaining":1,"errors":{}},"url":"/todos?filter=active","version":"v1","encryptHistory":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}
     , active.body);
 
     var deleted = try visit(&app, .delete, "/todos/2", &inertia_json, "");
@@ -514,7 +541,7 @@ test "router.reload({ only: ['todos'] }) returns only todos and errors" {
     var partial = try visit(&app, .get, "/todos", &reload, "");
     defer partial.deinit();
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"todos":[{"id":1,"text":"Buy milk","done":false}],"errors":{}},"url":"/todos","version":"v1","mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"todos":[{"id":1,"text":"Buy milk","done":false}],"errors":{}},"url":"/todos","version":"v1","encryptHistory":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"sharedProps":["app","framework"]}
     , partial.body);
 
     const bad = [_]zoda.request.Header{
@@ -550,7 +577,7 @@ test "the client loads deferred stats with a partial reload" {
     var stats = try visit(&app, .get, "/todos?filter=active", &reload, "");
     defer stats.deinit();
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"stats":{"total":2,"done":1},"errors":{}},"url":"/todos?filter=active","version":"v1","sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"stats":{"total":2,"done":1},"errors":{}},"url":"/todos?filter=active","version":"v1","encryptHistory":true,"sharedProps":["app","framework"]}
     , stats.body);
 }
 
@@ -579,7 +606,7 @@ test "<InfiniteScroll> pages through todos newest first and resets after a chang
     var second = try visit(&app, .get, "/todos?page=2", &more, "");
     defer second.deinit();
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"todos":[{"id":2,"text":"x","done":false},{"id":1,"text":"x","done":false}],"errors":{}},"url":"/todos?page=2","version":"v1","mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":1,"nextPage":null,"currentPage":2,"reset":false}},"sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"todos":[{"id":2,"text":"x","done":false},{"id":1,"text":"x","done":false}],"errors":{}},"url":"/todos?page=2","version":"v1","encryptHistory":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":1,"nextPage":null,"currentPage":2,"reset":false}},"sharedProps":["app","framework"]}
     , second.body);
 
     // Opening `?page=2` directly, then "Show earlier", prepends page 1. A
@@ -676,4 +703,43 @@ test "adding a todo flashes a notice that the next render shows once" {
     defer back.deinit();
     try std.testing.expect(std.mem.indexOf(u8, back.body, "\"flash\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, back.body, "\"errors\":{\"text\":\"Write something first.\"}") != null);
+}
+
+test "Forget history redirects to a page that clears it once" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+
+    // What `router.delete('/history?filter=active')` sends.
+    var forgot = try visit(&app, .delete, "/history?filter=active", &inertia_json, "");
+    defer forgot.deinit();
+    try std.testing.expectEqual(@as(u16, 303), forgot.status_code);
+    try std.testing.expectEqualStrings("/todos?filter=active", (try forgot.getHeaderOne("Location")).?);
+
+    const followed = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "Cookie", .value = (try sessionCookie(&forgot)).? },
+    };
+    var cleared = try visit(&app, .get, "/todos?filter=active", &followed, "");
+    defer cleared.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, cleared.body, "\"version\":\"v1\",\"encryptHistory\":true,\"clearHistory\":true,") != null);
+    try std.testing.expect(std.mem.endsWith(u8, cleared.body, ",\"flash\":{\"notice\":\"History cleared\"}}"));
+
+    // The saved cookie drops the request, so later pages stay encrypted
+    // without clearing again.
+    const again_headers = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "Cookie", .value = (try sessionCookie(&cleared)).? },
+    };
+    var again = try visit(&app, .get, "/todos?filter=active", &again_headers, "");
+    defer again.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, again.body, "\"encryptHistory\":true,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again.body, "clearHistory") == null);
+
+    var get = try visit(&app, .get, "/history", &inertia_get, "");
+    defer get.deinit();
+    try std.testing.expectEqual(@as(u16, 404), get.status_code);
 }

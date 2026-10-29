@@ -273,7 +273,10 @@ try ctx.plugins.sessions.save(&ctx.state.sessions, res);
   received messages as the page's top-level `flash`; see
   [Inertia.js flash](#flash). `Inertia.redirectWithErrors` stores
   validation errors as one message of the reserved kind `inertia-errors`;
-  see [Validation errors](#validation-errors). `peek` returns the received messages without
+  see [Validation errors](#validation-errors).
+  `Inertia.clearHistoryOnNextRender` stores one of the reserved kind
+  `inertia-clear-history`; see [History encryption](#history-encryption).
+  `peek` returns the received messages without
   consuming them, for integrations that `read` only once they have sent
   them.
 - **Clearing.** `clear` drops received and queued messages. `add` after `clear`
@@ -634,13 +637,15 @@ layout or root id before the first request; `render` checks again.
 | `version` | `.none` | `.value = "..."` or `.callback = fn (*const Request) []const u8`. `.none` sends `"version":null` and skips version checks. |
 | `shared` | `.none` | `.value = SharedProps{...}` or `.callback = fn (*const Request) SharedProps`. Use `zoda.Inertia(struct {})` for no shared props. |
 | `now_milliseconds` | `null` | Trusted UTC Unix-millisecond clock, `fn () i64`, for once props with an expiry. See [Once props](#once-props). |
+| `encrypt_history` | `false` | Sends `encryptHistory: true` on every page; `renderWith` can override it per page. See [History encryption](#history-encryption). |
 
 ### Responses
 
 - **`render(req, res, component, props)`** builds the page object
   `{"component", "props", "url", "version"}`. `props` must be a struct.
   Shared props come first and a route prop with the same name replaces the
-  shared one (checked at comptime). The status is 200.
+  shared one (checked at comptime). The status is 200; `renderWith` can
+  choose another (see [Per-render options](#per-render-options)).
   - Without `X-Inertia`, the response is `text/html; charset=utf-8`: the
     layout with `@inertia` replaced by the initial page. With the default
     `.script`, the form Inertia v3 reads, that is
@@ -1183,6 +1188,90 @@ form.post('/todos', { errorBag: 'createTodo' }) // form.errors.text
   both the response and the session unchanged. Call `sessions.save`
   afterwards, or the errors are lost with the unsaved session.
 
+### Per-render options
+
+`renderWith(req, res, component, props, options)` is `render` with a
+`RenderOptions` struct; `render` is `renderWith` with `.{}`. Every field
+defaults to `render`'s behavior:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `flash` | `null` | `FlashSource` to read flash, stored validation errors, and a stored history clear from. See [Flash](#flash). |
+| `encrypt_history` | `null` | `true` or `false` overrides the instance's `encrypt_history` for this page. |
+| `clear_history` | `false` | Sends `clearHistory: true`. |
+| `preserve_fragment` | `false` | Sends `preserveFragment: true`. |
+| `status` | `200` | Response status, for an error page rendered through Inertia. |
+
+```zig
+try ctx.plugins.inertia.renderWith(req, res, "Errors/NotFound", .{ .path = req.target }, .{ .status = 404 });
+```
+
+- **Status.** 200–299 other than 204 and 205, which cannot carry the page,
+  or 400–599. Anything else, redirects included, returns
+  `error.InvalidStatus` before the response changes; use `redirect` or
+  `location` for those. A v3 client given an Inertia page with a status of
+  400 or more fires its `httpException` event and then shows the page. A
+  stale asset version still gets the 409 conflict instead.
+- **`preserveFragment`.** The client normally drops the `#fragment` the
+  user asked for when the response is for a different URL, as after a
+  redirect. With `preserveFragment: true` it keeps the requested fragment
+  on the page it shows. Pass it on the page the redirect lands on.
+
+### History encryption
+
+The v3 client stores each page object in the browser's `history.state` so
+Back and Forward can restore it without a request. With
+`encryptHistory: true` it encrypts that copy with AES-GCM under a key kept
+in the tab's `sessionStorage`; `clearHistory: true` deletes the key, so
+pages stored before it can no longer be decrypted. Back to such a page
+makes the client fetch it from the server again instead of showing the old
+props. This is what you want after a logout on a shared computer.
+
+```zig
+// Registration: encrypt every page.
+.inertia = .{ .layout = layout, .encrypt_history = true },
+
+// POST /logout: end the session, ask the next page to clear history.
+const source: zoda.plugins.inertia.FlashSource = .{ .plugin = &ctx.plugins.flash, .session = &ctx.state.sessions };
+ctx.state.sessions.clear();
+try ctx.plugins.inertia.clearHistoryOnNextRender(source);
+try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+return ctx.plugins.inertia.redirect(req, res, "/login");
+
+// GET /login: sends `clearHistory: true` once.
+try ctx.plugins.inertia.renderWith(req, res, "Auth/Login", .{}, .{ .flash = source });
+return ctx.plugins.sessions.save(&ctx.state.sessions, res);
+```
+
+- **Fields.** `encryptHistory`, `clearHistory`, and `preserveFragment` follow
+  `version` in the page object and are sent only when true, so a default
+  page is unchanged. The client reads a missing field as false.
+- **Encrypting.** `encrypt_history = true` encrypts every page;
+  `renderWith`'s `.encrypt_history` overrides it for one page either way,
+  for example to encrypt only pages that show account data.
+- **Clearing.** `.clear_history = true` clears on the page being rendered.
+  A logout usually redirects, so `clearHistoryOnNextRender(source)` stores
+  the request in the session through [`zoda.Flash`](#flash-messages), as
+  one message of the reserved kind `history_flash_kind`
+  (`"inertia-clear-history"`), and the next `renderWith` with `.flash`
+  sends `clearHistory: true` and consumes it with the flash messages. It
+  is left out of `flash`. Calling it again before the next render adds
+  nothing. Call it after `State.clear`, which would drop it, and save the
+  session afterwards; a queued message keeps the cookie alive. It counts
+  toward the flash budget like any message (24 bytes) and returns the
+  `zoda.Flash` errors if that is full.
+- **Secure context.** The client encrypts with Web Crypto, which browsers
+  offer only on HTTPS pages and on `localhost`. Elsewhere the 3.9.1 client
+  logs "SSL is required" and fails the visit with "Unable to encrypt
+  history", so enable it only where the app is served over HTTPS.
+- **What it protects.** It keeps page props from being read back out of
+  this tab's history after `clearHistory`. It does not protect anything
+  from the server, which sends the props in plain JSON, or from script
+  running on the page, which can read the key from `sessionStorage`. The
+  key lives as long as the tab, so without `clearHistory` encrypted pages
+  stay readable; it is not a substitute for ending the session or for
+  `Cache-Control: no-store` on private pages.
+
 ### URL and origin policy
 
 The page `url` and the conflict's `X-Inertia-Location` are the raw
@@ -1208,7 +1297,7 @@ origin. A target that starts with `//` or contains `\` is refused with
   response's header limits (`error.TooManyHeaders`,
   `error.HeaderBytesExceeded`). These failures, header errors, and
   configuration errors (`InvalidLayout`, `InvalidRootId`, `InvalidComponent`
-  for an empty name) leave the response unchanged. The page JSON is built in
+  for an empty name, `InvalidStatus`) leave the response unchanged. The page JSON is built in
   full before the body limit is checked, as with `Response.replaceJson`.
 - **Errors propagate.** Nothing is mapped to a status. Register
   [`error_handler`](#status-and-error-handlers) to turn header errors into a
@@ -1226,8 +1315,8 @@ origin. A target that starts with `//` or contains `\` is refused with
   route props, and send flash messages and redirected validation errors
   with `renderWith` (see [Flash](#flash) and
   [Validation errors](#validation-errors)). Save the session before
-  `redirect`, after `redirectWithErrors`, and after `renderWith` when it
-  sends flash, so the read is persisted. `csrf.valid` reads `X-CSRF-Token`, not
+  `redirect`, after `redirectWithErrors` and `clearHistoryOnNextRender`,
+  and after `renderWith` when it sends flash, so the read is persisted. `csrf.valid` reads `X-CSRF-Token`, not
   the `X-XSRF-TOKEN` header that Inertia's axios client sends from an
   `XSRF-TOKEN` cookie. Either set `X-CSRF-Token` in your client's request
   headers or pass the submitted value to `csrf.validToken`.
@@ -1253,7 +1342,10 @@ visit. So was redirect-back validation: an empty todo posted with
 `errorBag: 'createTodo'` sent `X-Inertia-Error-Bag`, got a 303, and the
 followed GET carried `errors: {"createTodo": {"text": ...}}`, which
 `useForm` showed as `form.errors.text`; the next visit had `errors: {}`.
-The other rows are covered by the plugin's unit tests only.
+History encryption was driven in Chrome in all three: `history.state.page`
+was an encrypted `ArrayBuffer`, Back before "Forget history" restored the
+previous page with no request, and Back after it fetched the page from the
+server again. The other rows are covered by the plugin's unit tests only.
 
 The features not yet implemented are tracked in
 [#80](https://github.com/kamalogudah/zoda/issues/80), with one issue each.
@@ -1280,6 +1372,8 @@ The features not yet implemented are tracked in
 | Scroll props (`scroll`; `scrollProps`, `X-Inertia-Infinite-Scroll-Merge-Intent`) | Implemented: one page of items per response with route-supplied page numbers; the intent picks `mergeProps` or `prependProps`, and `X-Inertia-Reset` sets `reset`. Driven in a browser through the example's paged todo list. |
 | Once props (`once`, `.as(key)`, `.expiresIn(ms)`; `onceProps`, `X-Inertia-Except-Once-Props`) | Implemented: held keys are listed but not resolved, a partial reload that lists the prop in `-Data` always sends it, and `expiresAt` comes from the injected `now_milliseconds` clock. Covered by unit tests only. Deferred once props are not implemented. |
 | Error bags (`X-Inertia-Error-Bag`) | Implemented for `redirectWithErrors`: errors nest under the validated bag name. Route-supplied `errors` props are sent as given. Driven in a browser through the example's `createTodo` bag. |
-| History encryption (`encryptHistory`, `clearHistory`) | Not implemented: never sent, so off |
+| History encryption (`encryptHistory`, `clearHistory`) | Implemented: `encrypt_history` (instance) with a per-render override, `.clear_history`, and `clearHistoryOnNextRender` for a page reached through a redirect. Fields are sent only when true. Driven in a browser through the example's "Forget history" button. |
+| `preserveFragment` | Implemented (`renderWith` with `.preserve_fragment`). Covered by unit tests only. |
+| Error pages with a non-200 status | Implemented (`renderWith` with `.status`, 200–299 except 204/205, or 400–599) |
 | Precognition validation | Not implemented |
 | Server-side rendering | Not implemented |

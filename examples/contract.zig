@@ -1028,3 +1028,75 @@ test "PLUGINS Inertia.js validation errors example" {
     try std.testing.expectEqualStrings("{\"component\":\"Todos/Index\",\"props\":{\"errors\":{}},\"url\":\"/todos\",\"version\":null}", after.body);
     try std.testing.expect(unchanged == null);
 }
+
+// PLUGINS.md "Inertia.js" history encryption: every page is encrypted, a
+// logout asks the page it redirects to to clear history, and an error page
+// is rendered with its own status.
+fn inertiaHistoryRoute(ctx: *InertiaFlashApp.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    const inertia = &ctx.plugins.inertia;
+    const source: zoda.plugins.inertia.FlashSource = .{ .plugin = &ctx.plugins.flash, .session = &ctx.state.sessions };
+    if (req.onLiteral("logout") and req.isRoot() and req.method == .post) {
+        ctx.state.sessions.clear();
+        try inertia.clearHistoryOnNextRender(source);
+        try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+        return inertia.redirect(req, res, "/login");
+    }
+    if (req.onLiteral("login") and req.isRoot()) {
+        try inertia.renderWith(req, res, "Auth/Login", .{}, .{ .flash = source });
+        return ctx.plugins.sessions.save(&ctx.state.sessions, res);
+    }
+    return inertia.renderWith(req, res, "Errors/NotFound", .{ .path = req.target }, .{ .status = 404 });
+}
+
+test "PLUGINS Inertia.js history encryption example" {
+    var app = try InertiaFlashApp.init(std.testing.allocator, .{
+        .response_allocator = std.testing.allocator,
+        .plugins = .{
+            .sessions = .{
+                .keys = &.{.{ .id = 1, .secret = "example-secret-of-at-least-32-bytes!" }},
+                .lifetime_seconds = 3600,
+                .now_seconds = flashClock,
+            },
+            .inertia = .{ .layout = inertia_layout, .encrypt_history = true },
+        },
+        .route_fn = inertiaHistoryRoute,
+    });
+    defer app.deinit();
+
+    var cookie: [zoda.plugins.sessions.max_cookie_bytes]u8 = undefined;
+    const Visit = struct {
+        fn run(a: *const InertiaFlashApp, method: zoda.router.Method, target: []const u8, session: ?[]const u8) !zoda.response.Response {
+            var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
+            defer arena.deinit();
+            const headers = [_]zoda.request.Header{
+                .{ .name = "X-Inertia", .value = "true" },
+                .{ .name = "Cookie", .value = session orelse "" },
+            };
+            try arena.copyHeaders(if (session != null) &headers else headers[0..1]);
+            var req = arena.requestView(method);
+            return a.dispatch(&req);
+        }
+    };
+
+    var logged_out = try Visit.run(&app, .post, "/logout", null);
+    defer logged_out.deinit();
+    try std.testing.expectEqualStrings("/login", (try logged_out.getHeaderOne("Location")).?);
+    const set_cookie = (try logged_out.getHeaderOne("Set-Cookie")).?;
+    const value = set_cookie[0..std.mem.indexOfScalar(u8, set_cookie, ';').?];
+    @memcpy(cookie[0..value.len], value);
+
+    var login = try Visit.run(&app, .get, "/login", cookie[0..value.len]);
+    defer login.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Auth/Login\",\"props\":{\"errors\":{}},\"url\":\"/login\",\"version\":null,\"encryptHistory\":true,\"clearHistory\":true}",
+        login.body,
+    );
+
+    var missing = try Visit.run(&app, .get, "/nope", null);
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(u16, 404), missing.status_code);
+    try std.testing.expectEqualStrings(
+        "{\"component\":\"Errors/NotFound\",\"props\":{\"path\":\"/nope\",\"errors\":{}},\"url\":\"/nope\",\"version\":null,\"encryptHistory\":true}",
+        missing.body,
+    );
+}

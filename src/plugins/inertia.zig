@@ -84,9 +84,16 @@
 //!   `renderWith` with `.flash` sends them as `props.errors`, where route
 //!   `errors` win over them and they win over shared `errors`, and consumes
 //!   them with the flash messages.
+//! - History: the page carries `encryptHistory: true` when the instance's
+//!   `encrypt_history` or `renderWith`'s `.encrypt_history` asks for it, and
+//!   `clearHistory: true` or `preserveFragment: true` when `renderWith`
+//!   asks for them. `clearHistoryOnNextRender(source)` stores the request
+//!   for `clearHistory` in the session, like `redirectWithErrors`, for the
+//!   next `renderWith` with `.flash`, so a logout can redirect first. Each
+//!   field is left out when false, which the client reads as false.
 //!
-//! Not implemented: once deferred props, history encryption, precognition,
-//! and server-side rendering.
+//! Not implemented: once deferred props, precognition, and server-side
+//! rendering.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
 //! the current page are the raw origin-form request target, so path and
@@ -123,6 +130,10 @@ pub const max_error_bag_bytes = 64;
 /// `renderWith` leaves it out of the page's `flash`; do not add messages of
 /// this kind yourself.
 pub const errors_flash_kind = "inertia-errors";
+/// The `zoda.Flash` kind that `clearHistoryOnNextRender` stores.
+/// `renderWith` leaves it out of the page's `flash`; do not add messages of
+/// this kind yourself.
+pub const history_flash_kind = "inertia-clear-history";
 
 pub const HeaderError = error{ DuplicateInertiaHeader, MalformedInertiaHeader, DuplicateVersionHeader };
 pub const PartialError = error{ DuplicatePartialHeader, MalformedPartialHeader, PartialHeaderTooLarge };
@@ -134,6 +145,7 @@ pub const ErrorBagError = error{ DuplicateErrorBagHeader, MalformedErrorBagHeade
 pub const RenderError = HeaderError || PartialError || ScrollError || OnceError || ConfigError || TargetError || response.HeaderError || error{
     BodyTooLarge,
     InvalidComponent,
+    InvalidStatus,
 };
 pub const RedirectError = HeaderError || response.RedirectError || error{InvalidLocation};
 pub const ErrorsRedirectError = RedirectError || ErrorBagError || flash_mod.Error;
@@ -623,11 +635,36 @@ pub const FlashSource = struct {
 /// Per-call additions to `render`.
 pub const RenderOptions = struct {
     /// Sends the messages this request received as the page's top-level
-    /// `flash`, and errors stored by `redirectWithErrors` as `props.errors`,
-    /// and consumes them. Call `Sessions.save` after `renderWith` to persist
-    /// the consumption.
+    /// `flash`, errors stored by `redirectWithErrors` as `props.errors`, and
+    /// a `clearHistoryOnNextRender` request as `clearHistory`, and consumes
+    /// them. Call `Sessions.save` after `renderWith` to persist the
+    /// consumption.
     flash: ?FlashSource = null,
+    /// Overrides the instance's `encrypt_history` for this page.
+    encrypt_history: ?bool = null,
+    /// Sends `clearHistory: true`: the client deletes its history encryption
+    /// key, so earlier encrypted history entries can no longer be restored.
+    clear_history: bool = false,
+    /// Sends `preserveFragment: true`: the client keeps the `#fragment` of
+    /// the URL it requested, for a page reached through a redirect, which
+    /// would otherwise drop it.
+    preserve_fragment: bool = false,
+    /// The response status: 200-299 other than 204 and 205, which have no
+    /// body, or 400-599 for an error page, which v3 clients render after an
+    /// `httpException` event. A version conflict is still 409.
+    status: u16 = 200,
 };
+
+/// The page fields `RenderOptions` and the instance settings control.
+const PageOptions = struct {
+    encrypt_history: bool = false,
+    clear_history: bool = false,
+    preserve_fragment: bool = false,
+};
+
+fn validStatus(status: u16) bool {
+    return (status >= 200 and status <= 299 and status != 204 and status != 205) or (status >= 400 and status <= 599);
+}
 
 pub fn Inertia(comptime SharedProps: type) type {
     comptime if (@typeInfo(SharedProps) != .@"struct") @compileError("Inertia shared props must be a struct");
@@ -661,6 +698,13 @@ pub fn Inertia(comptime SharedProps: type) type {
         /// trusted wall clock; tests can inject one. Read at most once per
         /// `render`, and only when a listed once prop has an expiry.
         now_milliseconds: ?*const fn () i64 = null,
+        /// Sends `encryptHistory: true` on every page, so the client encrypts
+        /// the page state it stores in `history.state`. `renderWith` can
+        /// override it per page. Encryption needs a secure context (HTTPS or
+        /// localhost); it keeps the state from someone reading this browser
+        /// tab's history after `clearHistory`, not from the server or from
+        /// scripts on the page.
+        encrypt_history: bool = false,
 
         /// Checks the layout and root id. `render` repeats the check, so
         /// calling this at startup only reports mistakes earlier.
@@ -695,9 +739,11 @@ pub fn Inertia(comptime SharedProps: type) type {
         }
 
         /// `render` with per-call options. With `options.flash`, the page
-        /// carries the received flash messages and stored validation errors,
-        /// which are marked read once the response is committed; on an error
-        /// or a version conflict they stay unread.
+        /// carries the received flash messages, stored validation errors,
+        /// and a stored `clearHistory`, which are marked read once the
+        /// response is committed; on an error or a version conflict they stay
+        /// unread. The history options and `status` are checked before the
+        /// response changes.
         pub fn renderWith(
             self: *const Self,
             req: *const router.Request,
@@ -713,6 +759,7 @@ pub fn Inertia(comptime SharedProps: type) type {
                 }
             }
             try self.validate();
+            if (!validStatus(options.status)) return error.InvalidStatus;
             const inertia = try isInertia(req);
             // Partial headers only mean something on Inertia visits.
             const partial = if (inertia) try partialReload(req, component) else null;
@@ -736,7 +783,12 @@ pub fn Inertia(comptime SharedProps: type) type {
             // already consumed the messages.
             const flash = options.flash;
             const messages = if (flash) |source| source.plugin.peek(source.session) else null;
-            const page = try self.pageJson(res.allocator, req, partial, once_visit, component, props, url, version, messages);
+            const page_options: PageOptions = .{
+                .encrypt_history = options.encrypt_history orelse self.encrypt_history,
+                .clear_history = options.clear_history or (if (messages) |m| hasKind(m, history_flash_kind) else false),
+                .preserve_fragment = options.preserve_fragment,
+            };
+            const page = try self.pageJson(res.allocator, req, partial, once_visit, component, props, url, version, page_options, messages);
             if (inertia) {
                 var committed = false;
                 defer if (!committed) res.allocator.free(page);
@@ -744,7 +796,7 @@ pub fn Inertia(comptime SharedProps: type) type {
                 try reserveHeaders(res, 1, "X-Inertia".len + "true".len);
                 try res.setHeader("X-Inertia", "true");
                 try addInertiaVary(res);
-                try commitBody(res, response.json_content_type, page);
+                try commitBody(res, options.status, response.json_content_type, page);
                 committed = true;
             } else {
                 defer res.allocator.free(page);
@@ -753,7 +805,7 @@ pub fn Inertia(comptime SharedProps: type) type {
                 defer if (!committed) res.allocator.free(body);
                 try reserveHeaders(res, 0, 0);
                 try addInertiaVary(res);
-                try commitBody(res, html_content_type, body);
+                try commitBody(res, options.status, html_content_type, body);
                 committed = true;
             }
             // Consume only what was sent: nothing above can fail any more.
@@ -806,6 +858,19 @@ pub fn Inertia(comptime SharedProps: type) type {
             try checkRedirect(inertia, res, path);
             try source.plugin.add(source.session, errors_flash_kind, out.buffered());
             return sendRedirect(req, res, .see_other, path);
+        }
+
+        /// Stores a request for the next `renderWith` with `.flash` to send
+        /// `clearHistory: true`, so a route can redirect after logging out
+        /// and the page it redirects to clears the client's encrypted
+        /// history. Adds nothing if one is already queued. Call
+        /// `Sessions.save` afterwards; after `State.clear`, the queued
+        /// request keeps the cookie alive like any flash message.
+        pub fn clearHistoryOnNextRender(_: *const Self, source: FlashSource) flash_mod.Error!void {
+            const store = &source.session.flash;
+            const queued: flash_mod.Messages = .{ .bytes = store.queued[0..store.queued_len], .count = store.queued_count };
+            if (hasKind(queued, history_flash_kind)) return;
+            try source.plugin.add(source.session, history_flash_kind, "");
         }
 
         fn encodeErrors(json: *std.json.Stringify, bag: ?[]const u8, errors: anytype) std.json.Stringify.Error!void {
@@ -866,6 +931,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
+            page_options: PageOptions,
             flash: ?flash_mod.Messages,
         ) (error{OutOfMemory} || ScrollError || OnceError || PropsError(SharedProps) || PropsError(@TypeOf(props)))![]u8 {
             const shared: ?SharedProps = switch (self.shared) {
@@ -880,7 +946,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var json: std.json.Stringify = .{ .writer = &out.writer };
-            try writePage(&json, arena.allocator(), partial, once_visit, component, shared, props, url, version, flash);
+            try writePage(&json, arena.allocator(), partial, once_visit, component, shared, props, url, version, page_options, flash);
             return out.toOwnedSlice();
         }
 
@@ -898,6 +964,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             props: anytype,
             url: []const u8,
             version: ?[]const u8,
+            page_options: PageOptions,
             flash: ?flash_mod.Messages,
         ) (error{OutOfMemory} || ScrollError || OnceError || PropsError(SharedProps) || PropsError(@TypeOf(props)))!void {
             const P = @TypeOf(props);
@@ -931,6 +998,10 @@ pub fn Inertia(comptime SharedProps: type) type {
             json.endObject() catch return error.OutOfMemory;
             try writeField(json, "url", url);
             try writeField(json, "version", version);
+            // The client reads a missing field as false.
+            if (page_options.encrypt_history) try writeField(json, "encryptHistory", true);
+            if (page_options.clear_history) try writeField(json, "clearHistory", true);
+            if (page_options.preserve_fragment) try writeField(json, "preserveFragment", true);
             try writeMerge(json, partial, shared != null, comptime mergeProps(P));
             try writeScroll(json, partial, shared, props, comptime mergeProps(P));
             // Only full visits announce deferred props; a partial reload
@@ -968,17 +1039,17 @@ pub fn Inertia(comptime SharedProps: type) type {
         /// Writes `flash` as `{kind: text}` in the order each kind was last
         /// added, so a later message of a kind replaces an earlier one, as
         /// the client's `router.flash(key, value)` does. Leaves the field out
-        /// when there are no messages other than stored errors.
+        /// when there are no messages other than the reserved kinds.
         fn writeFlash(json: *std.json.Stringify, messages: flash_mod.Messages) error{OutOfMemory}!void {
             var shown = messages;
             while (shown.next()) |message| {
-                if (!std.mem.eql(u8, message.kind, errors_flash_kind)) break;
+                if (!reservedKind(message.kind)) break;
             } else return;
             json.objectField("flash") catch return error.OutOfMemory;
             json.beginObject() catch return error.OutOfMemory;
             var it = messages;
             while (it.next()) |message| {
-                if (std.mem.eql(u8, message.kind, errors_flash_kind)) continue;
+                if (reservedKind(message.kind)) continue;
                 var later = it;
                 const replaced = while (later.next()) |next| {
                     if (std.mem.eql(u8, next.kind, message.kind)) break true;
@@ -1307,6 +1378,20 @@ pub fn Inertia(comptime SharedProps: type) type {
     };
 }
 
+/// Whether `kind` is one the plugin stores for itself and leaves out of
+/// `flash`.
+fn reservedKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, errors_flash_kind) or std.mem.eql(u8, kind, history_flash_kind);
+}
+
+fn hasKind(messages: flash_mod.Messages, kind: []const u8) bool {
+    var it = messages;
+    while (it.next()) |message| {
+        if (std.mem.eql(u8, message.kind, kind)) return true;
+    }
+    return false;
+}
+
 /// What a visit says about once props: the keys the client still holds and
 /// the clock for their expiry.
 const OnceVisit = struct {
@@ -1433,8 +1518,8 @@ fn listsInertiaVary(res: *const response.Response) bool {
     return false;
 }
 
-fn commitBody(res: *response.Response, content_type: []const u8, body: []u8) error{ OutOfMemory, BodyTooLarge }!void {
-    res.replaceOwnedBody(200, content_type, body) catch |err| switch (err) {
+fn commitBody(res: *response.Response, status: u16, content_type: []const u8, body: []u8) error{ OutOfMemory, BodyTooLarge }!void {
+    res.replaceOwnedBody(status, content_type, body) catch |err| switch (err) {
         error.InvalidContentType => unreachable,
         else => |e| return e,
     };
@@ -3624,4 +3709,155 @@ test "route errors win over stored errors, which win over shared errors" {
         .flash = .{ .plugin = &flash, .session = &failed },
     }));
     try testing.expect(!failed.dirty and !failed.flash.consumed);
+}
+
+test "history fields are left out by default and follow the config and per-render options" {
+    const req = testRequest(.get, "/", &inertia_headers);
+    const plain: TestInertia = .{ .layout = test_layout };
+    const encrypted: TestInertia = .{ .layout = test_layout, .encrypt_history = true };
+    const head = "{\"component\":\"Home\",\"props\":{\"errors\":{}},\"url\":\"/\",\"version\":null";
+    const cases = .{
+        .{ plain, RenderOptions{}, "" },
+        .{ plain, RenderOptions{ .encrypt_history = false }, "" },
+        .{ plain, RenderOptions{ .encrypt_history = true }, ",\"encryptHistory\":true" },
+        .{ encrypted, RenderOptions{}, ",\"encryptHistory\":true" },
+        .{ encrypted, RenderOptions{ .encrypt_history = false }, "" },
+        .{ plain, RenderOptions{ .clear_history = true }, ",\"clearHistory\":true" },
+        .{ plain, RenderOptions{ .preserve_fragment = true }, ",\"preserveFragment\":true" },
+        .{ encrypted, RenderOptions{ .clear_history = true, .preserve_fragment = true }, ",\"encryptHistory\":true,\"clearHistory\":true,\"preserveFragment\":true" },
+    };
+    inline for (cases) |case| {
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        const plugin: TestInertia = case[0];
+        try plugin.renderWith(&req, &res, "Home", .{}, case[1]);
+        try testing.expectEqualStrings(head ++ case[2] ++ "}", res.body);
+    }
+    // `render` uses the instance setting.
+    var rendered = response.Response.init(testing.allocator);
+    defer rendered.deinit();
+    try encrypted.render(&req, &rendered, "Home", .{});
+    try testing.expectEqualStrings(head ++ ",\"encryptHistory\":true}", rendered.body);
+
+    // They follow `version` and precede the other page metadata, in the
+    // HTML shell too.
+    const shared: TestInertia = .{ .layout = "@inertia", .version = .{ .value = "v1" }, .shared = .{ .value = .{ .app_name = "zoda" } }, .encrypt_history = true };
+    var json = response.Response.init(testing.allocator);
+    defer json.deinit();
+    try shared.renderWith(&req, &json, "Home", .{ .stats = deferred({}, struct {
+        fn load(_: void, _: std.mem.Allocator) u32 {
+            return 1;
+        }
+    }.load) }, .{ .clear_history = true });
+    try testing.expectEqualStrings(
+        "{\"component\":\"Home\",\"props\":{\"app_name\":\"zoda\",\"user\":null,\"errors\":{}},\"url\":\"/\",\"version\":\"v1\"," ++
+            "\"encryptHistory\":true,\"clearHistory\":true,\"deferredProps\":{\"default\":[\"stats\"]},\"sharedProps\":[\"app_name\",\"user\"]}",
+        json.body,
+    );
+    var html = response.Response.init(testing.allocator);
+    defer html.deinit();
+    try shared.renderWith(&testRequest(.get, "/", &.{}), &html, "Home", .{}, .{ .preserve_fragment = true });
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"version\":\"v1\",\"encryptHistory\":true,\"preserveFragment\":true,\"sharedProps\"") != null);
+
+    // A version conflict sends none of them.
+    var stale = response.Response.init(testing.allocator);
+    defer stale.deinit();
+    try shared.renderWith(&testRequest(.get, "/", &.{.{ .name = "X-Inertia", .value = "true" }}), &stale, "Home", .{}, .{ .clear_history = true });
+    try testing.expectEqual(@as(u16, 409), stale.status_code);
+    try testing.expectEqualStrings("", stale.body);
+}
+
+test "renderWith sends the requested status and rejects one without a page" {
+    const plugin: TestInertia = .{ .layout = test_layout };
+    inline for (.{ &inertia_headers, &[_]router.Header{} }) |headers| {
+        const req = testRequest(.get, "/missing", headers);
+        for ([_]u16{ 200, 201, 404, 422, 503 }) |status| {
+            var res = response.Response.init(testing.allocator);
+            defer res.deinit();
+            try plugin.renderWith(&req, &res, "Errors/NotFound", .{}, .{ .status = status });
+            try testing.expectEqual(status, res.status_code);
+            try testing.expect(std.mem.indexOf(u8, res.body, "\"component\":\"Errors/NotFound\"") != null);
+        }
+        for ([_]u16{ 0, 101, 199, 204, 205, 300, 302, 304, 399, 600 }) |status| {
+            var res = response.Response.init(testing.allocator);
+            defer res.deinit();
+            try res.text(202, "keep");
+            try testing.expectError(error.InvalidStatus, plugin.renderWith(&req, &res, "Errors/NotFound", .{}, .{ .status = status }));
+            try testing.expectEqual(@as(u16, 202), res.status_code);
+            try testing.expectEqualStrings("keep", res.body);
+            try testing.expectEqual(@as(usize, 0), res.header_count);
+        }
+    }
+}
+
+const HistoryTest = struct {
+    const App = FlashTest.App;
+
+    /// `POST /todos` logs out: it drops the session, asks for the history to
+    /// be cleared, and redirects to the page that clears it.
+    fn route(ctx: *App.Context, req: *router.Request, res: *response.Response) !void {
+        const session = &ctx.state.sessions;
+        const inertia = &ctx.plugins.inertia;
+        const source: FlashSource = .{ .plugin = &ctx.plugins.flash, .session = session };
+        if (!req.onLiteral("todos") or !req.isRoot()) return;
+        if (req.method == .post) {
+            session.clear();
+            try ctx.plugins.flash.add(session, "notice", "Logged out");
+            try inertia.clearHistoryOnNextRender(source);
+            try inertia.clearHistoryOnNextRender(source);
+            try ctx.plugins.sessions.save(session, res);
+            return inertia.redirect(req, res, "/todos");
+        }
+        try inertia.renderWith(req, res, "Todos/Index", .{}, .{ .flash = source });
+        return ctx.plugins.sessions.save(session, res);
+    }
+
+    fn app() !App {
+        return App.init(testing.allocator, .{
+            .response_allocator = testing.allocator,
+            .plugins = .{ .sessions = flash_test_sessions, .inertia = .{ .layout = test_layout, .version = .{ .value = "v1" }, .encrypt_history = true } },
+            .route_fn = route,
+        });
+    }
+};
+
+test "clearHistoryOnNextRender sends clearHistory once on the page after a redirect" {
+    var app = try HistoryTest.app();
+    defer app.deinit();
+    var a: [2][8192]u8 = undefined;
+    var b: [2][8192]u8 = undefined;
+    var c: [2][8192]u8 = undefined;
+    const page_head = "{\"component\":\"Todos/Index\",\"props\":{\"errors\":{}},\"url\":\"/todos\",\"version\":\"v1\",\"encryptHistory\":true";
+
+    const logged_out = try FlashTest.visit(&app, .post, "/todos", null, &inertia_headers, &a);
+    try testing.expectEqual(@as(u16, 303), logged_out.status);
+
+    // The followed GET clears the history; the request is not in `flash`.
+    const shown = try FlashTest.visit(&app, .get, "/todos", logged_out.cookie, &inertia_headers, &b);
+    try testing.expectEqualStrings(page_head ++ ",\"clearHistory\":true,\"flash\":{\"notice\":\"Logged out\"}}", shown.body);
+
+    // It is consumed with the flash, so the next page does not clear again.
+    const after = try FlashTest.visit(&app, .get, "/todos", shown.cookie, &inertia_headers, &c);
+    try testing.expectEqualStrings(page_head ++ "}", after.body);
+
+    // A version conflict leaves it for the reload.
+    const stale = try FlashTest.visit(&app, .get, "/todos", logged_out.cookie, &.{.{ .name = "X-Inertia", .value = "true" }}, &c);
+    try testing.expectEqual(@as(u16, 409), stale.status);
+    try testing.expect(stale.cookie == null);
+    const html = try FlashTest.visit(&app, .get, "/todos", logged_out.cookie, &.{}, &c);
+    try testing.expect(std.mem.indexOf(u8, html.body, "\"encryptHistory\":true,\"clearHistory\":true,\"flash\"") != null);
+
+    // Queuing it twice stores one entry, and a request alone sends no `flash`.
+    const plugin: TestInertia = .{ .layout = test_layout };
+    const flash: flash_mod.Flash = .{};
+    var state = try emptySession();
+    try plugin.clearHistoryOnNextRender(.{ .plugin = &flash, .session = &state });
+    try plugin.clearHistoryOnNextRender(.{ .plugin = &flash, .session = &state });
+    try testing.expect(state.dirty and state.flash.queued_count == 1);
+    var received = try receivedFlash(&.{.{ history_flash_kind, "" }});
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try plugin.renderWith(&testRequest(.get, "/", &inertia_headers), &res, "Home", .{}, .{ .flash = .{ .plugin = &flash, .session = &received } });
+    try testing.expectEqualStrings("{\"component\":\"Home\",\"props\":{\"errors\":{}},\"url\":\"/\",\"version\":null,\"clearHistory\":true}", res.body);
+    try testing.expect(received.flash.consumed);
 }

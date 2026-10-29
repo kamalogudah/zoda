@@ -42,6 +42,7 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
 | `POST /todos` with `{"text": "…"}` | add | flash "Todo added", then back to the current filter at `#todo-<id>`; or store `errors.text` and 303 back to the current filter |
 | `PATCH /todos/:id` | toggle | 303 back |
 | `DELETE /todos/:id` | delete | 303 back, or 404 |
+| `DELETE /history` | forget history | flash "History cleared", ask the next page to clear history, then 303 back |
 
 - **First visit.** The layout in `server.zig` holds the `<link>` and
   `<script>` tags. `render` replaces its `@inertia` marker with
@@ -107,6 +108,17 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   reload does not clear it, because the client keeps its current flash on
   deferred-props reloads. The session key is random per run, so a restart
   just drops pending messages.
+- **History encryption.** The plugin is registered with
+  `encrypt_history = true`, so every page carries `encryptHistory: true`
+  and the client stores it in `history.state` encrypted with a key kept in
+  the tab's `sessionStorage`. Back and Forward still restore pages without
+  a request. The footer's "Forget history" button sends
+  `DELETE /history`, which calls `clearHistoryOnNextRender` and redirects
+  back; the page that follows carries `clearHistory: true`, and the client
+  deletes the key. Back to a page seen before then cannot decrypt the
+  stored copy, so the client fetches it from the server again. A real app
+  does this on logout. Encryption needs a secure context; `localhost`
+  counts, so the example works over plain HTTP here.
 - **Asset version.** At startup the server hashes `app.js` into the Inertia
   version. After you rebuild the frontend and restart the server, an open tab
   that sends the old version gets 409 and `X-Inertia-Location` and does a full
@@ -125,4 +137,5 @@ relates to Zoda's CSRF helpers.
 They cover the HTML shell, the JSON page, add, toggle, filter, and delete,
 redirect-back validation errors in the `createTodo` bag shown once, the version conflict, a partial reload of `todos`,
 loading the deferred `stats`, paging `todos` forward, backward, and
-after a reset, and the "Todo added" flash shown once.
+after a reset, the "Todo added" flash shown once, and "Forget history"
+sending `clearHistory` once.

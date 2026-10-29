@@ -87,6 +87,8 @@ function add() {
         <template #fallback><span class="stats"> · counting…</span></template>
         <span class="stats"> · {{ stats.done }} of {{ stats.total }} done</span>
       </Deferred>
+      <!-- Every page is encrypted in browser history; this clears the key. -->
+      <button class="forget" @click="router.delete(`/history${query}`)">Forget history</button>
     </footer>
   </main>
 </template>

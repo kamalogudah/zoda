@@ -202,9 +202,19 @@ runs inside `zig build test`.
   (`error.FlashTooLarge`) failures leave the response and session unchanged.
   The next `renderWith` with `.flash` sends them as `props.errors`, after
   route `errors` and before shared `errors`, and consumes them with the
-  flash; without stored errors the default stays `errors: {}`. Deferred
-  once props, history encryption, precognition, and SSR are not
-  implemented. See
+  flash; without stored errors the default stays `errors: {}`.
+  `RenderOptions` also has `encrypt_history: ?bool` (overrides the
+  instance's `encrypt_history: bool = false`), `clear_history`, and
+  `preserve_fragment`, which add `encryptHistory`, `clearHistory`, and
+  `preserveFragment` after `version` only when true, and `status` (200,
+  default; 200-299 except 204/205, or 400-599, else `error.InvalidStatus`
+  before the response changes). `clearHistoryOnNextRender(source)` stores a
+  `zoda.Flash` message of the reserved kind `history_flash_kind`, at most
+  one queued, so the next `renderWith` with `.flash` sends
+  `clearHistory: true` and consumes it; it is never sent in `flash`.
+  History encryption needs a secure context (HTTPS or localhost) and does
+  not hide props from the server or from script on the page. Deferred
+  once props, precognition, and SSR are not implemented. See
   [PLUGINS.md](PLUGINS.md#inertiajs).
 - `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
   local-path rules without changing a response.

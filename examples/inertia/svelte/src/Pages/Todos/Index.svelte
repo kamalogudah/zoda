@@ -85,5 +85,7 @@
       {#snippet fallback()}<span class="stats"> · counting…</span>{/snippet}
       <span class="stats"> · {stats.done} of {stats.total} done</span>
     </Deferred>
+    <!-- Every page is encrypted in browser history; this clears the key. -->
+    <button class="forget" onclick={() => router.delete(`/history${query}`)}>Forget history</button>
   </footer>
 </main>

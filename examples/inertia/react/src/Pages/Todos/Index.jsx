@@ -102,6 +102,10 @@ export default function Index({ app, framework, todos, filter, remaining, stats 
             </span>
           )}
         </Deferred>
+        {/* Every page is encrypted in browser history; this clears the key. */}
+        <button className="forget" onClick={() => router.delete(`/history${query}`)}>
+          Forget history
+        </button>
       </footer>
     </main>
   )
