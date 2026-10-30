@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/zoda-logo.png" alt="Zoda logo" width="256">
+</p>
+
 # Zoda
 
 Zoda is a small Zig web toolkit inspired by
