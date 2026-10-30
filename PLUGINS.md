@@ -631,13 +631,15 @@ layout or root id before the first request; `render` checks again.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `layout` | required | Full HTML document with the `@inertia` marker exactly once. It holds your asset tags and is copied verbatim. Zoda loads no templates at runtime. |
+| `layout` | required | Full HTML document with the `@inertia` marker exactly once, and optionally `@inertiaHead` once before it for server-rendered head tags (removed without SSR). It holds your asset tags and is copied verbatim. Zoda loads no templates at runtime. |
 | `root_id` | `"app"` | `id` of the generated root element; 1–64 `[A-Za-z0-9_-]` bytes. |
 | `initial_page` | `.script` | `.script` for Inertia v3 clients, `.attribute` for v1 and v2. See below. |
 | `version` | `.none` | `.value = "..."` or `.callback = fn (*const Request) []const u8`. `.none` sends `"version":null` and skips version checks. |
 | `shared` | `.none` | `.value = SharedProps{...}` or `.callback = fn (*const Request) SharedProps`. Use `zoda.Inertia(struct {})` for no shared props. |
 | `now_milliseconds` | `null` | Trusted UTC Unix-millisecond clock, `fn () i64`, for once props with an expiry. See [Once props](#once-props). |
 | `encrypt_history` | `false` | Sends `encryptHistory: true` on every page; `renderWith` can override it per page. See [History encryption](#history-encryption). |
+| `ssr` | `null` | `zoda.plugins.inertia.Ssr` settings to render full visits through an SSR server. See [Server-side rendering](#server-side-rendering). |
+| `on_ssr_failure` | `null` | `fn (*const Request, SsrFailure) void`, called before each fallback to client rendering. |
 
 ### Responses
 
@@ -1328,6 +1330,70 @@ const form = useForm({ text: '' }).withPrecognition('post', '/todos')
 - **Not covered.** File validation (`validateFiles`) needs multipart
   bodies, which `zoda.JsonParser` does not read.
 
+### Server-side rendering
+
+With `ssr` set, a full (non-`X-Inertia`) visit posts the page JSON to an
+Inertia SSR server, such as the one `@inertiajs/react/server` starts, and
+sends its rendered markup. The client then hydrates instead of mounting. The
+decision and its trade-offs are recorded in
+[zoda_plan.md §4.2.14](zoda_plan.md).
+
+```zig
+const layout =
+    \<!doctype html>
+    \<html><head><script type="module" src="/assets/app.js"></script>
+    \@inertiaHead</head>
+    \<body>@inertia</body></html>
+;
+
+fn logSsrFailure(req: *const zoda.router.Request, failure: zoda.plugins.inertia.SsrFailure) void {
+    std.log.warn("SSR failed for {s}: {s}", .{ req.target, @errorName(failure) });
+}
+
+// .inertia = .{
+//     .layout = layout,
+//     .ssr = .{ .timeout_ms = 500 }, // POST http://127.0.0.1:13714/render
+//     .on_ssr_failure = logSsrFailure,
+// },
+```
+
+| `Ssr` field | Default | Meaning |
+| --- | --- | --- |
+| `address` | `127.0.0.1:13714` | Literal `std.Io.net.IpAddress` of the SSR server. No name lookup happens. |
+| `path` | `"/render"` | Request path: `/` then printable ASCII without spaces, at most 256 bytes. |
+| `timeout_ms` | `1000` | Total budget for connecting, sending, and reading, 1 to 60,000. |
+| `max_response_bytes` | 1 MiB | Most bytes of the SSR server's answer, head included. |
+
+- **Request.** `POST <path> HTTP/1.1` with `Content-Type: application/json`
+  and `Connection: close`. The body is exactly the page object an
+  `X-Inertia` visit would get, unescaped.
+- **Answer.** 200 with `{"head": [string], "body": string}` (`head` may be
+  missing; other fields are ignored), framed by `Content-Length`, chunked
+  encoding, or the connection close. The `head` elements, joined with
+  newlines, replace `@inertiaHead`; `body` replaces `@inertia`. Both are
+  inserted as is: the SSR server is trusted like the layout. In v3 `body`
+  holds the `<script data-page>` element and
+  `<div data-server-rendered="true" id="app">`, built from the page JSON
+  Zoda sent, so `root_id` and `initial_page` must match the SSR server's
+  own setup.
+- **Fallback.** Any failure is passed to `on_ssr_failure` and the page is
+  the client-side shell, as without `ssr`: `SsrConnectFailed`,
+  `SsrTimeout`, `SsrIoFailed`, `SsrResponseTooLarge`, `SsrBadStatus`,
+  `SsrMalformedResponse`, `SsrPageTooLarge` (the document is over
+  `max_body_bytes`), and `SsrUnsupported` off Linux. Only `OutOfMemory`
+  propagates. The callback runs concurrently with other requests.
+- **Deadline.** The budget is one absolute deadline on the monotonic clock,
+  checked before every syscall, so a hung or slow SSR server costs at most
+  `timeout_ms`. During that time the request holds its connection task:
+  keep the SSR server local and the timeout short.
+- **Settings.** `validate()` and `render` return `error.InvalidSsr` for a
+  zero or over-limit `timeout_ms`, a zero `max_response_bytes`, or a bad
+  `path`. `@inertiaHead` after `@inertia`, or twice, is
+  `error.InvalidLayout`.
+- **Not covered.** Only full visits are rendered; `X-Inertia` responses are
+  JSON as always. The SSR server's error details (its 500 body) are not
+  read, only the status.
+
 ### URL and origin policy
 
 The page `url` and the conflict's `X-Inertia-Location` are the raw
@@ -1404,7 +1470,11 @@ previous page with no request, and Back after it fetched the page from the
 server again. Precognition was driven in Chrome with the React frontend:
 leaving the add field blank and blurring it sent a precognitive POST that
 got 422 and showed "Write something first." before any submit, and a valid
-value got 204 and cleared it, with no todo added. The other rows are
+value got 204 and cleared it, with no todo added. Server-side rendering
+was driven in Chrome with the React frontend and its `npm run ssr` server:
+the page arrived server-rendered, hydrated with no console messages, and
+the add form worked; with the SSR server stopped or hung, pages fell back
+to client rendering and the failure was logged. The other rows are
 covered by the plugin's unit tests only.
 
 The features not yet implemented are tracked in
@@ -1436,4 +1506,4 @@ The features not yet implemented are tracked in
 | `preserveFragment` | Implemented (`renderWith` with `.preserve_fragment`). Covered by unit tests only. |
 | Error pages with a non-200 status | Implemented (`renderWith` with `.status`, 200–299 except 204/205, or 400–599) |
 | Precognition (`Precognition`, `Precognition-Validate-Only`, `Precognition-Success`) | Implemented (`precognition`, `answerPrecognition`): 422 with the listed fields' `errors` or 204, both with `Precognition: true` and `Vary: Precognition`. Driven in a browser through the example's add form in React. |
-| Server-side rendering | Not implemented |
+| Server-side rendering (`@inertiajs/*/server`, `@inertiaHead`) | Implemented, opt-in (`ssr`): one bounded POST per full visit with fallback to the client-side shell, reported through `on_ssr_failure`. Linux only. Driven in a browser through the React example with `--ssr`. |

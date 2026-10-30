@@ -100,7 +100,20 @@
 //!   `Precognition: true` and `Vary: Precognition`, the contract of
 //!   laravel-precognition, which `useForm(...).withPrecognition()` uses.
 //!
-//! Not implemented: once deferred props and server-side rendering.
+//! - Server-side rendering: with `ssr` set, a full visit posts the page JSON
+//!   to an Inertia SSR server (`@inertiajs/*/server`, by default
+//!   `http://127.0.0.1:13714/render`) under one `timeout_ms` deadline and
+//!   puts its answer in the layout: the `head` elements, joined with
+//!   newlines, at the optional `@inertiaHead` marker and the `body` at
+//!   `@inertia`, both as is, since the SSR server is trusted like the
+//!   layout. The `body` carries the same `<script data-page>` element the
+//!   client hydrates from. Any failure, including a timeout, a refused
+//!   connection, a non-200 status, an oversized or malformed answer, or a
+//!   document over the body limit, is passed to `on_ssr_failure` and the
+//!   page falls back to the client-side shell. `X-Inertia` visits never
+//!   use SSR. See `inertia_ssr.zig` for the client.
+//!
+//! Not implemented: once deferred props.
 //!
 //! URL and origin policy: the page `url` and every `X-Inertia-Location` for
 //! the current page are the raw origin-form request target, so path and
@@ -118,8 +131,12 @@ const response = @import("../response.zig");
 const http_cache = @import("http_cache.zig");
 const flash_mod = @import("flash.zig");
 const sessions = @import("sessions.zig");
+const ssr_client = @import("inertia_ssr.zig");
 
 pub const layout_marker = "@inertia";
+/// Where server-rendered `head` elements go: at most once, before
+/// `layout_marker`. Without SSR it is removed.
+pub const head_marker = "@inertiaHead";
 pub const html_content_type = "text/html; charset=utf-8";
 pub const max_root_id_bytes = 64;
 /// Most names one `X-Inertia-Partial-Data`, `-Except`, or `X-Inertia-Reset`
@@ -150,7 +167,12 @@ pub const HeaderError = error{ DuplicateInertiaHeader, MalformedInertiaHeader, D
 pub const PartialError = error{ DuplicatePartialHeader, MalformedPartialHeader, PartialHeaderTooLarge };
 pub const ScrollError = error{InvalidScrollPageName};
 pub const OnceError = error{ OnceClockNotConfigured, InvalidOnceTime };
-pub const ConfigError = error{ InvalidLayout, InvalidRootId };
+pub const ConfigError = error{ InvalidLayout, InvalidRootId, InvalidSsr };
+/// SSR server settings: `address`, `path`, `timeout_ms`, and
+/// `max_response_bytes`.
+pub const Ssr = ssr_client.Config;
+/// Why a server-side render fell back to the client-side shell.
+pub const SsrFailure = ssr_client.Failure;
 pub const TargetError = error{ MissingRequestTarget, UnsafeRequestTarget };
 pub const ErrorBagError = error{ DuplicateErrorBagHeader, MalformedErrorBagHeader };
 pub const PrecognitionError = error{ DuplicatePrecognitionHeader, MalformedPrecognitionHeader, PrecognitionHeaderTooLarge };
@@ -772,8 +794,9 @@ pub fn Inertia(comptime SharedProps: type) type {
             callback: *const fn (*const router.Request) []const u8,
         };
 
-        /// Complete HTML document containing `@inertia` exactly once. It owns
-        /// the page layout and asset tags and is copied verbatim.
+        /// Complete HTML document containing `@inertia` exactly once, and
+        /// optionally `@inertiaHead` once before it. It owns the page layout
+        /// and asset tags and is copied verbatim.
         layout: []const u8,
         /// `id` of the generated root element: 1-64 `[A-Za-z0-9_-]` bytes.
         root_id: []const u8 = "app",
@@ -792,8 +815,19 @@ pub fn Inertia(comptime SharedProps: type) type {
         /// tab's history after `clearHistory`, not from the server or from
         /// scripts on the page.
         encrypt_history: bool = false,
+        /// Renders full visits through an Inertia SSR server; null sends
+        /// only the client-side shell. A render holds the request for at
+        /// most `timeout_ms`, which callers should budget for: it occupies a
+        /// connection worker meanwhile. Linux only; elsewhere every render
+        /// fails with `error.SsrUnsupported`.
+        ssr: ?Ssr = null,
+        /// Receives every SSR failure before the page falls back to the
+        /// client-side shell, for logging or metrics. It runs on the
+        /// request's task, concurrently with other requests. Unset, failures
+        /// are silent.
+        on_ssr_failure: ?*const fn (*const router.Request, SsrFailure) void = null,
 
-        /// Checks the layout and root id. `render` repeats the check, so
+        /// Checks the layout, root id, and SSR settings. `render` repeats the check, so
         /// calling this at startup only reports mistakes earlier.
         pub fn validate(self: *const Self) ConfigError!void {
             _ = try self.layoutParts();
@@ -801,6 +835,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             for (self.root_id) |c| {
                 if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) return error.InvalidRootId;
             }
+            if (self.ssr) |config| try config.validate();
         }
 
         /// The errors `render` can return for route props of type `Props`:
@@ -887,7 +922,7 @@ pub fn Inertia(comptime SharedProps: type) type {
                 committed = true;
             } else {
                 defer res.allocator.free(page);
-                const body = try self.htmlBody(res, page);
+                const body = try self.htmlBody(req, res, page);
                 var committed = false;
                 defer if (!committed) res.allocator.free(body);
                 try reserveHeaders(res, 0, 0);
@@ -1060,11 +1095,27 @@ pub fn Inertia(comptime SharedProps: type) type {
             emptyBody(res, 409);
         }
 
-        fn layoutParts(self: *const Self) ConfigError!struct { []const u8, []const u8 } {
-            const at = std.mem.indexOf(u8, self.layout, layout_marker) orelse return error.InvalidLayout;
-            const after = self.layout[at + layout_marker.len ..];
-            if (std.mem.indexOf(u8, after, layout_marker) != null) return error.InvalidLayout;
-            return .{ self.layout[0..at], after };
+        /// The layout before `@inertiaHead` (empty without one), between it
+        /// and `@inertia`, and after `@inertia`.
+        fn layoutParts(self: *const Self) ConfigError!struct { []const u8, []const u8, []const u8 } {
+            var head_at: ?usize = null;
+            var page_at: ?usize = null;
+            var from: usize = 0;
+            while (std.mem.indexOfPos(u8, self.layout, from, layout_marker)) |at| {
+                if (std.mem.startsWith(u8, self.layout[at..], head_marker)) {
+                    if (head_at != null or page_at != null) return error.InvalidLayout;
+                    head_at = at;
+                    from = at + head_marker.len;
+                } else {
+                    if (page_at != null) return error.InvalidLayout;
+                    page_at = at;
+                    from = at + layout_marker.len;
+                }
+            }
+            const page = page_at orelse return error.InvalidLayout;
+            const after = self.layout[page + layout_marker.len ..];
+            const head = head_at orelse return .{ "", self.layout[0..page], after };
+            return .{ self.layout[0..head], self.layout[head + head_marker.len .. page], after };
         }
 
         fn currentVersion(self: *const Self, req: *const router.Request) ?[]const u8 {
@@ -1488,17 +1539,26 @@ pub fn Inertia(comptime SharedProps: type) type {
             json.write(value) catch return error.OutOfMemory;
         }
 
-        fn htmlBody(self: *const Self, res: *const response.Response, page: []const u8) RenderError![]u8 {
-            const before, const after = try self.layoutParts();
+        /// The server-rendered document when `ssr` is set and the render
+        /// succeeds, else the client-side shell.
+        fn htmlBody(self: *const Self, req: *const router.Request, res: *const response.Response, page: []const u8) RenderError![]u8 {
+            const parts = try self.layoutParts();
+            if (self.ssr) |config| {
+                if (serverRendered(res, config, parts, page)) |body| return body else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => |failure| if (self.on_ssr_failure) |report| report(req, failure),
+                }
+            }
+            const before_head, const before_page, const after = parts;
             const id = self.root_id;
             // The escaped JSON goes between `head` and `tail`.
-            const head: [4][]const u8, const tail: [4][]const u8 = switch (self.initial_page) {
+            const head: [5][]const u8, const tail: [4][]const u8 = switch (self.initial_page) {
                 .script => .{
-                    .{ before, "<script data-page=\"", id, "\" type=\"application/json\">" },
+                    .{ before_head, before_page, "<script data-page=\"", id, "\" type=\"application/json\">" },
                     .{ "</script><div id=\"", id, "\"></div>", after },
                 },
                 .attribute => .{
-                    .{ before, "<div id=\"", id, "\" data-page=\"" },
+                    .{ before_head, before_page, "<div id=\"", id, "\" data-page=\"" },
                     .{ "\"></div>", after, "", "" },
                 },
             };
@@ -1528,6 +1588,21 @@ pub fn Inertia(comptime SharedProps: type) type {
             }
             std.debug.assert(i == len);
             return body;
+        }
+
+        fn serverRendered(
+            res: *const response.Response,
+            config: Ssr,
+            parts: struct { []const u8, []const u8, []const u8 },
+            page: []const u8,
+        ) (SsrFailure || error{OutOfMemory})![]u8 {
+            const rendered = try ssr_client.render(res.allocator, config, page);
+            defer rendered.deinit(res.allocator);
+            const pieces = [_][]const u8{ parts[0], rendered.head, parts[1], rendered.body, parts[2] };
+            var len: usize = 0;
+            for (pieces) |piece| len += piece.len;
+            if (len > res.limits.max_body_bytes) return error.SsrPageTooLarge;
+            return std.mem.concat(res.allocator, u8, &pieces);
         }
     };
 }
@@ -4189,5 +4264,141 @@ test "precognition answers keep one Vary member, fit the limits, and answer once
         try testing.expectEqual(@as(u16, 200), res.status_code);
         try testing.expectEqualStrings("keep", res.body);
         try testing.expectEqual(@as(usize, 0), res.header_count);
+    }
+}
+
+const SsrReports = struct {
+    var last: ?SsrFailure = null;
+    var count: usize = 0;
+
+    fn report(_: *const router.Request, failure: SsrFailure) void {
+        last = failure;
+        count += 1;
+    }
+
+    fn reset() void {
+        last = null;
+        count = 0;
+    }
+};
+
+const ssr_layout = "<html><head><title>x</title>@inertiaHead</head><body>@inertia</body></html>";
+const ssr_answer = "{\"head\":[\"<title>Home</title>\",\"<meta name=\\\"d\\\">\"],\"body\":\"<script data-page=\\\"app\\\" type=\\\"application/json\\\">{}</script><div data-server-rendered=\\\"true\\\" id=\\\"app\\\">Hi</div>\"}";
+
+fn ssrReply(comptime body: []const u8) []const u8 {
+    return std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+}
+
+test "SSR puts the server's head and body in the layout and sends it the page JSON" {
+    if (!ssr_client.supported) return error.SkipZigTest;
+    SsrReports.reset();
+    var server: ssr_client.TestServer = undefined;
+    try server.start(ssrReply(ssr_answer), 0);
+    const plugin: TestInertia = .{ .layout = ssr_layout, .version = .{ .value = "v1" }, .ssr = server.config(), .on_ssr_failure = SsrReports.report };
+    try plugin.validate();
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try plugin.render(&testRequest(.get, "/?a=<b>", &.{}), &res, "Home", .{ .name = "</script>" });
+    const request = server.finish();
+    try testing.expectEqual(@as(usize, 0), SsrReports.count);
+    try testing.expectEqual(@as(u16, 200), res.status_code);
+    try testing.expectEqualStrings(html_content_type, res.content_type);
+    try testing.expectEqualStrings("<html><head><title>x</title><title>Home</title>\n<meta name=\"d\"></head><body><script data-page=\"app\" type=\"application/json\">{}</script><div data-server-rendered=\"true\" id=\"app\">Hi</div></body></html>", res.body);
+    try testing.expectEqualStrings("X-Inertia", (try res.getHeaderOne("Vary")).?);
+
+    // The SSR server gets the page object an Inertia visit would, unescaped.
+    var json = response.Response.init(testing.allocator);
+    defer json.deinit();
+    const no_ssr: TestInertia = .{ .layout = ssr_layout, .version = .{ .value = "v1" } };
+    try no_ssr.render(&testRequest(.get, "/?a=<b>", &inertia_headers), &json, "Home", .{ .name = "</script>" });
+    const body_at = std.mem.indexOf(u8, request, "\r\n\r\n").? + 4;
+    try testing.expectEqualStrings(json.body, request[body_at..]);
+    try testing.expect(std.mem.startsWith(u8, request, "POST /render HTTP/1.1\r\n"));
+}
+
+test "SSR failures fall back to the client-side shell and are reported" {
+    if (!ssr_client.supported) return error.SkipZigTest;
+    const shell = "<html><head><title>x</title></head><body><script data-page=\"app\" type=\"application/json\">{\"component\":\"Home\",\"props\":{\"errors\":{}},\"url\":\"/\",\"version\":null}</script><div id=\"app\"></div></body></html>";
+    const cases = .{
+        .{ ssrReply(ssr_answer), 300, Ssr{ .timeout_ms = 30 }, error.SsrTimeout },
+        .{ "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\n\r\n{}", 0, Ssr{}, error.SsrBadStatus },
+        .{ ssrReply("{\"head\":[]}"), 0, Ssr{}, error.SsrMalformedResponse },
+        .{ "HTTP/1.1 200 OK\r\n\r\n<html>", 0, Ssr{}, error.SsrMalformedResponse },
+        .{ ssrReply(ssr_answer), 0, Ssr{ .max_response_bytes = 64 }, error.SsrResponseTooLarge },
+    };
+    inline for (cases) |case| {
+        SsrReports.reset();
+        var server: ssr_client.TestServer = undefined;
+        try server.start(case[0], case[1]);
+        var config = case[2];
+        config.address = server.config().address;
+        const plugin: TestInertia = .{ .layout = ssr_layout, .ssr = config, .on_ssr_failure = SsrReports.report };
+        var res = response.Response.init(testing.allocator);
+        defer res.deinit();
+        try plugin.render(&testRequest(.get, "/", &.{}), &res, "Home", .{});
+        _ = server.finish();
+        try testing.expectEqual(@as(usize, 1), SsrReports.count);
+        try testing.expectEqual(@as(?SsrFailure, case[3]), SsrReports.last);
+        try testing.expectEqual(@as(u16, 200), res.status_code);
+        try testing.expectEqualStrings(shell, res.body);
+    }
+
+    // A refused connection, and a document over the body limit while the
+    // shell still fits.
+    SsrReports.reset();
+    const refused: TestInertia = .{ .layout = ssr_layout, .ssr = .{ .address = .{ .ip4 = .loopback(1) } }, .on_ssr_failure = SsrReports.report };
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try refused.render(&testRequest(.get, "/", &.{}), &res, "Home", .{});
+    try testing.expectEqual(@as(?SsrFailure, error.SsrConnectFailed), SsrReports.last);
+    try testing.expectEqualStrings(shell, res.body);
+
+    SsrReports.reset();
+    const big_answer = "{\"body\":\"" ++ "x" ** 300 ++ "\"}";
+    var server: ssr_client.TestServer = undefined;
+    try server.start(ssrReply(big_answer), 0);
+    const limited: TestInertia = .{ .layout = ssr_layout, .ssr = server.config(), .on_ssr_failure = SsrReports.report };
+    var small = response.Response.initWithLimits(testing.allocator, .{ .max_body_bytes = 256 });
+    defer small.deinit();
+    try limited.render(&testRequest(.get, "/", &.{}), &small, "Home", .{});
+    _ = server.finish();
+    try testing.expectEqual(@as(?SsrFailure, error.SsrPageTooLarge), SsrReports.last);
+    try testing.expectEqualStrings(shell, small.body);
+
+    // Without a callback the fallback is silent.
+    const silent: TestInertia = .{ .layout = ssr_layout, .ssr = .{ .address = .{ .ip4 = .loopback(1) } } };
+    var quiet = response.Response.init(testing.allocator);
+    defer quiet.deinit();
+    try silent.render(&testRequest(.get, "/", &.{}), &quiet, "Home", .{});
+    try testing.expectEqualStrings(shell, quiet.body);
+}
+
+test "Inertia visits never use SSR" {
+    SsrReports.reset();
+    const plugin: TestInertia = .{ .layout = ssr_layout, .version = .{ .value = "v1" }, .ssr = .{ .address = .{ .ip4 = .loopback(1) } }, .on_ssr_failure = SsrReports.report };
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try plugin.render(&testRequest(.get, "/", &inertia_headers), &res, "Home", .{});
+    try testing.expectEqualStrings(response.json_content_type, res.content_type);
+    try testing.expectEqual(@as(usize, 0), SsrReports.count);
+}
+
+test "@inertiaHead is optional, single, before @inertia, and removed without SSR" {
+    const plugin: TestInertia = .{ .layout = ssr_layout };
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try plugin.render(&testRequest(.get, "/", &.{}), &res, "Home", .{});
+    try testing.expect(std.mem.startsWith(u8, res.body, "<html><head><title>x</title></head><body><script data-page="));
+
+    const req = testRequest(.get, "/", &.{});
+    for ([_][]const u8{ "@inertia @inertiaHead", "@inertiaHead @inertiaHead @inertia", "@inertiaHead" }) |layout| {
+        const bad: TestInertia = .{ .layout = layout };
+        try testing.expectError(error.InvalidLayout, bad.validate());
+        try testing.expectError(error.InvalidLayout, bad.render(&req, &res, "Home", .{}));
+    }
+    for ([_]Ssr{ .{ .timeout_ms = 0 }, .{ .path = "/a b" }, .{ .max_response_bytes = 0 } }) |config| {
+        const bad: TestInertia = .{ .layout = ssr_layout, .ssr = config };
+        try testing.expectError(error.InvalidSsr, bad.validate());
+        try testing.expectError(error.InvalidSsr, bad.render(&req, &res, "Home", .{}));
     }
 }

@@ -228,7 +228,16 @@ runs inside `zig build test`.
   `error.NotPrecognitive` and `error.PrecognitionAlreadySet` guard misuse,
   and header, limit, and body failures leave the response unchanged.
   `varyOnPrecognition(res)` adds `Vary: Precognition` to ordinary
-  responses. Deferred once props and SSR are not implemented. See
+  responses. With `ssr` set (`zoda.plugins.inertia.Ssr`: literal
+  `address`, default `127.0.0.1:13714`; `path`, default `/render`;
+  `timeout_ms`, default 1000; `max_response_bytes`, default 1 MiB), full
+  visits post the page JSON to an Inertia SSR server under one monotonic
+  deadline and insert its `head` at the optional `@inertiaHead` marker and
+  its `body` at `@inertia`, as is. Any failure (`SsrFailure`) goes to
+  `on_ssr_failure` and the page falls back to the client-side shell; bad
+  settings are `error.InvalidSsr`. Linux only, like `zoda.static`; a render
+  holds its connection task for up to `timeout_ms`. Deferred once props are
+  not implemented. See
   [PLUGINS.md](PLUGINS.md#inertiajs).
 - `zoda.response.validateRedirectPath(path)` checks the `redirectPath`
   local-path rules without changing a response.

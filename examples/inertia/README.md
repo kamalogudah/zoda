@@ -29,6 +29,26 @@ commands to try another frontend. With no argument the server uses `react`.
 To rebuild the bundle on every save, run `npm run watch` in the frontend
 directory, then restart the server so it picks up the new asset version.
 
+### Server-side rendering (React)
+
+`npm run build` in `react` also writes `dist/ssr/ssr.js`, a Node server
+made with `@inertiajs/react/server` from [`src/ssr.jsx`](react/src/ssr.jsx).
+Start it, then start Zoda with `--ssr`:
+
+```sh
+(cd examples/inertia/react && npm run ssr)      # listens on 127.0.0.1:13714
+zig build run-inertia -- react --ssr
+```
+
+Each full visit then posts its page JSON to the SSR server, with a 500 ms
+budget, and sends the rendered HTML: the page arrives as markup inside
+`<div data-server-rendered="true" id="app">`, and `main.jsx` hydrates it
+instead of mounting. The layout's `@inertiaHead` marker takes any head tags
+the SSR server returns. Stop the SSR server and pages still load: Zoda falls
+back to the client-rendered page and logs `SSR failed for /todos:
+SsrConnectFailed`. JSON visits never use SSR. Only the React frontend has
+an SSR entry.
+
 There is no Vite dev server or hot reload. Vite writes `dist/assets/app.js`
 and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
 `/assets`.

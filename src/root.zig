@@ -72,6 +72,7 @@ pub const plugins = struct {
     pub const security_policy = @import("plugins/security_policy.zig");
     /// Inertia.js page responses, asset-version conflicts, and redirects.
     pub const inertia = @import("plugins/inertia.zig");
+    pub const inertia_ssr = @import("plugins/inertia_ssr.zig");
 };
 
 /// Re-export the JSON plugin instance type for convenience.
@@ -114,6 +115,7 @@ comptime {
     std.testing.refAllDecls(plugins.error_handler);
     std.testing.refAllDecls(plugins.security_policy);
     std.testing.refAllDecls(plugins.inertia);
+    std.testing.refAllDecls(plugins.inertia_ssr);
 }
 
 test {

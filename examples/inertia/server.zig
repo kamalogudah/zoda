@@ -15,6 +15,14 @@
 //! history" redirects to a page that clears it. The add form validates as you
 //! type through Inertia's precognition support, which the same route answers
 //! without adding anything.
+//!
+//! With `--ssr` (React only), full visits are rendered on the server first:
+//!
+//!     (cd examples/inertia/react && npm run ssr)   # SSR server on :13714
+//!     zig build run-inertia -- react --ssr
+//!
+//! If the SSR server is down or slow, pages fall back to client rendering
+//! and the failure is logged.
 const std = @import("std");
 const zoda = @import("zoda");
 
@@ -115,6 +123,7 @@ pub const layout =
     \\  <title>Zoda + Inertia todos</title>
     \\  <link rel="stylesheet" href="/assets/app.css">
     \\  <script type="module" src="/assets/app.js"></script>
+    \\  @inertiaHead
     \\</head>
     \\<body>@inertia</body>
     \\</html>
@@ -306,6 +315,15 @@ pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const framework = if (args.len > 1) args[1] else "react";
+    const ssr = args.len > 2 and std.mem.eql(u8, args[2], "--ssr");
+    if (args.len > 3 or (args.len > 2 and !ssr)) {
+        std.log.err("usage: run-inertia -- [react|svelte|vue] [--ssr]", .{});
+        return error.InvalidArguments;
+    }
+    if (ssr and !std.mem.eql(u8, framework, "react")) {
+        std.log.err("--ssr is only set up for the react frontend", .{});
+        return error.InvalidArguments;
+    }
     for (frameworks) |known| {
         if (std.mem.eql(u8, framework, known)) break;
     } else {
@@ -360,6 +378,9 @@ pub fn main(init: std.process.Init) !void {
                 // The client encrypts with Web Crypto, which needs HTTPS or
                 // localhost, where this example runs.
                 .encrypt_history = true,
+                // `npm run ssr` listens on the default 127.0.0.1:13714.
+                .ssr = if (ssr) .{ .timeout_ms = 500 } else null,
+                .on_ssr_failure = logSsrFailure,
             },
             .sessions = .{ .keys = &.{.{ .id = 1, .secret = &secret }}, .lifetime_seconds = 60 * 60, .now_seconds = unixSeconds },
             .store = .{ .value = &store },
@@ -373,8 +394,12 @@ pub fn main(init: std.process.Init) !void {
     const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(8080) };
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
-    std.log.info("serving the {s} frontend on http://localhost:8080", .{framework});
+    std.log.info("serving the {s} frontend on http://localhost:8080{s}", .{ framework, if (ssr) " with SSR" else "" });
     try zoda.server.serve(App, allocator, io, &listener, &app, .{});
+}
+
+fn logSsrFailure(req: *const zoda.router.Request, failure: zoda.plugins.inertia.SsrFailure) void {
+    std.log.warn("SSR failed for {s}: {s}; sent the client-rendered page", .{ req.target, @errorName(failure) });
 }
 
 fn testClock() i64 {

@@ -3,8 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build",
-    "watch": "vite build --watch"
+    "build": "vite build && vite build --ssr",
+    "watch": "vite build --watch",
+    "ssr": "node dist/ssr/ssr.js"
   },
   "dependencies": {
     "@inertiajs/react": "3.9.1",

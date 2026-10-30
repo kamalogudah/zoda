@@ -15,3 +15,18 @@ export function build(entry) {
     },
   }
 }
+
+// The Node SSR server bundle, `dist/ssr/ssr.js`, built after the client
+// bundle, which empties `dist`. Zoda's static middleware serves only
+// `dist/assets`, so it is never sent to browsers.
+export function ssrBuild(entry) {
+  return {
+    outDir: 'dist/ssr',
+    emptyOutDir: false,
+    ssr: true,
+    rolldownOptions: {
+      input: entry,
+      output: { entryFileNames: 'ssr.js' },
+    },
+  }
+}

@@ -1833,6 +1833,66 @@ Local validation on 2026-10-27, Zig `0.16.0`, `x86_64-linux-gnu`:
 `git diff --check` all passed. The new local measurements are in
 [SUPPORTED_API.md](SUPPORTED_API.md#reproducible-measurements-and-decisions).
 
+### §4.2.14 Inertia server-side rendering decision — issue #78
+
+**Outcome: optional SSR through a plugin-owned client, with fallback.**
+`zoda.Inertia` can render full visits through an Inertia SSR server
+(`@inertiajs/*/server`). It is off by default (`ssr = null`), and any
+failure sends the existing client-rendered page.
+
+The conflict the issue named is real: handlers get no `std.Io`, dispatch has
+no time budget (the §4.2.2 deadlines cover header reads, body reads, and
+response writes), and connection tasks are capped. An outbound call made
+while handling a request holds a task for as long as it takes. The design
+bounds that instead of avoiding it:
+
+- **One absolute deadline.** Connecting, sending the page, and reading the
+  answer share one `timeout_ms` budget (1 to 60,000 ms, default 1,000)
+  measured on `CLOCK_MONOTONIC`. A render never holds the request longer.
+  The pinned `std.Io.net.IpAddress.connect` panics when given a timeout
+  (`TODO implement netConnectIpPosix with timeout`), so the client
+  (`src/plugins/inertia_ssr.zig`) uses Linux syscalls directly: a
+  non-blocking socket and `poll`. Like `zoda.static` (§4.2.11) it fails
+  closed elsewhere (`error.SsrUnsupported`), which falls back.
+- **No name lookup.** The endpoint is a literal IP address and port, so DNS
+  never runs in the request path.
+- **Bounded answers.** At most `max_response_bytes` (default 1 MiB) are read.
+  The answer must be HTTP/1.x 200 with a body framed by `Content-Length`,
+  strict chunked encoding, or the connection close, holding
+  `{"head": [string], "body": string}`. The finished document must fit
+  `max_body_bytes`.
+- **Fallback, reported.** Timeouts, refused connections, I/O errors,
+  non-200 statuses, oversized or malformed answers, and oversized documents
+  go to the optional `on_ssr_failure` callback, and the response is the
+  client-side shell, byte for byte what it is without SSR. Only allocation
+  failure propagates.
+- **Trusted output.** `head` (joined with newlines, at the optional
+  `@inertiaHead` layout marker) and `body` (at `@inertia`) are inserted as
+  is, like the layout. The SSR server builds `body`, including the
+  `<script data-page>` element the client hydrates from, from the exact page
+  JSON an `X-Inertia` visit would get.
+- **Capacity.** With SSR on, each full visit occupies a connection task for
+  up to `timeout_ms`. Size the timeout below the client's patience and keep
+  the SSR server local. `X-Inertia` visits never use SSR.
+
+Rejected alternatives: an injected renderer callback would leave the
+deadline to application code, and build-time prerendering only fits pages
+whose props never change per request. Neither is needed alongside this.
+
+Evidence: unit tests in `src/plugins/inertia_ssr.zig` (request bytes,
+`Content-Length`, chunked, and close-delimited answers, a 50 ms timeout
+against a 500 ms server finishing in under 400 ms, refused connections, the
+response size limit, malformed answers, settings validation) and in
+`src/plugins/inertia.zig` (layout insertion, the page JSON sent equal to the
+`X-Inertia` body, every fallback with its report, the body limit, no SSR for
+`X-Inertia` visits, `@inertiaHead` rules). The React example's
+`npm run ssr` plus `zig build run-inertia -- react --ssr` was driven in
+Chrome: the page arrived server-rendered (`data-server-rendered="true"`),
+hydrated with no console messages, and the add form worked; with the SSR
+server stopped, pages fell back and logged `SsrConnectFailed`, and against a
+server that never answered they fell back after 0.51 s on a 500 ms budget,
+logging `SsrTimeout`.
+
 ## 5. Compiling public API examples
 
 The implementation of the original §5.1–§5.4 design sketches is the
@@ -1890,6 +1950,9 @@ Remaining decisions have explicit gates:
 - ~~HTTP/2 support~~ — resolved in Phase 2c as HTTP/1.1-only: the pinned
   `std.http` has no HTTP/2 server (issue #19, §4.2.6). HTTP/2 stays
   unsupported until a reopening condition there is met.
+- ~~Inertia server-side rendering~~ — resolved as optional SSR through a
+  plugin-owned client with one deadline and client-rendering fallback
+  (issue [#78](https://github.com/kamalogudah/zoda/issues/78), §4.2.14).
 - ~~Named capture convenience~~ — Phase 4 decision: deferred for lack of a
   demonstrated need (issue [#30](https://github.com/kamalogudah/zoda/issues/30),
   §4 Phase 4). Open a scoped implementation issue linked to roadmap
