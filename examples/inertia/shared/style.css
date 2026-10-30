@@ -193,3 +193,59 @@ button.forget {
 }
 
 button.forget:hover { color: var(--ink); }
+
+.hint {
+  color: var(--muted);
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+}
+
+button.link {
+  padding: 0;
+  margin-left: 0.5rem;
+  font: inherit;
+  color: var(--muted);
+  background: none;
+  border: 0;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+button.link:hover { color: var(--ink); }
+
+.about {
+  clear: both;
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+}
+
+.activity {
+  margin-top: 2rem;
+}
+
+.activity h2 {
+  font-size: 1rem;
+  margin: 0 0 0.5rem;
+}
+
+.activity h2 small {
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 0.5rem;
+}
+
+.activity ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.9rem;
+}
+
+.activity li {
+  padding: 0.3rem 0;
+  border-top: 0;
+}
+
+.activity a {
+  color: var(--ink);
+}

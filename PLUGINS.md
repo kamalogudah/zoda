@@ -1104,9 +1104,29 @@ return ctx.plugins.inertia.render(req, res, "Billing/Plans", .{
   for example `plans: zoda.plugins.inertia.Onceable("plans", *Store, Plans.load)`.
 - **Rules checked at compile time.** `errors` cannot be a once prop, and a
   once prop's name must be non-empty `[A-Za-z0-9_$-]`, since the client
-  reads `prop` as a dot path. Once props cannot be wrapped in `merge`,
-  `prepend`, `deepMerge`, `scroll`, or `always`. Deferred once props
-  (Laravel's `Inertia::defer(...)->once()`) are not implemented.
+  reads `prop` as a dot path. Once props, deferred once props included,
+  cannot be wrapped in `merge`, `prepend`, `deepMerge`, `scroll`, or
+  `always`.
+
+#### Deferred once props
+
+`deferred(context, resolve).once()`, or `deferredGroup(...).once()`, is
+Laravel's `Inertia::defer(...)->once()`: a deferred prop the client keeps
+after loading it. It returns a `DeferredOnce(group, key, Context, resolve)`
+prop, which takes `.as(key)` and `.expiresIn(ms)` like `once`.
+
+```zig
+// Loaded after the first page renders, then reused until it expires.
+.plans = inertia.deferred(store, Plans.load).once().expiresIn(10 * 60 * 1000),
+```
+
+- **Full visits** list it in `deferredProps` and `onceProps` without
+  resolving it. When `X-Inertia-Except-Once-Props` names its key, it is
+  left out of `deferredProps`, so the client does not request it again and
+  carries its value over; the `onceProps` entry stays.
+- **Partial reloads** follow the once rules: the client's deferred reload
+  lists it in `X-Inertia-Partial-Data` and gets a fresh value with its
+  entry, and an except-only reload leaves a held value to the client.
 
 ### Flash
 
@@ -1555,11 +1575,26 @@ value got 204 and cleared it, with no todo added. Server-side rendering
 was driven in Chrome with the React frontend and its `npm run ssr` server:
 the page arrived server-rendered, hydrated with no console messages, and
 the add form worked; with the SSR server stopped or hung, pages fell back
-to client rendering and the failure was logged. The other rows are
-covered by the plugin's unit tests only.
-
-The features not yet implemented are tracked in
-[#80](https://github.com/kamalogudah/zoda/issues/80), with one issue each.
+to client rendering and the failure was logged. The rest of the protocol
+was driven in Chrome in all three frontends. The `limits` once prop came
+with the first page and later visits sent `X-Inertia-Except-Once-Props:
+limits,server` and got no value. The deferred once `about` prop loaded
+after the first page and was neither deferred nor requested again. Hovering
+a filter link prefetched it with `Purpose: prefetch` and the click used
+that response; a change sent with `invalidateCacheTags` made the next
+click fetch the page again. A toggle sent with `only: ['todos', 'stats']`
+got the always prop `remaining` back too. "Show activity" loaded the
+optional `activity` prop, and "Check for new" sent the last id and
+appended only the new entry through `deepMergeProps` and `matchPropsOn`.
+"Refresh counts" sent `X-Inertia-Partial-Except: todos,activity` and
+kept the loaded list and log. An activity link to `/todos/18#todo-18`
+was redirected to `/todos?page=2`, and `preserveFragment` kept
+`#todo-18` in the address bar and scrolled the todo into view. A link
+to a deleted todo got the `Errors/NotFound` page with status 404 after
+one `httpException` event and no error dialog. React's SSR server
+rendered both pages. The `.expiresIn` expiry passing, `deferredGroup`,
+and merge props other than `scroll` and `deepMerge` are covered by the
+plugin's unit tests only.
 
 | Inertia v3 feature | Status |
 | --- | --- |
@@ -1573,18 +1608,19 @@ The features not yet implemented are tracked in
 | 303 after PUT/PATCH/DELETE/POST | Implemented (`redirect`) |
 | Fragment redirects, 409 + `X-Inertia-Redirect` | Implemented (`redirect` with `#`) |
 | External and full-page visits, 409 + `X-Inertia-Location` | Implemented (`location`) |
-| Prefetching (`Purpose: prefetch`) | Not special-cased: a prefetch is an ordinary Inertia GET and gets a full response. Not exercised by the example. |
-| Partial reloads (`X-Inertia-Partial-Data`, `-Component`, `-Except`) | Implemented, top-level names only (dot paths select the whole top-level prop). Driven in a browser through deferred loading (`only`); `except` is covered by unit tests only. |
+| Prefetching (`Purpose: prefetch`) | Not special-cased: a prefetch is an ordinary Inertia GET and gets a full response, so a route that consumes flash or other one-time state consumes it on the prefetch. Driven in a browser through the example's filter links, with `cacheTags` invalidated by each change. |
+| Partial reloads (`X-Inertia-Partial-Data`, `-Component`, `-Except`) | Implemented, top-level names only (dot paths select the whole top-level prop). Driven in a browser through deferred loading and "Show activity" (`only`) and "Refresh counts" (`except`). |
 | Top-level `flash` | Implemented (`renderWith` with `.flash`): `zoda.Flash` messages as `{kind: text}`, consumed once the response is committed and left out when empty. Sent on partial reloads too; the client ignores it only on deferred-props reloads. Driven in a browser through the example's "Todo added" notice. |
-| Optional props (`optional`) and always props (`always`) | Implemented |
-| Deferred props (`deferred`, `deferredGroup`, `deferredProps`) | Implemented, including groups and shared deferred props |
-| Merge props (`merge`, `prepend`, `deepMerge`, `matchOn`; `mergeProps`, `prependProps`, `deepMergeProps`, `matchPropsOn`) | Implemented, including optional, deferred, and shared merge props |
+| Optional props (`optional`) and always props (`always`) | Implemented. Driven in a browser through the example's activity log (`optional`) and remaining count (`always`). |
+| Deferred props (`deferred`, `deferredGroup`, `deferredProps`) | Implemented, including groups and shared deferred props. Driven in a browser through `stats` and `about`; groups are covered by unit tests only. |
+| Merge props (`merge`, `prepend`, `deepMerge`, `matchOn`; `mergeProps`, `prependProps`, `deepMergeProps`, `matchPropsOn`) | Implemented, including optional, deferred, and shared merge props. Driven in a browser through the scroll prop and the activity log's `deepMerge(optional(...)).matchOn("events.id")`. |
 | Reset (`X-Inertia-Reset`) | Implemented: listed props are sent without merge metadata on partial reloads of the rendered component |
 | Scroll props (`scroll`; `scrollProps`, `X-Inertia-Infinite-Scroll-Merge-Intent`) | Implemented: one page of items per response with route-supplied page numbers; the intent picks `mergeProps` or `prependProps`, and `X-Inertia-Reset` sets `reset`. Driven in a browser through the example's paged todo list. |
-| Once props (`once`, `.as(key)`, `.expiresIn(ms)`; `onceProps`, `X-Inertia-Except-Once-Props`) | Implemented: held keys are listed but not resolved, a partial reload that lists the prop in `-Data` always sends it, and `expiresAt` comes from the injected `now_milliseconds` clock. Covered by unit tests only. Deferred once props are not implemented. |
+| Once props (`once`, `.as(key)`, `.expiresIn(ms)`; `onceProps`, `X-Inertia-Except-Once-Props`) | Implemented: held keys are listed but not resolved, a partial reload that lists the prop in `-Data` always sends it, and `expiresAt` comes from the injected `now_milliseconds` clock. Driven in a browser through the example's `limits`. |
 | Error bags (`X-Inertia-Error-Bag`) | Implemented for `redirectWithErrors`: errors nest under the validated bag name. Route-supplied `errors` props are sent as given. Driven in a browser through the example's `createTodo` bag. |
 | History encryption (`encryptHistory`, `clearHistory`) | Implemented: `encrypt_history` (instance) with a per-render override, `.clear_history`, and `clearHistoryOnNextRender` for a page reached through a redirect. Fields are sent only when true. Driven in a browser through the example's "Forget history" button. |
-| `preserveFragment` | Implemented (`renderWith` with `.preserve_fragment`). Covered by unit tests only. |
-| Error pages with a non-200 status | Implemented (`renderWith` with `.status`, 200–299 except 204/205, or 400–599) |
+| Deferred once props (`deferred(...).once()`) | Implemented: listed in `deferredProps` and `onceProps`, and left out of `deferredProps` while the client holds the key. Driven in a browser through the example's `about`. |
+| `preserveFragment` | Implemented (`renderWith` with `.preserve_fragment`). Driven in a browser through the example's activity links, which redirect to the page holding the todo. |
+| Error pages with a non-200 status | Implemented (`renderWith` with `.status`, 200–299 except 204/205, or 400–599). Driven in a browser through the example's 404 page for a deleted todo. |
 | Precognition (`Precognition`, `Precognition-Validate-Only`, `Precognition-Success`) | Implemented (`precognition`, `answerPrecognition`): 422 with the listed fields' `errors` or 204, both with `Precognition: true` and `Vary: Precognition`. Driven in a browser through the example's add form in React. |
 | Server-side rendering (`@inertiajs/*/server`, `@inertiaHead`) | Implemented, opt-in (`ssr`): one bounded POST per full visit with fallback to the client-side shell, reported through `on_ssr_failure`. Linux only. Driven in a browser through the React example with `--ssr`. |

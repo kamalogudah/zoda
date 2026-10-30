@@ -67,6 +67,9 @@
 //!   `X-Inertia-Except-Once-Props` names the key keeps the entry but neither
 //!   resolves nor sends the prop, since the client still holds it, unless a
 //!   partial reload of the component lists it in `X-Inertia-Partial-Data`.
+//!   `deferred(...).once()` is a deferred prop with the same `onceProps`
+//!   entry; a full visit whose header names its key leaves it out of
+//!   `deferredProps`, so the client does not request it again.
 //!
 //! - Flash: `renderWith(..., .{ .flash = .{ .plugin, .session } })` sends the
 //!   messages this request received through `zoda.Flash` as the top-level
@@ -353,10 +356,58 @@ fn Lazy(comptime kind: PropKind, comptime group: []const u8, comptime Context: t
 
         context: Context,
 
+        /// Makes a deferred prop a once prop as well: the client keeps the
+        /// value once it has loaded it, and later visits that say it still
+        /// holds it neither list nor resolve the prop.
+        pub fn once(self: @This()) DeferredOnce(group, null, Context, resolve) {
+            comptime if (kind != .deferred) @compileError("only deferred props have .once()");
+            return .{ .context = self.context };
+        }
+
         fn resolveIn(self: @This(), allocator: std.mem.Allocator) Error!Value {
             return resolve(self.context, allocator);
         }
     };
+}
+
+/// The prop type `deferred(...).once()` and `deferredGroup(...).once()`
+/// return: a deferred prop in `group` that is also listed in `onceProps`,
+/// keyed by `key` or, when it is null, by the prop's name. `key` follows the
+/// `Onceable` rules.
+pub fn DeferredOnce(comptime group: []const u8, comptime key: ?[]const u8, comptime Context: type, comptime resolve: anytype) type {
+    comptime if (key) |k| checkOnceKey(k);
+    const Base = Deferred(group, Context, resolve);
+    return struct {
+        pub const inertia_prop: PropKind = .deferred;
+        pub const inertia_group = group;
+        pub const inertia_once_key = key;
+        pub const inertia_deferred_once = true;
+        pub const Error = Base.Error;
+
+        context: Context,
+        /// Like `Onceable.expires_in_ms`.
+        expires_in_ms: ?u64 = null,
+
+        /// Like `Onceable.as`.
+        pub fn as(self: @This(), comptime new_key: []const u8) DeferredOnce(group, new_key, Context, resolve) {
+            return .{ .context = self.context, .expires_in_ms = self.expires_in_ms };
+        }
+
+        /// Like `Onceable.expiresIn`.
+        pub fn expiresIn(self: @This(), ms: u64) @This() {
+            return .{ .context = self.context, .expires_in_ms = ms };
+        }
+
+        fn resolveIn(self: @This(), allocator: std.mem.Allocator) Error!Base.Resolved {
+            return resolve(self.context, allocator);
+        }
+    };
+}
+
+/// Whether `T` is listed in `onceProps`: a once prop or a deferred once prop.
+fn listsOnce(comptime T: type) bool {
+    if (propKind(T) == .once) return true;
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "inertia_deferred_once");
 }
 
 /// A prop computed only when a partial reload requests it. `allocator` is
@@ -479,7 +530,7 @@ pub fn Mergeable(comptime mode: MergeMode, comptime T: type, comptime match_on: 
     comptime {
         if (mergeMode(T) != null) @compileError("merge props do not nest");
         if (propKind(T) == .always) @compileError("always props cannot be merged");
-        if (propKind(T) == .once) @compileError("once props cannot be merged");
+        if (listsOnce(T)) @compileError("once props cannot be merged");
         checkMatchKeys(mode, match_on);
     }
     return struct {
@@ -578,7 +629,7 @@ pub fn Scrollable(comptime T: type, comptime match_on: []const []const u8) type 
     comptime {
         if (mergeMode(T) != null) @compileError("scroll props do not wrap merge props");
         if (propKind(T) == .always) @compileError("always props cannot be scroll props");
-        if (propKind(T) == .once) @compileError("once props cannot be scroll props");
+        if (listsOnce(T)) @compileError("once props cannot be scroll props");
         checkMatchKeys(.append, match_on);
     }
     return struct {
@@ -1288,7 +1339,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             try writeScroll(json, partial, shared, props, comptime mergeProps(P));
             // Only full visits announce deferred props; a partial reload
             // either resolves them or leaves them to the client.
-            if (partial == null) try writeDeferred(json, shared != null, comptime deferredProps(P));
+            if (partial == null) try writeDeferred(json, once_visit, shared != null, comptime deferredProps(P));
             try writeOnce(json, partial, once_visit, shared, props, comptime onceProps(P));
             if (shared != null) {
                 // v3 carries these props over to instant client-side visits.
@@ -1341,7 +1392,8 @@ pub fn Inertia(comptime SharedProps: type) type {
             json.endObject() catch return error.OutOfMemory;
         }
 
-        const DeferredProp = struct { group: []const u8, name: []const u8, shared: bool };
+        /// `once_key` is set for a deferred once prop.
+        const DeferredProp = struct { group: []const u8, name: []const u8, shared: bool, once_key: ?[]const u8 };
 
         /// The deferred props of a page with route props `P`, shared ones
         /// first, leaving out shared props that a route prop overrides.
@@ -1352,7 +1404,8 @@ pub fn Inertia(comptime SharedProps: type) type {
                     if (propKind(field.type) != .deferred) continue;
                     if (is_shared and @hasField(P, field.name)) continue;
                     checkListedName("deferred", field.name);
-                    found = found ++ .{DeferredProp{ .group = Unmerged(field.type).inertia_group, .name = field.name, .shared = is_shared }};
+                    const once_key: ?[]const u8 = if (listsOnce(field.type)) field.type.inertia_once_key orelse field.name else null;
+                    found = found ++ .{DeferredProp{ .group = Unmerged(field.type).inertia_group, .name = field.name, .shared = is_shared, .once_key = once_key }};
                 }
             }
             return found;
@@ -1379,7 +1432,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             var found: []const OnceProp = &.{};
             for (.{ SharedProps, P }, .{ true, false }) |T, is_shared| {
                 for (std.meta.fields(T)) |field| {
-                    if (propKind(field.type) != .once) continue;
+                    if (!listsOnce(field.type)) continue;
                     if (is_shared and @hasField(P, field.name)) continue;
                     checkListedName("once", field.name);
                     const key = field.type.inertia_once_key orelse field.name;
@@ -1557,7 +1610,9 @@ pub fn Inertia(comptime SharedProps: type) type {
         /// Writes `deferredProps` as `{group: [names]}` in first-seen group
         /// order, leaving out shared props when no shared values are set,
         /// and the whole field when no group has a prop.
-        fn writeDeferred(json: *std.json.Stringify, has_shared: bool, comptime props: []const DeferredProp) error{OutOfMemory}!void {
+        /// Leaves out deferred once props the client still holds, which it
+        /// would otherwise request again.
+        fn writeDeferred(json: *std.json.Stringify, once_visit: OnceVisit, has_shared: bool, comptime props: []const DeferredProp) error{OutOfMemory}!void {
             var started = false;
             inline for (props, 0..) |first, i| {
                 const new_group = comptime for (props[0..i]) |earlier| {
@@ -1567,7 +1622,8 @@ pub fn Inertia(comptime SharedProps: type) type {
                     var opened = false;
                     inline for (props[i..]) |prop| {
                         if (comptime !std.mem.eql(u8, prop.group, first.group)) continue;
-                        if (!prop.shared or has_shared) {
+                        const held = if (prop.once_key) |key| once_visit.holds(null, prop.name, key) else false;
+                        if ((!prop.shared or has_shared) and !held) {
                             if (!started) {
                                 json.objectField("deferredProps") catch return error.OutOfMemory;
                                 json.beginObject() catch return error.OutOfMemory;
@@ -1602,7 +1658,14 @@ pub fn Inertia(comptime SharedProps: type) type {
             switch (kind) {
                 .eager => try writeField(json, name, prop),
                 .always => try writeField(json, name, prop.value),
-                .optional, .deferred => try writeField(json, name, try prop.resolveIn(arena)),
+                .optional => try writeField(json, name, try prop.resolveIn(arena)),
+                .deferred => {
+                    if (comptime listsOnce(@TypeOf(prop))) {
+                        const key = comptime @TypeOf(prop).inertia_once_key orelse name;
+                        if (once_visit.holds(partial, name, key)) return;
+                    }
+                    try writeField(json, name, try prop.resolveIn(arena));
+                },
                 .once => {
                     const key = comptime @TypeOf(prop).inertia_once_key orelse name;
                     if (once_visit.holds(partial, name, key)) return;
@@ -3588,6 +3651,77 @@ test "once callback errors propagate and route props override shared once props"
     defer bare.deinit();
     try unset.render(&req, &bare, "Billing", .{});
     try testing.expectEqualStrings("{\"component\":\"Billing\",\"props\":{\"errors\":{}},\"url\":\"/billing\",\"version\":null}", bare.body);
+}
+
+test "deferred once props load once and are not requested again while held" {
+    var state: OnceTest = .{};
+    const plugin: TestInertia = .{ .layout = test_layout, .now_milliseconds = onceClock };
+    const Page = struct {
+        fn render(p: *const TestInertia, s: *OnceTest, headers: []const router.Header, res: *response.Response) !void {
+            const req = testRequest(.get, "/billing", headers);
+            try p.render(&req, res, "Billing", .{
+                .plans = deferred(s, OnceTest.plans).once(),
+                .rates = deferredGroup("slow", s, OnceTest.rates).once().as("billing.rates").expiresIn(60_000),
+            });
+        }
+    };
+    const entries = "\"onceProps\":{\"plans\":{\"prop\":\"plans\",\"expiresAt\":null},\"billing.rates\":{\"prop\":\"rates\",\"expiresAt\":1700000060000}}";
+
+    // The first visit lists both as deferred and as once props, unresolved.
+    var first = response.Response.init(testing.allocator);
+    defer first.deinit();
+    try Page.render(&plugin, &state, &inertia_headers, &first);
+    try testing.expectEqualStrings(
+        "{\"component\":\"Billing\",\"props\":{\"errors\":{}},\"url\":\"/billing\",\"version\":null," ++
+            "\"deferredProps\":{\"default\":[\"plans\"],\"slow\":[\"rates\"]}," ++ entries ++ "}",
+        first.body,
+    );
+    try testing.expectEqual(@as(usize, 0), state.plans_calls + state.rates_calls);
+
+    // The client's deferred reload resolves the group and lists its entry.
+    var loaded = response.Response.init(testing.allocator);
+    defer loaded.deinit();
+    try Page.render(&plugin, &state, partialHeaders("Billing", &.{.{ .name = "X-Inertia-Partial-Data", .value = "plans" }}), &loaded);
+    try testing.expectEqualStrings(
+        "{\"component\":\"Billing\",\"props\":{\"plans\":[\"free\",\"pro\"],\"errors\":{}},\"url\":\"/billing\",\"version\":null," ++
+            "\"onceProps\":{\"plans\":{\"prop\":\"plans\",\"expiresAt\":null}}}",
+        loaded.body,
+    );
+    try testing.expectEqual(@as(usize, 1), state.plans_calls);
+
+    // Later visits keep the entries but do not defer what the client holds,
+    // so it is not requested again.
+    var held = response.Response.init(testing.allocator);
+    defer held.deinit();
+    try Page.render(&plugin, &state, onceHeaders("plans,billing.rates"), &held);
+    try testing.expectEqualStrings(
+        "{\"component\":\"Billing\",\"props\":{\"errors\":{}},\"url\":\"/billing\",\"version\":null," ++ entries ++ "}",
+        held.body,
+    );
+    var half = response.Response.init(testing.allocator);
+    defer half.deinit();
+    try Page.render(&plugin, &state, onceHeaders("plans"), &half);
+    try testing.expect(std.mem.indexOf(u8, half.body, "\"deferredProps\":{\"slow\":[\"rates\"]},") != null);
+
+    // An except-only reload leaves held values to the client; listing the
+    // prop in `-Data` sends it fresh.
+    var except = response.Response.init(testing.allocator);
+    defer except.deinit();
+    try Page.render(&plugin, &state, partialHeaders("Billing", &.{
+        .{ .name = "X-Inertia-Partial-Except", .value = "title" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "plans,billing.rates" },
+    }), &except);
+    try testing.expect(std.mem.indexOf(u8, except.body, "\"plans\":[") == null);
+    try testing.expect(std.mem.indexOf(u8, except.body, "\"rates\":\"") == null);
+    var fresh = response.Response.init(testing.allocator);
+    defer fresh.deinit();
+    try Page.render(&plugin, &state, partialHeaders("Billing", &.{
+        .{ .name = "X-Inertia-Partial-Data", .value = "plans" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "plans,billing.rates" },
+    }), &fresh);
+    try testing.expect(std.mem.indexOf(u8, fresh.body, "\"plans\":[\"free\",\"pro\"]") != null);
+    try testing.expectEqual(@as(usize, 2), state.plans_calls);
+    try testing.expectEqual(@as(usize, 0), state.rates_calls);
 }
 
 const flash_test_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
