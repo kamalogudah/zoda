@@ -89,6 +89,11 @@ const zoda = b.dependency("zoda", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("zoda", zoda.module("zoda"));
 ```
 
+New to Zoda? [Getting started with Zoda](Getting_started_with_zoda.md) walks
+through a notes app step by step: a plain JSON and HTML server, then a React
+front end through Inertia, then sessions, CSRF, flash messages, and other
+plugins working together.
+
 ## Usage
 
 ### Todo example
