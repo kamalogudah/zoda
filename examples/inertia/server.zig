@@ -18,6 +18,14 @@
 //! the session, which the Inertia client sends back as `X-XSRF-TOKEN` on
 //! each change, and every change is refused without it.
 //!
+//! The page also shows the rest of the protocol: the input limits are a once
+//! prop, the server details a deferred once prop, the activity log an
+//! optional deep-merge prop loaded on demand, the remaining count an always
+//! prop, and "Refresh counts" an `except` reload. Activity entries link to
+//! `/todos/<id>#todo-<id>`, which redirects to the page holding the todo and
+//! keeps the fragment through `preserveFragment`, or renders a 404 page for
+//! a deleted one. Filter links are prefetched on hover.
+//!
 //! With `--ssr` (React only), full visits are rendered on the server first:
 //!
 //!     (cd examples/inertia/react && npm run ssr)   # SSR server on :13714
@@ -26,7 +34,9 @@
 //! If the SSR server is down or slow, pages fall back to client rendering
 //! and the failure is logged.
 const std = @import("std");
+const builtin = @import("builtin");
 const zoda = @import("zoda");
+const inertia_props = zoda.plugins.inertia;
 const csrf = zoda.plugins.csrf;
 
 pub const Todo = struct {
@@ -41,6 +51,18 @@ pub const max_text_bytes = 200;
 pub const per_page = 10;
 /// Sample todos `main` adds, enough for a few pages.
 pub const sample_count = 25;
+/// Activity entries the store keeps; older ones are dropped.
+pub const max_events = 50;
+/// Entries the activity log shows when it is first opened.
+pub const recent_events = 10;
+
+/// One change to the list, for the activity log. `todo` is the id of the
+/// todo it changed, which may since have been deleted.
+pub const Event = struct {
+    id: u64,
+    todo: u64,
+    text: []const u8,
+};
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -48,10 +70,16 @@ pub const Store = struct {
     mutex: std.Io.Mutex = .init,
     items: std.ArrayList(Todo) = .empty,
     next_id: u64 = 1,
+    events: std.ArrayList(Event) = .empty,
+    next_event: u64 = 1,
+    /// When the server started, in Unix milliseconds, for the `about` prop.
+    started_ms: i64 = 0,
 
     pub fn deinit(self: *Store) void {
         for (self.items.items) |item| self.allocator.free(item.text);
         self.items.deinit(self.allocator);
+        for (self.events.items) |event| self.allocator.free(event.text);
+        self.events.deinit(self.allocator);
     }
 
     fn add(self: *Store, text: []const u8) !u64 {
@@ -59,16 +87,19 @@ pub const Store = struct {
         errdefer self.allocator.free(owned);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.items.append(self.allocator, .{ .id = self.next_id, .text = owned });
+        try self.items.ensureUnusedCapacity(self.allocator, 1);
+        try self.record(self.next_id, "Added", text);
+        self.items.appendAssumeCapacity(.{ .id = self.next_id, .text = owned });
         self.next_id += 1;
         return self.next_id - 1;
     }
 
-    fn toggle(self: *Store, id: u64) bool {
+    fn toggle(self: *Store, id: u64) !bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.items.items) |*item| {
             if (item.id == id) {
+                try self.record(id, if (item.done) "Reopened" else "Completed", item.text);
                 item.done = !item.done;
                 return true;
             }
@@ -76,17 +107,38 @@ pub const Store = struct {
         return false;
     }
 
-    fn delete(self: *Store, id: u64) bool {
+    fn delete(self: *Store, id: u64) !bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.items.items, 0..) |item, i| {
             if (item.id == id) {
+                try self.record(id, "Deleted", item.text);
                 self.allocator.free(item.text);
                 _ = self.items.orderedRemove(i);
                 return true;
             }
         }
         return false;
+    }
+
+    /// Appends an activity entry, dropping the oldest past `max_events`.
+    /// Called with the lock held.
+    fn record(self: *Store, todo: u64, verb: []const u8, text: []const u8) !void {
+        const line = try std.fmt.allocPrint(self.allocator, "{s} \"{s}\"", .{ verb, text });
+        errdefer self.allocator.free(line);
+        try self.events.append(self.allocator, .{ .id = self.next_event, .todo = todo, .text = line });
+        self.next_event += 1;
+        if (self.events.items.len > max_events) self.allocator.free(self.events.orderedRemove(0).text);
+    }
+
+    /// The page of the unfiltered, newest-first list that holds `id`.
+    fn pageOf(self: *Store, id: u64) ?u32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.items.items, 0..) |item, i| {
+            if (item.id == id) return @intCast((self.items.items.len - 1 - i) / per_page + 1);
+        }
+        return null;
     }
 };
 
@@ -101,6 +153,52 @@ pub const Stats = struct {
         var done: usize = 0;
         for (store.items.items) |todo| done += @intFromBool(todo.done);
         return .{ .total = store.items.items.len, .done = done };
+    }
+};
+
+/// Limits the add form shows. A once prop: they never change while the
+/// server runs, so the client keeps them after the first page.
+pub const Limits = struct {
+    max_text_bytes: usize = max_text_bytes,
+    per_page: usize = per_page,
+
+    fn get(_: void, _: std.mem.Allocator) Limits {
+        return .{};
+    }
+};
+
+/// Server details for the footer. A deferred once prop: it stands in for
+/// something slow to compute that rarely changes, so the client loads it
+/// after the page renders and then keeps it for a few minutes.
+pub const About = struct {
+    zig: []const u8,
+    started_ms: i64,
+
+    fn get(store: *Store, _: std.mem.Allocator) About {
+        return .{ .zig = builtin.zig_version_string, .started_ms = store.started_ms };
+    }
+};
+
+/// The activity log: the entries after `after`, or the latest
+/// `recent_events` when `after` is 0, and how many changes there have been.
+/// An optional prop deep-merged on the client, so each check appends only
+/// the new entries to `events`, matched on `id`, and replaces `total`.
+pub const Activity = struct {
+    events: []const Event,
+    total: u64,
+
+    const Query = struct { store: *Store, after: u64 };
+
+    /// Runs inside `render`, which `renderIndex` calls with the store lock
+    /// held; the entries are borrowed until the page is serialized.
+    fn get(query: Query, _: std.mem.Allocator) Activity {
+        const events = query.store.events.items;
+        const start = if (query.after == 0)
+            events.len -| recent_events
+        else for (events, 0..) |event, i| {
+            if (event.id > query.after) break i;
+        } else events.len;
+        return .{ .events = events[start..], .total = query.store.next_event - 1 };
     }
 };
 
@@ -179,8 +277,9 @@ pub fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.R
     const id = req.onInt(u64) orelse return;
     if (!req.isRoot()) return;
     const found = switch (req.method) {
-        .patch => store.toggle(id),
-        .delete => store.delete(id),
+        .get => return showTodo(ctx, req, res, id),
+        .patch => try store.toggle(id),
+        .delete => try store.delete(id),
         else => return,
     };
     if (!found) return res.text(404, "Todo not found");
@@ -228,6 +327,28 @@ fn forgetHistory(
     return ctx.plugins.inertia.redirect(req, res, backTo(filter));
 }
 
+/// A link to one todo, `/todos/<id>#todo-<id>` from the activity log:
+/// redirects to the unfiltered page that holds it, or renders a 404 page
+/// when it has been deleted. XHR drops the requested fragment when it follows
+/// the redirect; the page it lands on sends `preserveFragment`, so the client
+/// puts it back and scrolls to the todo.
+fn showTodo(
+    ctx: *App.Context,
+    req: *zoda.router.Request,
+    res: *zoda.response.Response,
+    id: u64,
+) !void {
+    const inertia = &ctx.plugins.inertia;
+    const page = ctx.plugins.store.value.pageOf(id) orelse {
+        // An Inertia page with status 404: the v3 client fires its
+        // `httpException` event and then shows it instead of a dialog.
+        return inertia.renderWith(req, res, "Errors/NotFound", .{ .id = id }, .{ .status = 404 });
+    };
+    if (page == 1) return inertia.redirect(req, res, "/todos");
+    var buffer: [32]u8 = undefined;
+    return inertia.redirect(req, res, try std.fmt.bufPrint(&buffer, "/todos?page={d}", .{page}));
+}
+
 fn renderIndex(
     ctx: *App.Context,
     req: *zoda.router.Request,
@@ -273,8 +394,20 @@ fn renderIndex(
             .current = page,
         }).matchOn("id"),
         .filter = filter,
-        .remaining = remaining,
-        .stats = zoda.plugins.inertia.deferred(store, Stats.compute),
+        // Sent on every reload, even one that asks only for other props, so
+        // the count never goes stale.
+        .remaining = inertia_props.always(remaining),
+        .stats = inertia_props.deferred(store, Stats.compute),
+        // Resolved on the first visit; later visits say the client holds it.
+        .limits = inertia_props.once({}, Limits.get),
+        // Loaded right after the first page, then kept for five minutes
+        // under the key "server".
+        .about = inertia_props.deferred(store, About.get).once().as("server").expiresIn(5 * 60 * 1000),
+        // Only sent when "Show activity" asks for it.
+        .activity = inertia_props.deepMerge(inertia_props.optional(
+            Activity.Query{ .store = store, .after = activityAfter(req) },
+            Activity.get,
+        )).matchOn("events.id"),
     };
     const session = &ctx.state.sessions;
     // The first page of a session creates its token, which the save below
@@ -287,6 +420,8 @@ fn renderIndex(
     // that, so they are sent once.
     try ctx.plugins.inertia.renderWith(req, res, "Todos/Index", props, .{
         .flash = .{ .plugin = &ctx.plugins.flash, .session = session },
+        // Keeps the `#todo-<id>` of a link that `showTodo` redirected here.
+        .preserve_fragment = true,
     });
     return ctx.plugins.sessions.save(session, res);
 }
@@ -297,6 +432,13 @@ fn parsePage(req: *const zoda.router.Request) u32 {
     const value = (req.getOne("page") catch null) orelse return 1;
     const page = std.fmt.parseInt(u32, value, 10) catch return 1;
     return @max(page, 1);
+}
+
+/// `X-Activity-After`, the id of the last activity entry the client has, which
+/// "Check for new" sends; 0 when absent or malformed.
+fn activityAfter(req: *const zoda.router.Request) u64 {
+    const value = (req.getHeaderOne("X-Activity-After") catch null) orelse return 0;
+    return std.fmt.parseInt(u64, value, 10) catch 0;
 }
 
 fn parseFilter(req: *const zoda.router.Request) Filter {
@@ -321,6 +463,11 @@ var clock_io: std.Io = undefined;
 
 fn unixSeconds() i64 {
     return std.Io.Clock.real.now(clock_io).toSeconds();
+}
+
+/// The once-prop clock, for `expiresAt`.
+fn unixMilliseconds() i64 {
+    return std.Io.Clock.real.now(clock_io).toMilliseconds();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -369,7 +516,7 @@ pub fn main(init: std.process.Init) !void {
     var secret: [32]u8 = undefined;
     try std.Io.randomSecure(io, &secret);
 
-    var store = Store{ .allocator = allocator, .io = io };
+    var store = Store{ .allocator = allocator, .io = io, .started_ms = unixMilliseconds() };
     defer store.deinit();
     for (1..sample_count + 1) |n| {
         var text: [32]u8 = undefined;
@@ -392,6 +539,7 @@ pub fn main(init: std.process.Init) !void {
                 // The client encrypts with Web Crypto, which needs HTTPS or
                 // localhost, where this example runs.
                 .encrypt_history = true,
+                .now_milliseconds = unixMilliseconds,
                 // `npm run ssr` listens on the default 127.0.0.1:13714.
                 .ssr = if (ssr) .{ .timeout_ms = 500 } else null,
                 .on_ssr_failure = logSsrFailure,
@@ -420,11 +568,15 @@ fn testClock() i64 {
     return 1000;
 }
 
+fn testMilliseconds() i64 {
+    return 1_000_000;
+}
+
 fn testApp(store: *Store) !App {
     return App.init(std.testing.allocator, .{
         .response_allocator = std.testing.allocator,
         .plugins = .{
-            .inertia = .{ .layout = layout, .version = .{ .value = "v1" }, .shared = .{ .value = .{ .app = "Zoda", .framework = "test" } }, .encrypt_history = true },
+            .inertia = .{ .layout = layout, .version = .{ .value = "v1" }, .shared = .{ .value = .{ .app = "Zoda", .framework = "test" } }, .encrypt_history = true, .now_milliseconds = testMilliseconds },
             .sessions = .{ .keys = &.{.{ .id = 1, .secret = "x" ** 32 }}, .lifetime_seconds = 300, .now_seconds = testClock },
             .store = .{ .value = store },
         },
@@ -499,7 +651,7 @@ test "first visit renders the HTML shell with the page object" {
     try std.testing.expectEqual(@as(u16, 200), page.status_code);
     try std.testing.expect(std.mem.indexOf(u8, page.body, "<script type=\"module\" src=\"/assets/app.js\"></script>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page.body,
-        \\<script data-page="app" type="application/json">{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[],"filter":"all","remaining":0,"errors":{}},"url":"/todos","version":"v1","encryptHistory":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}</script><div id="app"></div>
+        \\<script data-page="app" type="application/json">{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[],"filter":"all","remaining":0,"limits":{"max_text_bytes":200,"per_page":10},"errors":{}},"url":"/todos","version":"v1","encryptHistory":true,"preserveFragment":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats","about"]},"onceProps":{"limits":{"prop":"limits","expiresAt":null},"server":{"prop":"about","expiresAt":1300000}},"sharedProps":["app","framework"]}</script><div id="app"></div>
     ) != null);
 }
 
@@ -527,7 +679,7 @@ test "Inertia visits add, toggle, filter, and delete todos" {
     defer active.deinit();
     try std.testing.expectEqualStrings("true", (try active.getHeaderOne("X-Inertia")).?);
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[{"id":2,"text":"Walk <dog>","done":false}],"filter":"active","remaining":1,"errors":{}},"url":"/todos?filter=active","version":"v1","encryptHistory":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[{"id":2,"text":"Walk <dog>","done":false}],"filter":"active","remaining":1,"limits":{"max_text_bytes":200,"per_page":10},"errors":{}},"url":"/todos?filter=active","version":"v1","encryptHistory":true,"preserveFragment":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats","about"]},"onceProps":{"limits":{"prop":"limits","expiresAt":null},"server":{"prop":"about","expiresAt":1300000}},"sharedProps":["app","framework"]}
     , active.body);
 
     var deleted = try visit(&app, .delete, "/todos/2", &browser.with(inertia_json), "");
@@ -698,7 +850,7 @@ test "precognitive posts validate the todo without adding it" {
     try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
 }
 
-test "router.reload({ only: ['todos'] }) returns only todos and errors" {
+test "router.reload({ only: ['todos'] }) returns todos and the always props" {
     var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer store.deinit();
     var app = try testApp(&store);
@@ -715,7 +867,7 @@ test "router.reload({ only: ['todos'] }) returns only todos and errors" {
     var partial = try visit(&app, .get, "/todos", &reload, "");
     defer partial.deinit();
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"todos":[{"id":1,"text":"Buy milk","done":false}],"errors":{}},"url":"/todos","version":"v1","encryptHistory":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"todos":[{"id":1,"text":"Buy milk","done":false}],"remaining":1,"errors":{}},"url":"/todos","version":"v1","encryptHistory":true,"preserveFragment":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"sharedProps":["app","framework"]}
     , partial.body);
 
     const bad = [_]zoda.request.Header{
@@ -733,13 +885,13 @@ test "the client loads deferred stats with a partial reload" {
     defer app.deinit();
     _ = try store.add("Buy milk");
     _ = try store.add("Walk dog");
-    _ = store.toggle(1);
+    _ = try store.toggle(1);
 
     // The first response lists `stats` instead of sending it.
     var page = try visit(&app, .get, "/todos?filter=active", &inertia_get, "");
     defer page.deinit();
     try std.testing.expect(std.mem.indexOf(u8, page.body, "\"stats\":") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page.body, "\"deferredProps\":{\"default\":[\"stats\"]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page.body, "\"deferredProps\":{\"default\":[\"stats\",\"about\"]}") != null);
 
     // What `<Deferred data="stats">` makes the client send next.
     const reload = [_]zoda.request.Header{
@@ -751,7 +903,7 @@ test "the client loads deferred stats with a partial reload" {
     var stats = try visit(&app, .get, "/todos?filter=active", &reload, "");
     defer stats.deinit();
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"stats":{"total":2,"done":1},"errors":{}},"url":"/todos?filter=active","version":"v1","encryptHistory":true,"sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"remaining":1,"stats":{"total":2,"done":1},"errors":{}},"url":"/todos?filter=active","version":"v1","encryptHistory":true,"preserveFragment":true,"sharedProps":["app","framework"]}
     , stats.body);
 }
 
@@ -781,7 +933,7 @@ test "<InfiniteScroll> pages through todos newest first and resets after a chang
     var second = try visit(&app, .get, "/todos?page=2", &more, "");
     defer second.deinit();
     try std.testing.expectEqualStrings(
-        \\{"component":"Todos/Index","props":{"todos":[{"id":2,"text":"x","done":false},{"id":1,"text":"x","done":false}],"errors":{}},"url":"/todos?page=2","version":"v1","encryptHistory":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":1,"nextPage":null,"currentPage":2,"reset":false}},"sharedProps":["app","framework"]}
+        \\{"component":"Todos/Index","props":{"todos":[{"id":2,"text":"x","done":false},{"id":1,"text":"x","done":false}],"remaining":12,"errors":{}},"url":"/todos?page=2","version":"v1","encryptHistory":true,"preserveFragment":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":1,"nextPage":null,"currentPage":2,"reset":false}},"sharedProps":["app","framework"]}
     , second.body);
 
     // Opening `?page=2` directly, then "Show earlier", prepends page 1. A
@@ -817,6 +969,137 @@ test "<InfiniteScroll> pages through todos newest first and resets after a chang
     try std.testing.expect(std.mem.indexOf(u8, back.body, "\"remaining\":11,\"stats\":{\"total\":12,\"done\":1},\"errors\":{}},") != null);
     try std.testing.expect(std.mem.indexOf(u8, back.body, "\"mergeProps\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, back.body, "\"nextPage\":2,\"currentPage\":1,\"reset\":true") != null);
+}
+
+test "once and deferred once props are sent until the client holds them" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+
+    const entries = "\"onceProps\":{\"limits\":{\"prop\":\"limits\",\"expiresAt\":null},\"server\":{\"prop\":\"about\",\"expiresAt\":1300000}}";
+    var first = try visit(&app, .get, "/todos", &inertia_get, "");
+    defer first.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, first.body, "\"limits\":{\"max_text_bytes\":200,\"per_page\":10}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.body, "\"deferredProps\":{\"default\":[\"stats\",\"about\"]}," ++ entries) != null);
+
+    // The deferred reload `<Deferred data="about">` makes, both props in
+    // the "default" group.
+    const deferred = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "stats,about" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "limits" },
+    };
+    var loaded = try visit(&app, .get, "/todos", &deferred, "");
+    defer loaded.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, loaded.body, "\"about\":{\"zig\":\"" ++ builtin.zig_version_string ++ "\",\"started_ms\":0}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded.body, "\"onceProps\":{\"server\":{\"prop\":\"about\",\"expiresAt\":1300000}}") != null);
+
+    // Later visits, while the client holds both: neither is sent, `about`
+    // is not deferred again, and the entries stay.
+    const later = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "limits,server" },
+    };
+    var held = try visit(&app, .get, "/todos?filter=done", &later, "");
+    defer held.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, held.body, "\"limits\":{\"max") == null);
+    try std.testing.expect(std.mem.indexOf(u8, held.body, "\"deferredProps\":{\"default\":[\"stats\"]}," ++ entries) != null);
+}
+
+test "the activity log loads on demand and deep-merges only new entries" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+    _ = try store.add("Buy milk");
+    _ = try store.add("Walk dog");
+    _ = try store.toggle(1);
+
+    var page = try visit(&app, .get, "/todos", &inertia_get, "");
+    defer page.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, page.body, "activity") == null);
+
+    // "Show activity": `router.reload({ only: ['activity'] })`. The
+    // always prop `remaining` comes along.
+    const show = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Data", .value = "activity" },
+    };
+    var shown = try visit(&app, .get, "/todos", &show, "");
+    defer shown.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, shown.body,
+        \\{"component":"Todos/Index","props":{"remaining":1,"activity":{"events":[{"id":1,"todo":1,"text":"Added \"Buy milk\""},{"id":2,"todo":2,"text":"Added \"Walk dog\""},{"id":3,"todo":1,"text":"Completed \"Buy milk\""}],"total":3},"errors":{}}
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, shown.body, "\"deepMergeProps\":[\"activity\"],\"matchPropsOn\":[\"activity.events.id\"]") != null);
+
+    // "Check for new" sends the last id it has and gets only what follows.
+    _ = try store.delete(2);
+    const check = show ++ [_]zoda.request.Header{.{ .name = "X-Activity-After", .value = "3" }};
+    var newer = try visit(&app, .get, "/todos", &check, "");
+    defer newer.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, newer.body,
+        \\"activity":{"events":[{"id":4,"todo":2,"text":"Deleted \"Walk dog\""}],"total":4}
+    ) != null);
+
+    // Opened fresh, the log starts at the latest `recent_events`.
+    for (0..recent_events) |_| _ = try store.add("x");
+    var recent = try visit(&app, .get, "/todos", &show, "");
+    defer recent.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, recent.body, "\"events\":[{\"id\":5,") != null);
+
+    // "Refresh counts": `router.reload({ except: ['todos', 'activity'] })`
+    // while the client holds the once props.
+    const refresh = [_]zoda.request.Header{
+        .{ .name = "X-Inertia", .value = "true" },
+        .{ .name = "X-Inertia-Version", .value = "v1" },
+        .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" },
+        .{ .name = "X-Inertia-Partial-Except", .value = "todos,activity" },
+        .{ .name = "X-Inertia-Except-Once-Props", .value = "limits,server" },
+    };
+    var counts = try visit(&app, .get, "/todos", &refresh, "");
+    defer counts.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, counts.body,
+        \\"props":{"app":"Zoda","framework":"test","filter":"all","remaining":10,"stats":{"total":11,"done":1},"errors":{}}
+    ) != null);
+}
+
+test "todo links redirect to the page holding the todo, or show a 404 page" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+    var browser = try Browser.open(&app);
+    for (0..per_page + 2) |_| _ = try store.add("x");
+
+    // `<Link href="/todos/1#todo-1">`: the client keeps the fragment
+    // through the page's `preserveFragment`.
+    var oldest = try visit(&app, .get, "/todos/1", &inertia_get, "");
+    defer oldest.deinit();
+    try std.testing.expectEqual(@as(u16, 302), oldest.status_code);
+    try std.testing.expectEqualStrings("/todos?page=2", (try oldest.getHeaderOne("Location")).?);
+    var newest = try visit(&app, .get, "/todos/12", &inertia_get, "");
+    defer newest.deinit();
+    try std.testing.expectEqualStrings("/todos", (try newest.getHeaderOne("Location")).?);
+
+    var deleted = try visit(&app, .delete, "/todos/1", &browser.with(inertia_json), "");
+    defer deleted.deinit();
+    var gone = try visit(&app, .get, "/todos/1", &inertia_get, "");
+    defer gone.deinit();
+    try std.testing.expectEqual(@as(u16, 404), gone.status_code);
+    try std.testing.expectEqualStrings("true", (try gone.getHeaderOne("X-Inertia")).?);
+    try std.testing.expectEqualStrings(
+        \\{"component":"Errors/NotFound","props":{"app":"Zoda","framework":"test","id":1,"errors":{}},"url":"/todos/1","version":"v1","encryptHistory":true,"sharedProps":["app","framework"]}
+    , gone.body);
+    var html = try visit(&app, .get, "/todos/1", &.{}, "");
+    defer html.deinit();
+    try std.testing.expectEqual(@as(u16, 404), html.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, html.body, "\"component\":\"Errors/NotFound\"") != null);
 }
 
 /// The session cookie a response sets, without its attributes.

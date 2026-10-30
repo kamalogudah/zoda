@@ -59,6 +59,7 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
 | --- | --- | --- |
 | `GET /` | redirect | 302 to `/todos` |
 | `GET /todos[?filter=active\|done][&page=n]` | `render("Todos/Index", …)` | HTML shell on the first visit, the page JSON on Inertia visits; 10 todos per page, newest first |
+| `GET /todos/:id` | show | 302 to the unfiltered page holding the todo, or the `Errors/NotFound` page with 404 |
 | `POST /todos` with `{"text": "…"}` | add | flash "Todo added", then back to the current filter at `#todo-<id>`; or store `errors.text` and 303 back to the current filter |
 | `POST /todos` with `Precognition: true` | validate only | 422 with `errors.text`, or 204; nothing is added |
 | `PATCH /todos/:id` | toggle | 303 back |
@@ -102,15 +103,53 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   `aria-invalid`. Type some spaces and click away to see it.
 - **Partial reloads.** `router.reload({ only: ['todos'] })` sends
   `X-Inertia-Partial-Component: Todos/Index` and
-  `X-Inertia-Partial-Data: todos`, and the server answers with only `todos`
-  and `errors`; the client keeps its other props. The page component has no
-  reload button, but the server test below sends exactly those headers.
+  `X-Inertia-Partial-Data: todos`, and the server answers with only `todos`,
+  the always prop `remaining`, and `errors`; the client keeps its other
+  props. "Refresh counts" is the other way round:
+  `router.reload({ except: ['todos', 'activity'] })` sends
+  `X-Inertia-Partial-Except`, and gets every prop but those two, so the
+  pages of todos and the activity log already loaded stay as they are.
+- **Always props.** `remaining` is `zoda.plugins.inertia.always(...)`, so
+  every reload sends it, even one whose `only` leaves it out. Mutations
+  ask for `only: ['todos', 'stats']` and still get a fresh count.
 - **Deferred props.** The footer's "1 of 2 done" comes from `stats`, a
   `zoda.plugins.inertia.deferred` prop. Every full page response leaves it
   out and lists it as `deferredProps: {"default": ["stats"]}`; the client
   then requests it with `X-Inertia-Partial-Data: stats` and the page's
   `<Deferred data="stats">` shows "counting…" until it arrives. The counts
   are cheap here; a real app would defer a slow query.
+- **Once props.** `limits` (the input size and page size shown under the
+  form) is `zoda.plugins.inertia.once(...)`. The first page sends it and
+  lists it in `onceProps`; from then on the client sends
+  `X-Inertia-Except-Once-Props: limits,server`, and the server lists the
+  entry without resolving or sending the value, which the client keeps.
+- **Deferred once props.** The footer's "Served by Zig …" comes from
+  `about`, a `deferred(...).once().as("server").expiresIn(5 * 60 * 1000)`
+  prop. The first page defers it under the key `server` with an
+  `expiresAt` from the server's clock. While the client holds it, later
+  pages leave it out of `deferredProps`, so it is not requested again;
+  after five minutes the client drops the key and the next page loads it
+  afresh.
+- **Activity log.** "Show activity" calls
+  `router.reload({ only: ['activity'] })`. `activity` is an optional prop,
+  so no other response has it, wrapped in `deepMerge(...)` with
+  `.matchOn("events.id")`. "Check for new" sends the last entry's id in an
+  `X-Activity-After` header and the server answers with only the entries
+  after it and the new `total`; the client deep-merges them, appending to
+  `events` and replacing `total`. The store keeps the last 50 entries, and
+  a log opened fresh starts at the latest 10.
+- **Fragments.** Each activity entry links to `/todos/<id>#todo-<id>`. The
+  route redirects to the unfiltered page that holds the todo, and XHR
+  drops the fragment when it follows the redirect, so every list page is
+  rendered with `preserve_fragment`: the client puts the requested
+  `#todo-<id>` back and scrolls the todo into view. A deleted todo's link
+  renders `Errors/NotFound` with status 404 through `renderWith`; the
+  client fires its `httpException` event and shows that page.
+- **Prefetching.** The filter links are `<Link prefetch cacheTags="todos">`:
+  hovering one fetches its page with `Purpose: prefetch`, an ordinary
+  Inertia GET for the server, and the click shows it without waiting.
+  Every change posts with `invalidateCacheTags: ['todos']`, so a filter
+  page prefetched before it is fetched again.
 - **Infinite scroll.** `todos` is a `zoda.plugins.inertia.scroll` prop:
   the route reads `?page=`, sends that page of ten (newest first, so a new
   todo is on page 1), and says which pages are before and after it. The
@@ -122,7 +161,7 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   `?page=` into the address bar. Reload the page there and it opens on that
   page with "Show earlier", which sends `prepend` and puts the earlier page
   above. Mutations keep the page component mounted, so they send
-  `only: ['todos', 'remaining', 'stats']` and `reset: ['todos']`; the reply
+  `only: ['todos', 'stats']` and `reset: ['todos']`; the reply
   has `scrollProps.todos.reset: true`, and the list starts again at page 1.
   Filter links are plain GET visits, which remount the page, so they need
   no reset. Drop `manual` to load pages as you scroll instead.
@@ -172,5 +211,8 @@ They cover the HTML shell, the JSON page, add, toggle, filter, and delete,
 redirect-back validation errors in the `createTodo` bag shown once, the version conflict, a partial reload of `todos`,
 loading the deferred `stats`, paging `todos` forward, backward, and
 after a reset, the "Todo added" flash shown once, "Forget history"
-sending `clearHistory` once, and precognitive posts answered with 422 or
-204 without adding a todo.
+sending `clearHistory` once, precognitive posts answered with 422 or
+204 without adding a todo, the once and deferred once props skipped while
+the client holds them, the activity log loaded on demand and checked for
+new entries, the `except` reload, and todo links that redirect or render
+the 404 page.
