@@ -14,7 +14,9 @@
 //! the client to encrypt the copy it keeps in browser history, and "Forget
 //! history" redirects to a page that clears it. The add form validates as you
 //! type through Inertia's precognition support, which the same route answers
-//! without adding anything.
+//! without adding anything. Every page sets an `XSRF-TOKEN` cookie bound to
+//! the session, which the Inertia client sends back as `X-XSRF-TOKEN` on
+//! each change, and every change is refused without it.
 //!
 //! With `--ssr` (React only), full visits are rendered on the server first:
 //!
@@ -25,6 +27,7 @@
 //! and the failure is logged.
 const std = @import("std");
 const zoda = @import("zoda");
+const csrf = zoda.plugins.csrf;
 
 pub const Todo = struct {
     id: u64,
@@ -131,6 +134,12 @@ pub const layout =
 
 pub fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
     const inertia = &ctx.plugins.inertia;
+    // Every change, precognitive validation included, must carry the token
+    // from the `XSRF-TOKEN` cookie, which only script on this origin can
+    // read. The check comes before the body is parsed.
+    if (req.method != .get and req.method != .head and !csrf.validHeader(req, &ctx.state.sessions, csrf.xsrf_header_name)) {
+        return res.text(403, "Missing or stale CSRF token; reload the page.");
+    }
     if (req.isRoot() and req.isGet()) return inertia.redirect(req, res, "/todos");
     const filter = parseFilter(req);
     if (req.onLiteral("history")) {
@@ -268,6 +277,10 @@ fn renderIndex(
         .stats = zoda.plugins.inertia.deferred(store, Stats.compute),
     };
     const session = &ctx.state.sessions;
+    // The first page of a session creates its token, which the save below
+    // persists. The cookie is set on every page, so a browser that lost it
+    // gets it back with the next visit.
+    try csrf.setXsrfCookie(res, try csrf.token(store.io, session));
     // Sends pending flash messages as the page's `flash`, stored validation
     // errors as `errors` (`{}` when there are none), and a pending history
     // clear as `clearHistory`, and marks them read; the save below persists
@@ -348,9 +361,10 @@ pub fn main(init: std.process.Init) !void {
     std.crypto.hash.sha2.Sha256.hash(bundle, &digest, .{});
     const version = std.fmt.bytesToHex(digest[0..8], .lower);
 
-    // Sessions only carry flash messages and validation errors here, so a
-    // fresh key per run is enough: a restart just drops pending ones. A real app loads a
-    // stable secret from its configuration.
+    // Sessions only carry flash messages, validation errors, and the CSRF
+    // secret here, so a fresh key per run is enough: a restart drops pending
+    // messages, and an open tab's next change is refused until it reloads.
+    // A real app loads a stable secret from its configuration.
     clock_io = io;
     var secret: [32]u8 = undefined;
     try std.Io.randomSecure(io, &secret);
@@ -427,6 +441,39 @@ const inertia_json = [_]zoda.request.Header{
     .{ .name = "Content-Type", .value = "application/json" },
 };
 
+/// What a browser holds after its first page: the session cookie and the
+/// `XSRF-TOKEN` value the Inertia client copies into `X-XSRF-TOKEN`.
+const Browser = struct {
+    cookie_buffer: [4096]u8 = undefined,
+    cookie_len: usize = 0,
+    token: [csrf.token_bytes]u8 = undefined,
+
+    fn open(app: *const App) !Browser {
+        var page = try visit(app, .get, "/todos", &.{}, "");
+        defer page.deinit();
+        var browser: Browser = .{};
+        const session = sessionCookie(&page).?;
+        @memcpy(browser.cookie_buffer[0..session.len], session);
+        browser.cookie_len = session.len;
+        const xsrf = setCookie(&page, csrf.xsrf_cookie_name).?;
+        @memcpy(&browser.token, xsrf[csrf.xsrf_cookie_name.len + 1 ..]);
+        return browser;
+    }
+
+    fn cookie(self: *const Browser) []const u8 {
+        return self.cookie_buffer[0..self.cookie_len];
+    }
+
+    /// `headers` plus the session cookie and the CSRF header.
+    fn with(self: *const Browser, headers: anytype) [headers.len + 2]zoda.request.Header {
+        var out: [headers.len + 2]zoda.request.Header = undefined;
+        @memcpy(out[0..headers.len], &headers);
+        out[headers.len] = .{ .name = "Cookie", .value = self.cookie() };
+        out[headers.len + 1] = .{ .name = csrf.xsrf_header_name, .value = &self.token };
+        return out;
+    }
+};
+
 fn visit(app: *const App, method: zoda.router.Method, target: []const u8, headers: []const zoda.request.Header, body: []const u8) !zoda.response.Response {
     var arena = try zoda.request.parseOriginForm(std.testing.allocator, .default, target);
     defer arena.deinit();
@@ -461,16 +508,17 @@ test "Inertia visits add, toggle, filter, and delete todos" {
     defer store.deinit();
     var app = try testApp(&store);
     defer app.deinit();
+    var browser = try Browser.open(&app);
 
-    var created = try visit(&app, .post, "/todos", &inertia_json, "{\"text\":\"  Buy milk  \"}");
+    var created = try visit(&app, .post, "/todos", &browser.with(inertia_json), "{\"text\":\"  Buy milk  \"}");
     defer created.deinit();
     try std.testing.expectEqual(@as(u16, 409), created.status_code);
     try std.testing.expectEqualStrings("/todos#todo-1", (try created.getHeaderOne("X-Inertia-Redirect")).?);
-    var second = try visit(&app, .post, "/todos?filter=active", &inertia_json, "{\"text\":\"Walk <dog>\"}");
+    var second = try visit(&app, .post, "/todos?filter=active", &browser.with(inertia_json), "{\"text\":\"Walk <dog>\"}");
     defer second.deinit();
     try std.testing.expectEqualStrings("/todos?filter=active#todo-2", (try second.getHeaderOne("X-Inertia-Redirect")).?);
 
-    var toggled = try visit(&app, .patch, "/todos/1?filter=done", &inertia_json, "{}");
+    var toggled = try visit(&app, .patch, "/todos/1?filter=done", &browser.with(inertia_json), "{}");
     defer toggled.deinit();
     try std.testing.expectEqual(@as(u16, 303), toggled.status_code);
     try std.testing.expectEqualStrings("/todos?filter=done", (try toggled.getHeaderOne("Location")).?);
@@ -482,10 +530,10 @@ test "Inertia visits add, toggle, filter, and delete todos" {
         \\{"component":"Todos/Index","props":{"app":"Zoda","framework":"test","todos":[{"id":2,"text":"Walk <dog>","done":false}],"filter":"active","remaining":1,"errors":{}},"url":"/todos?filter=active","version":"v1","encryptHistory":true,"mergeProps":["todos"],"matchPropsOn":["todos.id"],"scrollProps":{"todos":{"pageName":"page","previousPage":null,"nextPage":null,"currentPage":1,"reset":false}},"deferredProps":{"default":["stats"]},"sharedProps":["app","framework"]}
     , active.body);
 
-    var deleted = try visit(&app, .delete, "/todos/2", &inertia_json, "");
+    var deleted = try visit(&app, .delete, "/todos/2", &browser.with(inertia_json), "");
     defer deleted.deinit();
     try std.testing.expectEqual(@as(u16, 303), deleted.status_code);
-    var missing = try visit(&app, .delete, "/todos/2", &inertia_json, "");
+    var missing = try visit(&app, .delete, "/todos/2", &browser.with(inertia_json), "");
     defer missing.deinit();
     try std.testing.expectEqual(@as(u16, 404), missing.status_code);
 
@@ -499,6 +547,7 @@ test "validation errors redirect back and show once, and stale clients reload" {
     defer store.deinit();
     var app = try testApp(&store);
     defer app.deinit();
+    var browser = try Browser.open(&app);
 
     // What `form.post('/todos?filter=active', { errorBag: 'createTodo' })` sends.
     const form = [_]zoda.request.Header{
@@ -507,7 +556,7 @@ test "validation errors redirect back and show once, and stale clients reload" {
         .{ .name = "Content-Type", .value = "application/json" },
         .{ .name = "X-Inertia-Error-Bag", .value = "createTodo" },
     };
-    var blank = try visit(&app, .post, "/todos?filter=active", &form, "{\"text\":\"   \"}");
+    var blank = try visit(&app, .post, "/todos?filter=active", &browser.with(form), "{\"text\":\"   \"}");
     defer blank.deinit();
     try std.testing.expectEqual(@as(u16, 303), blank.status_code);
     try std.testing.expectEqualStrings("/todos?filter=active", (try blank.getHeaderOne("Location")).?);
@@ -516,7 +565,7 @@ test "validation errors redirect back and show once, and stale clients reload" {
     // XHR follows with the same headers; the errors arrive under the bag.
     var followed: [form.len + 1]zoda.request.Header = undefined;
     @memcpy(followed[0..form.len], &form);
-    followed[form.len] = .{ .name = "Cookie", .value = (try sessionCookie(&blank)).? };
+    followed[form.len] = .{ .name = "Cookie", .value = sessionCookie(&blank).? };
     var shown = try visit(&app, .get, "/todos?filter=active", &followed, "");
     defer shown.deinit();
     try std.testing.expect(std.mem.indexOf(u8, shown.body, "\"errors\":{\"createTodo\":{\"text\":\"Write something first.\"}}},") != null);
@@ -526,20 +575,20 @@ test "validation errors redirect back and show once, and stale clients reload" {
     const again_headers = [_]zoda.request.Header{
         .{ .name = "X-Inertia", .value = "true" },
         .{ .name = "X-Inertia-Version", .value = "v1" },
-        .{ .name = "Cookie", .value = (try sessionCookie(&shown)).? },
+        .{ .name = "Cookie", .value = sessionCookie(&shown).? },
     };
     var again = try visit(&app, .get, "/todos?filter=active", &again_headers, "");
     defer again.deinit();
     try std.testing.expect(std.mem.indexOf(u8, again.body, "\"errors\":{}},") != null);
-    try std.testing.expect((try sessionCookie(&again)) == null);
+    try std.testing.expect(sessionCookie(&again) == null);
 
     // Without a bag, an overlong todo's error is top-level.
-    var long = try visit(&app, .post, "/todos", &inertia_json, "{\"text\":\"" ++ "x" ** (max_text_bytes + 1) ++ "\"}");
+    var long = try visit(&app, .post, "/todos", &browser.with(inertia_json), "{\"text\":\"" ++ "x" ** (max_text_bytes + 1) ++ "\"}");
     defer long.deinit();
     const long_headers = [_]zoda.request.Header{
         .{ .name = "X-Inertia", .value = "true" },
         .{ .name = "X-Inertia-Version", .value = "v1" },
-        .{ .name = "Cookie", .value = (try sessionCookie(&long)).? },
+        .{ .name = "Cookie", .value = sessionCookie(&long).? },
     };
     var long_shown = try visit(&app, .get, "/todos", &long_headers, "");
     defer long_shown.deinit();
@@ -550,9 +599,9 @@ test "validation errors redirect back and show once, and stale clients reload" {
         .{ .name = "Content-Type", .value = "application/json" },
         .{ .name = "X-Inertia-Error-Bag", .value = "create todo" },
     };
-    try std.testing.expectError(error.MalformedErrorBagHeader, visit(&app, .post, "/todos", &bad_bag, "{\"text\":\"\"}"));
+    try std.testing.expectError(error.MalformedErrorBagHeader, visit(&app, .post, "/todos", &browser.with(bad_bag), "{\"text\":\"\"}"));
 
-    var malformed = try visit(&app, .post, "/todos", &inertia_json, "{\"title\":\"x\"}");
+    var malformed = try visit(&app, .post, "/todos", &browser.with(inertia_json), "{\"title\":\"x\"}");
     defer malformed.deinit();
     try std.testing.expectEqual(@as(u16, 400), malformed.status_code);
 
@@ -563,11 +612,52 @@ test "validation errors redirect back and show once, and stale clients reload" {
     try std.testing.expectEqualStrings("/todos?filter=done", (try stale.getHeaderOne("X-Inertia-Location")).?);
 }
 
+test "changes need the XSRF-TOKEN cookie's value in X-XSRF-TOKEN" {
+    var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer store.deinit();
+    var app = try testApp(&store);
+    defer app.deinit();
+
+    // The first page sets the cookie for script: no `HttpOnly`.
+    var page = try visit(&app, .get, "/todos", &.{}, "");
+    defer page.deinit();
+    var it = page.getAllHeaders("Set-Cookie");
+    var xsrf_field: ?[]const u8 = null;
+    while (it.next()) |field| {
+        if (std.mem.startsWith(u8, field, csrf.xsrf_cookie_name ++ "=")) xsrf_field = field;
+    }
+    try std.testing.expect(std.mem.endsWith(u8, xsrf_field.?, "; Path=/; Secure; SameSite=Lax"));
+
+    var browser = try Browser.open(&app);
+    // No token, the token in the old `X-CSRF-Token` header, a token from
+    // another session, and a repeated header are all refused before parsing.
+    const no_token = [_]zoda.request.Header{ inertia_json[0], inertia_json[1], .{ .name = "Cookie", .value = browser.cookie() } };
+    const old_header = [_]zoda.request.Header{ inertia_json[0], inertia_json[1], .{ .name = "Cookie", .value = browser.cookie() }, .{ .name = csrf.header_name, .value = &browser.token } };
+    var other = try Browser.open(&app);
+    const foreign = [_]zoda.request.Header{ inertia_json[0], inertia_json[1], .{ .name = "Cookie", .value = browser.cookie() }, .{ .name = csrf.xsrf_header_name, .value = &other.token } };
+    const repeated = browser.with([_]zoda.request.Header{ inertia_json[0], inertia_json[1], .{ .name = csrf.xsrf_header_name, .value = &browser.token } });
+    inline for (.{ &no_token, &old_header, &foreign, &repeated }) |headers| {
+        var refused = try visit(&app, .post, "/todos", headers, "{\"text\":\"Buy milk\"}");
+        defer refused.deinit();
+        try std.testing.expectEqual(@as(u16, 403), refused.status_code);
+    }
+    var deleted = try visit(&app, .delete, "/history", &no_token, "");
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(u16, 403), deleted.status_code);
+    try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
+
+    var accepted = try visit(&app, .post, "/todos", &browser.with(inertia_json), "{\"text\":\"Buy milk\"}");
+    defer accepted.deinit();
+    try std.testing.expectEqual(@as(u16, 409), accepted.status_code);
+    try std.testing.expectEqual(@as(usize, 1), store.items.items.len);
+}
+
 test "precognitive posts validate the todo without adding it" {
     var store = Store{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer store.deinit();
     var app = try testApp(&store);
     defer app.deinit();
+    var browser = try Browser.open(&app);
 
     // What `form.validate('text')` sends after `withPrecognition('post', '/todos')`.
     const precognitive = [_]zoda.request.Header{
@@ -575,15 +665,15 @@ test "precognitive posts validate the todo without adding it" {
         .{ .name = "Precognition-Validate-Only", .value = "text" },
         .{ .name = "Content-Type", .value = "application/json" },
     };
-    var blank = try visit(&app, .post, "/todos", &precognitive, "{\"text\":\"  \"}");
+    var blank = try visit(&app, .post, "/todos", &browser.with(precognitive), "{\"text\":\"  \"}");
     defer blank.deinit();
     try std.testing.expectEqual(@as(u16, 422), blank.status_code);
     try std.testing.expectEqualStrings("{\"errors\":{\"text\":\"Write something first.\"}}", blank.body);
     try std.testing.expectEqualStrings("true", (try blank.getHeaderOne("Precognition")).?);
     try std.testing.expectEqualStrings("Precognition", (try blank.getHeaderOne("Vary")).?);
-    try std.testing.expect((try sessionCookie(&blank)) == null);
+    try std.testing.expect(sessionCookie(&blank) == null);
 
-    var valid = try visit(&app, .post, "/todos", &precognitive, "{\"text\":\"Buy milk\"}");
+    var valid = try visit(&app, .post, "/todos", &browser.with(precognitive), "{\"text\":\"Buy milk\"}");
     defer valid.deinit();
     try std.testing.expectEqual(@as(u16, 204), valid.status_code);
     try std.testing.expectEqualStrings("true", (try valid.getHeaderOne("Precognition-Success")).?);
@@ -594,7 +684,7 @@ test "precognitive posts validate the todo without adding it" {
         .{ .name = "Precognition-Validate-Only", .value = "due" },
         .{ .name = "Content-Type", .value = "application/json" },
     };
-    var unlisted = try visit(&app, .post, "/todos", &other_field, "{\"text\":\"\"}");
+    var unlisted = try visit(&app, .post, "/todos", &browser.with(other_field), "{\"text\":\"\"}");
     defer unlisted.deinit();
     try std.testing.expectEqual(@as(u16, 204), unlisted.status_code);
     try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
@@ -604,7 +694,7 @@ test "precognitive posts validate the todo without adding it" {
         .{ .name = "Precognition", .value = "true" },
         .{ .name = "Content-Type", .value = "application/json" },
     };
-    try std.testing.expectError(error.DuplicatePrecognitionHeader, visit(&app, .post, "/todos", &duplicate, "{\"text\":\"x\"}"));
+    try std.testing.expectError(error.DuplicatePrecognitionHeader, visit(&app, .post, "/todos", &browser.with(duplicate), "{\"text\":\"x\"}"));
     try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
 }
 
@@ -670,6 +760,7 @@ test "<InfiniteScroll> pages through todos newest first and resets after a chang
     defer store.deinit();
     var app = try testApp(&store);
     defer app.deinit();
+    var browser = try Browser.open(&app);
     for (0..per_page + 2) |_| _ = try store.add("x");
 
     var first = try visit(&app, .get, "/todos", &inertia_get, "");
@@ -718,7 +809,7 @@ test "<InfiniteScroll> pages through todos newest first and resets after a chang
         .{ .name = "X-Inertia-Partial-Data", .value = "todos,remaining,stats,todos" },
         .{ .name = "X-Inertia-Reset", .value = "todos" },
     };
-    var toggled = try visit(&app, .patch, "/todos/12", &reset, "");
+    var toggled = try visit(&app, .patch, "/todos/12", &browser.with(reset), "");
     defer toggled.deinit();
     try std.testing.expectEqualStrings("/todos", (try toggled.getHeaderOne("Location")).?);
     var back = try visit(&app, .get, "/todos", &reset, "");
@@ -729,9 +820,18 @@ test "<InfiniteScroll> pages through todos newest first and resets after a chang
 }
 
 /// The session cookie a response sets, without its attributes.
-fn sessionCookie(res: *const zoda.response.Response) !?[]const u8 {
-    const set_cookie = (try res.getHeaderOne("Set-Cookie")) orelse return null;
-    return set_cookie[0..std.mem.indexOfScalar(u8, set_cookie, ';').?];
+fn sessionCookie(res: *const zoda.response.Response) ?[]const u8 {
+    return setCookie(res, zoda.plugins.sessions.cookie_name);
+}
+
+/// The `name=value` of the cookie `name` that `res` sets.
+fn setCookie(res: *const zoda.response.Response, name: []const u8) ?[]const u8 {
+    var it = res.getAllHeaders("Set-Cookie");
+    while (it.next()) |field| {
+        const pair = field[0..std.mem.indexOfScalar(u8, field, ';').?];
+        if (pair.len > name.len and std.mem.startsWith(u8, pair, name) and pair[name.len] == '=') return pair;
+    }
+    return null;
 }
 
 test "adding a todo flashes a notice that the next render shows once" {
@@ -739,6 +839,7 @@ test "adding a todo flashes a notice that the next render shows once" {
     defer store.deinit();
     var app = try testApp(&store);
     defer app.deinit();
+    var browser = try Browser.open(&app);
 
     // The form posts with `only` and `reset`, which XHR repeats on the GET
     // that follows the redirect, so that partial reload carries the flash.
@@ -750,10 +851,10 @@ test "adding a todo flashes a notice that the next render shows once" {
         .{ .name = "X-Inertia-Partial-Data", .value = "todos,remaining,stats" },
         .{ .name = "X-Inertia-Reset", .value = "todos" },
     };
-    var created = try visit(&app, .post, "/todos", &form, "{\"text\":\"Buy milk\"}");
+    var created = try visit(&app, .post, "/todos", &browser.with(form), "{\"text\":\"Buy milk\"}");
     defer created.deinit();
     try std.testing.expectEqualStrings("/todos#todo-1", (try created.getHeaderOne("X-Inertia-Redirect")).?);
-    const pending = (try sessionCookie(&created)).?;
+    const pending = sessionCookie(&created).?;
 
     var with_cookie: [form.len + 1]zoda.request.Header = undefined;
     @memcpy(with_cookie[0..form.len], &form);
@@ -761,7 +862,7 @@ test "adding a todo flashes a notice that the next render shows once" {
     var shown = try visit(&app, .get, "/todos", &with_cookie, "");
     defer shown.deinit();
     try std.testing.expect(std.mem.endsWith(u8, shown.body, ",\"flash\":{\"notice\":\"Todo added\"}}"));
-    const read = (try sessionCookie(&shown)).?;
+    const read = sessionCookie(&shown).?;
 
     // The saved cookie no longer holds the message.
     const again_headers = [_]zoda.request.Header{
@@ -772,16 +873,16 @@ test "adding a todo flashes a notice that the next render shows once" {
     var again = try visit(&app, .get, "/todos", &again_headers, "");
     defer again.deinit();
     try std.testing.expect(std.mem.indexOf(u8, again.body, "\"flash\"") == null);
-    try std.testing.expect((try sessionCookie(&again)) == null);
+    try std.testing.expect(sessionCookie(&again) == null);
 
     // A rejected todo stores only its errors, so the page that follows has
     // no `flash`.
-    var blank = try visit(&app, .post, "/todos", &inertia_json, "{\"text\":\" \"}");
+    var blank = try visit(&app, .post, "/todos", &browser.with(inertia_json), "{\"text\":\" \"}");
     defer blank.deinit();
     const rejected = [_]zoda.request.Header{
         .{ .name = "X-Inertia", .value = "true" },
         .{ .name = "X-Inertia-Version", .value = "v1" },
-        .{ .name = "Cookie", .value = (try sessionCookie(&blank)).? },
+        .{ .name = "Cookie", .value = sessionCookie(&blank).? },
     };
     var back = try visit(&app, .get, "/todos", &rejected, "");
     defer back.deinit();
@@ -794,9 +895,10 @@ test "Forget history redirects to a page that clears it once" {
     defer store.deinit();
     var app = try testApp(&store);
     defer app.deinit();
+    var browser = try Browser.open(&app);
 
     // What `router.delete('/history?filter=active')` sends.
-    var forgot = try visit(&app, .delete, "/history?filter=active", &inertia_json, "");
+    var forgot = try visit(&app, .delete, "/history?filter=active", &browser.with(inertia_json), "");
     defer forgot.deinit();
     try std.testing.expectEqual(@as(u16, 303), forgot.status_code);
     try std.testing.expectEqualStrings("/todos?filter=active", (try forgot.getHeaderOne("Location")).?);
@@ -804,7 +906,7 @@ test "Forget history redirects to a page that clears it once" {
     const followed = [_]zoda.request.Header{
         .{ .name = "X-Inertia", .value = "true" },
         .{ .name = "X-Inertia-Version", .value = "v1" },
-        .{ .name = "Cookie", .value = (try sessionCookie(&forgot)).? },
+        .{ .name = "Cookie", .value = sessionCookie(&forgot).? },
     };
     var cleared = try visit(&app, .get, "/todos?filter=active", &followed, "");
     defer cleared.deinit();
@@ -816,7 +918,7 @@ test "Forget history redirects to a page that clears it once" {
     const again_headers = [_]zoda.request.Header{
         .{ .name = "X-Inertia", .value = "true" },
         .{ .name = "X-Inertia-Version", .value = "v1" },
-        .{ .name = "Cookie", .value = (try sessionCookie(&cleared)).? },
+        .{ .name = "Cookie", .value = sessionCookie(&cleared).? },
     };
     var again = try visit(&app, .get, "/todos?filter=active", &again_headers, "");
     defer again.deinit();

@@ -121,6 +121,10 @@
 //! forwarded headers; the client resolves the relative URL against the page it
 //! is already on. Targets beginning with `//` or containing `\` are refused.
 //!
+//! Shared props from request state: `.shared = .fromContext(App.Context,
+//! resolve)` calls `resolve(ctx, req)` on each render with the context
+//! `renderWith` receives as `.context = .of(ctx)`. Route props still win.
+//!
 //! Ownership: the response owns every serialized byte. Shared values and the
 //! version must outlive the instance; callback results must stay valid until
 //! the call that requested them returns. Header-syntax, configuration, and
@@ -174,6 +178,9 @@ pub const Ssr = ssr_client.Config;
 /// Why a server-side render fell back to the client-side shell.
 pub const SsrFailure = ssr_client.Failure;
 pub const TargetError = error{ MissingRequestTarget, UnsafeRequestTarget };
+/// `.shared = .fromContext(...)` needs `RenderOptions.context` of the same
+/// context type.
+pub const ContextError = error{ MissingRouteContext, RouteContextMismatch };
 pub const ErrorBagError = error{ DuplicateErrorBagHeader, MalformedErrorBagHeader };
 pub const PrecognitionError = error{ DuplicatePrecognitionHeader, MalformedPrecognitionHeader, PrecognitionHeaderTooLarge };
 pub const PrecognitionResponseError = PrecognitionError || response.HeaderError || error{
@@ -181,7 +188,7 @@ pub const PrecognitionResponseError = PrecognitionError || response.HeaderError 
     NotPrecognitive,
     PrecognitionAlreadySet,
 };
-pub const RenderError = HeaderError || PartialError || ScrollError || OnceError || ConfigError || TargetError || response.HeaderError || error{
+pub const RenderError = HeaderError || PartialError || ScrollError || OnceError || ConfigError || ContextError || TargetError || response.HeaderError || error{
     BodyTooLarge,
     InvalidComponent,
     InvalidStatus,
@@ -741,8 +748,44 @@ pub const FlashSource = struct {
     session: *sessions.Sessions.State,
 };
 
+/// A type-erased pointer to the route's context, such as `*App.Context`,
+/// for shared props built with `Shared.fromContext`. The plugin is declared
+/// before the app, so it cannot name the context type itself.
+pub const RouteContext = struct {
+    tag: *const anyopaque,
+    ptr: *anyopaque,
+
+    /// Wraps `ctx`, a mutable single-item pointer such as `*App.Context`.
+    /// It must outlive the `renderWith` call it is passed to.
+    pub fn of(ctx: anytype) RouteContext {
+        const info = @typeInfo(@TypeOf(ctx));
+        if (info != .pointer or info.pointer.size != .one or info.pointer.is_const) {
+            @compileError("RouteContext.of takes a mutable single-item pointer such as *App.Context");
+        }
+        return .{ .tag = contextTag(info.pointer.child), .ptr = ctx };
+    }
+};
+
+/// One static byte per context type, whose address identifies the type at
+/// run time.
+fn ContextTag(comptime Context: type) type {
+    return struct {
+        comptime {
+            _ = Context;
+        }
+        var byte: u8 = 0;
+    };
+}
+
+fn contextTag(comptime Context: type) *const anyopaque {
+    return &ContextTag(Context).byte;
+}
+
 /// Per-call additions to `render`.
 pub const RenderOptions = struct {
+    /// The route's context, `RouteContext.of(ctx)`, for shared props built
+    /// with `Shared.fromContext`. Ignored by the other `shared` forms.
+    context: ?RouteContext = null,
     /// Sends the messages this request received as the page's top-level
     /// `flash`, errors stored by `redirectWithErrors` as `props.errors`, and
     /// a `clearHistoryOnNextRender` request as `clearHistory`, and consumes
@@ -785,6 +828,29 @@ pub fn Inertia(comptime SharedProps: type) type {
             none,
             value: SharedProps,
             callback: *const fn (*const router.Request) SharedProps,
+            /// Made by `fromContext`.
+            context: ContextCallback,
+
+            /// Shared props built from the route context, such as session
+            /// state in `ctx.state`, by `resolve(ctx, req)`. Every render
+            /// must then pass `.context = .of(ctx)` to `renderWith` with a
+            /// `*Context`; `render` returns `error.MissingRouteContext` and
+            /// another context type `error.RouteContextMismatch`.
+            pub fn fromContext(
+                comptime Context: type,
+                comptime resolve: fn (*Context, *const router.Request) SharedProps,
+            ) Shared {
+                return .{ .context = .{ .tag = contextTag(Context), .call = struct {
+                    fn call(ptr: *anyopaque, req: *const router.Request) SharedProps {
+                        return resolve(@ptrCast(@alignCast(ptr)), req);
+                    }
+                }.call } };
+            }
+        };
+
+        pub const ContextCallback = struct {
+            tag: *const anyopaque,
+            call: *const fn (*anyopaque, *const router.Request) SharedProps,
         };
 
         /// Asset version. `.none` sends `"version":null` and skips the check.
@@ -882,6 +948,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             }
             try self.validate();
             if (!validStatus(options.status)) return error.InvalidStatus;
+            try self.checkContext(options.context);
             const inertia = try isInertia(req);
             // Partial headers only mean something on Inertia visits.
             const partial = if (inertia) try partialReload(req, component) else null;
@@ -910,7 +977,7 @@ pub fn Inertia(comptime SharedProps: type) type {
                 .clear_history = options.clear_history or (if (messages) |m| hasKind(m, history_flash_kind) else false),
                 .preserve_fragment = options.preserve_fragment,
             };
-            const page = try self.pageJson(res.allocator, req, partial, once_visit, component, props, url, version, page_options, messages);
+            const page = try self.pageJson(res.allocator, req, options.context, partial, once_visit, component, props, url, version, page_options, messages);
             if (inertia) {
                 var committed = false;
                 defer if (!committed) res.allocator.free(page);
@@ -1126,10 +1193,18 @@ pub fn Inertia(comptime SharedProps: type) type {
             };
         }
 
+        /// Checks that `context` can resolve `.fromContext` shared props.
+        fn checkContext(self: *const Self, context: ?RouteContext) ContextError!void {
+            if (self.shared != .context) return;
+            const given = context orelse return error.MissingRouteContext;
+            if (given.tag != self.shared.context.tag) return error.RouteContextMismatch;
+        }
+
         fn pageJson(
             self: *const Self,
             allocator: std.mem.Allocator,
             req: *const router.Request,
+            context: ?RouteContext,
             partial: ?Partial,
             once_visit: OnceVisit,
             component: []const u8,
@@ -1143,6 +1218,8 @@ pub fn Inertia(comptime SharedProps: type) type {
                 .none => null,
                 .value => |value| value,
                 .callback => |callback| callback(req),
+                // `checkContext` has accepted `context`.
+                .context => |callback| callback.call(context.?.ptr, req),
             };
             // `optional`, `deferred`, and `once` results live here until
             // serialized.
@@ -1878,6 +1955,93 @@ test "attribute initial page escapes the JSON for v1 and v2 clients" {
             "</body></html>",
         res.body,
     );
+}
+
+test "shared props built from the route context read session state" {
+    const app_mod = @import("../app.zig");
+    const Plugins = struct { sessions: sessions.Sessions, inertia: TestInertia };
+    const App = app_mod.App(Plugins);
+    const Routes = struct {
+        fn shared(ctx: *App.Context, _: *const router.Request) TestShared {
+            const user = ctx.state.sessions.value();
+            return .{ .app_name = "zoda", .user = if (user.len == 0) null else user };
+        }
+
+        fn route(ctx: *App.Context, req: *router.Request, res: *response.Response) !void {
+            const inertia = &ctx.plugins.inertia;
+            if (req.onLiteral("login")) {
+                try ctx.state.sessions.set("ada");
+                try ctx.plugins.sessions.save(&ctx.state.sessions, res);
+                return inertia.redirect(req, res, "/");
+            }
+            if (req.onLiteral("override")) {
+                return inertia.renderWith(req, res, "Home", .{ .user = "route" }, .{ .context = .of(ctx) });
+            }
+            if (req.onLiteral("bare")) return inertia.render(req, res, "Home", .{});
+            return inertia.renderWith(req, res, "Home", .{}, .{ .context = .of(ctx) });
+        }
+    };
+    var app = try App.init(testing.allocator, .{
+        .response_allocator = testing.allocator,
+        .plugins = .{
+            .sessions = .{
+                .keys = &.{.{ .id = 1, .secret = "a" ** 32 }},
+                .lifetime_seconds = 300,
+                .now_seconds = struct {
+                    fn now() i64 {
+                        return 1000;
+                    }
+                }.now,
+            },
+            .inertia = .{ .layout = test_layout, .shared = .fromContext(App.Context, Routes.shared) },
+        },
+        .route_fn = Routes.route,
+    });
+    defer app.deinit();
+
+    var anonymous_req = testRequest(.get, "/", &inertia_headers);
+    var anonymous = try app.dispatch(&anonymous_req);
+    defer anonymous.deinit();
+    try testing.expectEqualStrings(
+        "{\"component\":\"Home\",\"props\":{\"app_name\":\"zoda\",\"user\":null,\"errors\":{}},\"url\":\"/\",\"version\":null,\"sharedProps\":[\"app_name\",\"user\"]}",
+        anonymous.body,
+    );
+
+    var login_req: router.Request = .{ .method = .post, .segments = &.{"login"}, .target = "/login", .headers = &inertia_headers };
+    var login = try app.dispatch(&login_req);
+    defer login.deinit();
+    const set_cookie = (try login.getHeaderOne("Set-Cookie")).?;
+    const cookie = set_cookie[0..std.mem.indexOfScalar(u8, set_cookie, ';').?];
+    const signed_in = [_]router.Header{ inertia_headers[0], .{ .name = "Cookie", .value = cookie } };
+
+    var home_req = testRequest(.get, "/", &signed_in);
+    var home = try app.dispatch(&home_req);
+    defer home.deinit();
+    try testing.expectEqualStrings(
+        "{\"component\":\"Home\",\"props\":{\"app_name\":\"zoda\",\"user\":\"ada\",\"errors\":{}},\"url\":\"/\",\"version\":null,\"sharedProps\":[\"app_name\",\"user\"]}",
+        home.body,
+    );
+
+    // Route props still win over shared ones of the same name.
+    var override_req: router.Request = .{ .method = .get, .segments = &.{"override"}, .target = "/override", .headers = &signed_in };
+    var override = try app.dispatch(&override_req);
+    defer override.deinit();
+    try testing.expectEqualStrings(
+        "{\"component\":\"Home\",\"props\":{\"app_name\":\"zoda\",\"user\":\"route\",\"errors\":{}},\"url\":\"/override\",\"version\":null,\"sharedProps\":[\"app_name\",\"user\"]}",
+        override.body,
+    );
+
+    // Without the context the render fails before the response changes.
+    var bare_req: router.Request = .{ .method = .get, .segments = &.{"bare"}, .target = "/bare", .headers = &signed_in };
+    try testing.expectError(error.MissingRouteContext, app.dispatch(&bare_req));
+
+    // A context of another type is refused rather than misread.
+    var other: struct { value: u8 } = .{ .value = 1 };
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    try testing.expectError(error.RouteContextMismatch, app.plugins.inertia.renderWith(&home_req, &res, "Home", .{}, .{ .context = .of(&other) }));
+    try testing.expectEqual(@as(usize, 0), res.header_count);
+    try testing.expectEqualStrings("", res.body);
 }
 
 test "Inertia visit returns the JSON page with shared props overridden by route props" {

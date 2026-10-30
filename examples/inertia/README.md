@@ -152,12 +152,17 @@ and `dist/assets/app.css`, and Zoda serves them with `zoda.static` under
   version. After you rebuild the frontend and restart the server, an open tab
   that sends the old version gets 409 and `X-Inertia-Location` and does a full
   reload, so it never mixes old JavaScript with new props.
+- **CSRF.** Each page render issues the session's CSRF token and sets it as
+  the `XSRF-TOKEN` cookie (`Secure`, `SameSite=Lax`, readable by script).
+  The Inertia client copies it into `X-XSRF-TOKEN` on every same-origin
+  request, and the route answers any `POST`, `PATCH`, or `DELETE` without a
+  matching token with 403 before reading the body, precognitive validation
+  included. See
+  [XSRF-TOKEN cookie](../../PLUGINS.md#xsrf-token-cookie-inertia-axios).
+  The session key is new on each run, so after a restart an open tab's next
+  change gets 403 until it reloads.
 
-The session only carries flash messages and validation errors. The JSON body parser accepts only
-`Content-Type: application/json`, so a plain cross-site HTML form cannot post
-here. A real app that uses cookies should still add CSRF checks; see
-[PLUGINS.md](../../PLUGINS.md#inertiajs) for how Inertia's `X-XSRF-TOKEN`
-relates to Zoda's CSRF helpers.
+The session carries flash messages, validation errors, and the CSRF secret.
 
 ## Tests
 

@@ -205,7 +205,8 @@ try performProtectedAction();
 
 `io` is the application's `std.Io`; token creation uses
 `std.Io.randomSecure` and can fail if secure entropy is unavailable. For
-JavaScript submissions, send the token in one `X-CSRF-Token` header. For HTML
+JavaScript submissions, send the token in one `X-CSRF-Token` header, or read
+another header with `csrf.validHeader(req, state, name)`. For HTML
 forms, extract exactly one token field and call `csrf.validToken`; reject
 duplicate fields. Missing, malformed, duplicate-header, and cross-session
 tokens fail validation. The token is stable until the session is cleared; do
@@ -215,6 +216,44 @@ policy above, and do not allow untrusted cross-origin requests to send the
 custom header through permissive CORS. The [compiling app dispatch example](src/plugins/csrf.zig)
 exercises explicit plugin access, session persistence, and rejection before
 the protected action.
+
+### XSRF-TOKEN cookie (Inertia, axios)
+
+Inertia's HTTP client and axios read a cookie named `XSRF-TOKEN` and send its
+value back as `X-XSRF-TOKEN` on same-origin requests. To use that, set the
+cookie when you issue the token and validate that header:
+
+```zig
+// On every page render, before `sessions.save`:
+try csrf.setXsrfCookie(res, try csrf.token(io, &ctx.state.sessions));
+
+// Before any protected action:
+if (!csrf.validHeader(req, &ctx.state.sessions, csrf.xsrf_header_name)) return res.text(403, "forbidden");
+```
+
+`setXsrfCookie` writes `XSRF-TOKEN=<token>; Path=/; Secure; SameSite=Lax`
+and refuses anything that is not a `token` value (`error.InvalidToken`).
+Only `xsrf_header_name` is read, and a repeated header fails like a repeated
+`X-CSRF-Token`. Trade-offs:
+
+- **No `HttpOnly`.** Script on the page has to read the cookie, so any script
+  that runs on your origin, including injected script, can read the token.
+  That is no weaker than a token in the page, but keep XSS defenses (such as
+  [`security_policy`](#security-response-policies)) in place.
+- **The session decides.** The token is checked against the secret in the
+  signed `__Host-` session cookie, not against this cookie. A sibling
+  subdomain that overwrites `XSRF-TOKEN` can only make requests fail.
+- **`Secure` and `SameSite=Lax`.** The cookie is sent over HTTPS only
+  (browsers also accept it on `http://localhost`), and not on cross-site
+  subrequests. Other origins cannot read it, which is what makes copying it
+  into a header a proof of same-origin script.
+- **Lifetime.** It has no `Max-Age`, so it ends with the browser session.
+  Set it on every page so a browser that dropped it gets it back. After the
+  session cookie expires or the key rotates out, the old token fails until
+  the page reloads and issues a new one.
+
+The [Inertia example](examples/inertia/server.zig) protects every change
+this way.
 
 ## Flash messages
 
@@ -635,7 +674,7 @@ layout or root id before the first request; `render` checks again.
 | `root_id` | `"app"` | `id` of the generated root element; 1–64 `[A-Za-z0-9_-]` bytes. |
 | `initial_page` | `.script` | `.script` for Inertia v3 clients, `.attribute` for v1 and v2. See below. |
 | `version` | `.none` | `.value = "..."` or `.callback = fn (*const Request) []const u8`. `.none` sends `"version":null` and skips version checks. |
-| `shared` | `.none` | `.value = SharedProps{...}` or `.callback = fn (*const Request) SharedProps`. Use `zoda.Inertia(struct {})` for no shared props. |
+| `shared` | `.none` | `.value = SharedProps{...}`, `.callback = fn (*const Request) SharedProps`, or `.fromContext(App.Context, fn (*App.Context, *const Request) SharedProps)` for props built from request state (see [Shared props from request state](#shared-props-from-request-state)). Use `zoda.Inertia(struct {})` for no shared props. |
 | `now_milliseconds` | `null` | Trusted UTC Unix-millisecond clock, `fn () i64`, for once props with an expiry. See [Once props](#once-props). |
 | `encrypt_history` | `false` | Sends `encryptHistory: true` on every page; `renderWith` can override it per page. See [History encryption](#history-encryption). |
 | `ssr` | `null` | `zoda.plugins.inertia.Ssr` settings to render full visits through an SSR server. See [Server-side rendering](#server-side-rendering). |
@@ -1198,6 +1237,7 @@ defaults to `render`'s behavior:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
+| `context` | `null` | `.of(ctx)`, the route's context, for `.fromContext` shared props. See [Shared props from request state](#shared-props-from-request-state). |
 | `flash` | `null` | `FlashSource` to read flash, stored validation errors, and a stored history clear from. See [Flash](#flash). |
 | `encrypt_history` | `null` | `true` or `false` overrides the instance's `encrypt_history` for this page. |
 | `clear_history` | `false` | Sends `clearHistory: true`. |
@@ -1218,6 +1258,45 @@ try ctx.plugins.inertia.renderWith(req, res, "Errors/NotFound", .{ .path = req.t
   user asked for when the response is for a different URL, as after a
   redirect. With `preserveFragment: true` it keeps the requested fragment
   on the page it shows. Pass it on the page the redirect lands on.
+
+### Shared props from request state
+
+`.shared = .fromContext(App.Context, resolve)` builds the shared props on
+each render by calling `resolve(ctx, req)`, so they can come from session
+state such as the signed-in user. The plugin is declared before the app and
+cannot name `App.Context` itself, so each render passes the context in
+`renderWith`'s `.context`:
+
+```zig
+const Shared = struct { user: ?[]const u8 };
+const Plugins = struct { sessions: zoda.Sessions, inertia: zoda.Inertia(Shared) };
+const App = zoda.app.App(Plugins);
+
+fn shared(ctx: *App.Context, _: *const zoda.router.Request) Shared {
+    const user = ctx.state.sessions.value();
+    return .{ .user = if (user.len == 0) null else user };
+}
+
+fn route(ctx: *App.Context, req: *zoda.router.Request, res: *zoda.response.Response) !void {
+    return ctx.plugins.inertia.renderWith(req, res, "Home", .{}, .{ .context = .of(ctx) });
+}
+
+// .plugins = .{ .inertia = .{ .layout = layout, .shared = .fromContext(App.Context, shared) }, ... },
+```
+
+- **Precedence.** Unchanged: a route prop with the same name replaces the
+  shared one, checked at comptime, and `sharedProps` still names every
+  shared prop.
+- **Missing or wrong context.** `render`, or `renderWith` without
+  `.context`, returns `error.MissingRouteContext`; a context of another type
+  returns `error.RouteContextMismatch`. Both are checked before the response
+  changes. `.context` is ignored for the other `shared` forms.
+- **Lifetime.** `resolve` runs once per render, after the version check, on
+  the request's task. What it returns, such as a slice of the session
+  payload, must stay valid until `renderWith` returns.
+
+The [test](src/plugins/inertia.zig) builds `user` from the session payload
+across a login redirect and checks precedence.
 
 ### History encryption
 
@@ -1432,16 +1511,18 @@ origin. A target that starts with `//` or contains `\` is refused with
 
 ### Interactions
 
-- **Sessions, CSRF, and flash.** Shared-props callbacks receive only the
-  request, not `ctx`, so put session-derived values (the current user) in
-  route props, and send flash messages and redirected validation errors
-  with `renderWith` (see [Flash](#flash) and
-  [Validation errors](#validation-errors)). Save the session before
-  `redirect`, after `redirectWithErrors` and `clearHistoryOnNextRender`,
-  and after `renderWith` when it sends flash, so the read is persisted. `csrf.valid` reads `X-CSRF-Token`, not
-  the `X-XSRF-TOKEN` header that Inertia's axios client sends from an
-  `XSRF-TOKEN` cookie. Either set `X-CSRF-Token` in your client's request
-  headers or pass the submitted value to `csrf.validToken`.
+- **Sessions, CSRF, and flash.** Build session-derived shared props (the
+  current user) with `.fromContext` (see
+  [Shared props from request state](#shared-props-from-request-state)), and
+  send flash messages and redirected validation errors with `renderWith`
+  (see [Flash](#flash) and [Validation errors](#validation-errors)). Save
+  the session before `redirect`, after `redirectWithErrors` and
+  `clearHistoryOnNextRender`, and after `renderWith` when it sends flash, so
+  the read is persisted. Inertia's client sends the `XSRF-TOKEN` cookie as
+  `X-XSRF-TOKEN`: set the cookie with `csrf.setXsrfCookie` and check
+  `csrf.validHeader(req, state, csrf.xsrf_header_name)`; see
+  [XSRF-TOKEN cookie](#xsrf-token-cookie-inertia-axios). The check covers
+  precognitive requests too, which the client sends with the same header.
 - **Caching.** Do not mark Inertia pages `public` without `Vary: X-Inertia`,
   which `render` already adds; add other `Vary` fields with
   `http_cache.addVary`.

@@ -132,7 +132,10 @@ runs inside `zig build test`.
   `\u`-escaped, followed by the empty root element; `initial_page =
   .attribute` writes the v1/v2 attribute-escaped `data-page` instead. Route
   props replace shared props of the same name; `props.errors` defaults to
-  `{}`; configured shared props are named in `sharedProps`. An Inertia GET whose
+  `{}`; configured shared props are named in `sharedProps`. Shared props are
+  a value, a request callback, or `Shared.fromContext(Context, resolve)`,
+  resolved from `RenderOptions.context = RouteContext.of(ctx)`
+  (`error.MissingRouteContext` or `error.RouteContextMismatch` otherwise). An Inertia GET whose
   `X-Inertia-Version` (missing counts as empty) differs from the configured
   version gets 409 and `X-Inertia-Location`. Checked against
   `@inertiajs/react`, `@inertiajs/svelte`, and `@inertiajs/vue3` 3.9.1 by
@@ -331,8 +334,10 @@ same signed (not encrypted) cookie. `add` queues a message for the next
 request. `read` returns this request's messages and marks them consumed for
 the next `save`. Without a save, they are shown again. `peek` returns them
 without consuming them. `reset` undoes this
-request's flash changes before a recovery save. Call `csrf.valid` before protected actions and reject duplicate form
-tokens before `validToken`. See the [README](PLUGINS.md#cookie-sessions) for
+request's flash changes before a recovery save. Call `csrf.valid` (or `csrf.validHeader` with
+another header name, such as `csrf.xsrf_header_name`) before protected actions
+and reject duplicate form tokens before `validToken`. `csrf.setXsrfCookie`
+hands a token to script as the non-`HttpOnly` `XSRF-TOKEN` cookie. See the [README](PLUGINS.md#cookie-sessions) for
 rotation and cookie behavior.
 
 ## Defaults and unsupported capabilities

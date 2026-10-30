@@ -145,6 +145,9 @@ measurement.
 
 | Date | Commit | Change | Target | Command | Req/s | Avg latency | Socket errors | Environment |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-30 | `04b8fd0` + working tree | CSRF `X-XSRF-TOKEN`/`XSRF-TOKEN` helpers and Inertia context shared props (opt-in, not in todo app; request path unchanged). Differences from earlier rows are machine variation | todo `/api/todos` | `wrk -t8 -c128 -d10s` | 83,362 | 1.63 ms | read 230 | A |
+| 2026-10-30 | `04b8fd0` + working tree | CSRF `X-XSRF-TOKEN`/`XSRF-TOKEN` helpers and Inertia context shared props (opt-in, not in todo app; request path unchanged). Differences from earlier rows are machine variation | todo `/` | `wrk -t8 -c128 -d10s` | 49,084 | 3.16 ms | read 21 | A |
+| 2026-10-30 | `04b8fd0` + working tree | CSRF `X-XSRF-TOKEN`/`XSRF-TOKEN` helpers and Inertia context shared props (opt-in, not in todo app; request path unchanged). Differences from earlier rows are machine variation | todo `/api/todos` | `wrk -t8 -c400 -d10s` | 55,824 | 1.54 ms | read 149571 | A |
 | 2026-10-28 | `1b8b3ee` + working tree | Inertia.js plugin (opt-in, not in todo app; request path unchanged). About 2x the previous rows with no request-path change: machine load differed, not an improvement | todo `/api/todos` | `wrk -t8 -c128 -d10s` | 65,867 | 2.03 ms | read 196 | A |
 | 2026-10-28 | `1b8b3ee` + working tree | Inertia.js plugin (opt-in, not in todo app; request path unchanged). About 2x the previous rows with no request-path change: machine load differed, not an improvement | todo `/` | `wrk -t8 -c128 -d10s` | 41,911 | 2.87 ms | read 63 | A |
 | 2026-10-28 | `1b8b3ee` + working tree | Inertia.js plugin (opt-in, not in todo app; request path unchanged). About 2x the previous rows with no request-path change: machine load differed, not an improvement | todo `/api/todos` | `wrk -t8 -c400 -d10s` | 29,565 | 2.35 ms | read 211,631 | A |
