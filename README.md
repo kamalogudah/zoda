@@ -15,7 +15,7 @@ explicitly. It targets JSON APIs and server-rendered sites.
 
 ## Requirements
 
-- Zig **0.16.0** (exact pin). Other versions are not supported.
+- Zig **0.17.1** (exact pin). Other versions are not supported.
 - Primary platform: `x86_64-linux-gnu`. Other targets are best-effort.
 
 [`PLATFORM.md`](PLATFORM.md) covers installation, the allocator and threading

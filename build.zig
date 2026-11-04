@@ -111,9 +111,7 @@ pub fn build(b: *std.Build) void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
@@ -181,7 +179,7 @@ pub fn build(b: *std.Build) void {
     const inertia_exe = b.addExecutable(.{ .name = "inertia-todo", .root_module = inertia_module });
     const inertia_run = b.addRunArtifact(inertia_exe);
     inertia_run.setCwd(b.path("."));
-    if (b.args) |args| inertia_run.addArgs(args);
+    inertia_run.addPassthruArgs();
     const inertia_step = b.step("run-inertia", "Run the Inertia.js todo app (react, svelte, or vue) on localhost:8080");
     inertia_step.dependOn(&inertia_run.step);
     const inertia_tests = b.addRunArtifact(b.addTest(.{ .root_module = inertia_module }));
@@ -231,10 +229,8 @@ pub fn build(b: *std.Build) void {
     const watch_cmd = b.addRunArtifact(watch_exe);
     watch_cmd.setCwd(b.path("."));
     watch_cmd.addArgs(&.{ "--zig", b.graph.zig_exe });
-    if (b.args) |args| {
-        watch_cmd.addArg("--");
-        watch_cmd.addArgs(args);
-    }
+    watch_cmd.addArg("--");
+    watch_cmd.addPassthruArgs();
     const watch_step = b.step("watch", "Rebuild and restart the demo server when sources change");
     watch_step.dependOn(&watch_cmd.step);
 
@@ -246,7 +242,7 @@ pub fn build(b: *std.Build) void {
     // several times and is kept out of the quick `test` step.
     const devloop_options = b.addOptions();
     devloop_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
-    devloop_options.addOption([]const u8, "repo_root", b.pathFromRoot("."));
+    devloop_options.addOptionPathUntracked("repo_root", b.path("."));
     const devloop_module = b.createModule(.{
         .root_source_file = b.path("src/devloop.zig"),
         .target = target,

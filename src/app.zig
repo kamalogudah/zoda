@@ -38,23 +38,21 @@ pub const Clock = timing.Clock;
 /// non-`void` `State` type and an `initRequest` hook. Field names match the
 /// plugin instance names.
 pub fn RequestState(comptime Plugins: type) type {
-    const fields = std.meta.fields(Plugins);
+    const info = @typeInfo(Plugins).@"struct";
     const count = comptime blk: {
         var c: usize = 0;
-        for (fields) |f| {
-            const PT = f.type;
+        for (info.field_types) |PT| {
             if (@hasDecl(PT, "State") and PT.State != void and @hasDecl(PT, "initRequest")) c += 1;
         }
         break :blk c;
     };
     var names: [count][]const u8 = undefined;
     var types: [count]type = undefined;
-    var attrs: [count]std.builtin.Type.StructField.Attributes = undefined;
+    var attrs: [count]std.builtin.Type.Struct.FieldAttributes = undefined;
     var i: usize = 0;
-    inline for (fields) |f| {
-        const PT = f.type;
+    inline for (info.field_names, info.field_types) |name, PT| {
         if (@hasDecl(PT, "State") and PT.State != void and @hasDecl(PT, "initRequest")) {
-            names[i] = f.name;
+            names[i] = name;
             types[i] = PT.State;
             attrs[i] = .{};
             i += 1;
@@ -72,25 +70,24 @@ pub fn initRequestState(
     req: *router.Request,
     state: *RequestState(Plugins),
 ) !void {
-    const fields = std.meta.fields(Plugins);
-    var initialized = [1]bool{false} ** fields.len;
+    const info = @typeInfo(Plugins).@"struct";
+    var initialized: [info.field_names.len]bool = @splat(false);
 
     errdefer {
-        inline for (0..fields.len) |rev_offset| {
-            const idx = fields.len - 1 - rev_offset;
-            const f = fields[idx];
-            const PT = f.type;
+        inline for (0..info.field_names.len) |rev_offset| {
+            const idx = info.field_names.len - 1 - rev_offset;
+            const name = info.field_names[idx];
+            const PT = info.field_types[idx];
             if (initialized[idx] and @hasDecl(PT, "deinitRequest")) {
-                @field(plugins, f.name).deinitRequest(&@field(state, f.name));
+                @field(plugins, name).deinitRequest(&@field(state, name));
             }
         }
     }
 
-    inline for (fields, 0..) |f, idx| {
-        const PT = f.type;
+    inline for (info.field_names, info.field_types, 0..) |name, PT, idx| {
         if (@hasDecl(PT, "State") and PT.State != void and @hasDecl(PT, "initRequest")) {
-            const plugin_ptr = &@field(plugins, f.name);
-            @field(state, f.name) = try plugin_ptr.initRequest(req);
+            const plugin_ptr = &@field(plugins, name);
+            @field(state, name) = try plugin_ptr.initRequest(req);
             initialized[idx] = true;
         }
     }
@@ -103,13 +100,13 @@ pub fn deinitRequestState(
     plugins: *const Plugins,
     state: *RequestState(Plugins),
 ) void {
-    const fields = std.meta.fields(Plugins);
-    inline for (0..fields.len) |rev_offset| {
-        const idx = fields.len - 1 - rev_offset;
-        const f = fields[idx];
-        const PT = f.type;
+    const info = @typeInfo(Plugins).@"struct";
+    inline for (0..info.field_names.len) |rev_offset| {
+        const idx = info.field_names.len - 1 - rev_offset;
+        const name = info.field_names[idx];
+        const PT = info.field_types[idx];
         if (@hasDecl(PT, "State") and PT.State != void and @hasDecl(PT, "deinitRequest")) {
-            @field(plugins, f.name).deinitRequest(&@field(state, f.name));
+            @field(plugins, name).deinitRequest(&@field(state, name));
         }
     }
 }
@@ -177,12 +174,13 @@ pub fn App(comptime Plugins: type) type {
         /// A route passed to `route_fn` without composing runs no wrappers.
         pub fn composeRoute(comptime base: RouteFn) RouteFn {
             return comptime blk: {
-                const fields = std.meta.fields(Plugins);
+                const info = @typeInfo(Plugins).@"struct";
                 var route = base;
-                for (0..fields.len) |rev_offset| {
-                    const f = fields[fields.len - 1 - rev_offset];
-                    if (@hasDecl(f.type, "wrapRoute")) {
-                        route = f.type.wrapRoute(RouteHook(f.name), route);
+                for (0..info.field_names.len) |rev_offset| {
+                    const idx = info.field_names.len - 1 - rev_offset;
+                    const PT = info.field_types[idx];
+                    if (@hasDecl(PT, "wrapRoute")) {
+                        route = PT.wrapRoute(RouteHook(info.field_names[idx]), route);
                     }
                 }
                 break :blk route;

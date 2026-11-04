@@ -420,10 +420,10 @@ test "flash limits count received messages until they are read" {
     var state = try plugin.initRequest(&req);
     try std.testing.expectError(error.InvalidFlashKind, flash.add(&state, "", "x"));
     try std.testing.expectError(error.InvalidFlashKind, flash.add(&state, "has space", "x"));
-    try std.testing.expectError(error.InvalidFlashKind, flash.add(&state, "k" ** (max_kind_bytes + 1), "x"));
-    try std.testing.expectError(error.FlashTooLarge, flash.add(&state, "n", "x" ** (max_bytes - 3)));
+    try std.testing.expectError(error.InvalidFlashKind, flash.add(&state, &comptime @as([(max_kind_bytes + 1)]u8, @splat('k')), "x"));
+    try std.testing.expectError(error.FlashTooLarge, flash.add(&state, "n", &comptime @as([(max_bytes - 3)]u8, @splat('x'))));
     try std.testing.expect(!state.dirty);
-    try flash.add(&state, "n", "x" ** (max_bytes - 4));
+    try flash.add(&state, "n", &comptime @as([(max_bytes - 4)]u8, @splat('x')));
     try std.testing.expectError(error.FlashTooLarge, flash.add(&state, "n", ""));
     flash.reset(&state);
     for (0..max_messages) |_| try flash.add(&state, "n", "");
@@ -438,10 +438,10 @@ test "flash limits count received messages until they are read" {
     // Unread messages would be persisted again, so they still fill the budget.
     try std.testing.expectError(error.TooManyFlashMessages, flash.add(&loaded, "n", ""));
     try std.testing.expectEqual(@as(usize, max_messages), flash.read(&loaded).count);
-    try flash.add(&loaded, "n", "x" ** (max_bytes - 4));
+    try flash.add(&loaded, "n", &comptime @as([(max_bytes - 4)]u8, @splat('x')));
 
     // The largest session, CSRF secret, and flash still fit one cookie.
-    try loaded.set("p" ** sessions.max_payload_bytes);
+    try loaded.set(&comptime @as([sessions.max_payload_bytes]u8, @splat('p')));
     _ = try csrf.token(std.testing.io, &loaded);
     try plugin.save(&loaded, &res);
     try std.testing.expect(res.headers[1].value.len <= sessions.max_cookie_bytes);

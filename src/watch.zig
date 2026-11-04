@@ -441,7 +441,7 @@ const Fixture = struct {
 };
 
 fn expectGone(id: process.Child.Id) !void {
-    try testing.expectError(error.ProcessNotFound, posix.kill(id, @enumFromInt(0)));
+    try testing.expectError(error.ProcessNotFound, posix.kill(id, @fromBackingInt(@intCast(0))));
 }
 
 test "watch: repeated edits rebuild and restart, stopping each previous process" {
@@ -483,7 +483,7 @@ test "watch: failed build keeps the last working process and recovers on the nex
     try testing.expect(std.mem.indexOf(u8, f.out.written(), "keeping previous process") != null);
     // Still the same live process.
     try testing.expectEqual(working, f.watcher.pid().?);
-    try posix.kill(working, @enumFromInt(0));
+    try posix.kill(working, @fromBackingInt(@intCast(0)));
     try testing.expectEqual(Outcome.unchanged, try f.watcher.poll());
 
     try f.write("src/version", "v2");

@@ -73,7 +73,7 @@ test "typed JSON owns strings and rejects malformed and ambiguous requests" {
     try std.testing.expectError(error.InvalidJson, parser.parse(std.testing.allocator, &req, T));
     req.body = "";
     try std.testing.expectError(error.EmptyBody, parser.parse(std.testing.allocator, &req, T));
-    req.body = " " ** 33;
+    req.body = &comptime @as([33]u8, @splat(' '));
     try std.testing.expectError(error.BodyTooLarge, parser.parse(std.testing.allocator, &req, T));
     req.body = "{\"id\":7,\"name\":\"ada\"}";
 

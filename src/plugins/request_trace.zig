@@ -142,7 +142,7 @@ test "ID policy validates bounds and syntax" {
     try std.testing.expect(!validId(""));
     try std.testing.expect(!validId("bad value"));
     try std.testing.expect(!validId("bad\nvalue"));
-    try std.testing.expect(!validId("a" ** 65));
+    try std.testing.expect(!validId(&comptime @as([65]u8, @splat('a'))));
 }
 
 test "IDs, completion records, short circuits and errors" {

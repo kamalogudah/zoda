@@ -340,7 +340,7 @@ pub fn Deferred(comptime group: []const u8, comptime Context: type, comptime res
 
 fn Lazy(comptime kind: PropKind, comptime group: []const u8, comptime Context: type, comptime resolve: anytype) type {
     const info = @typeInfo(@TypeOf(resolve));
-    if (info != .@"fn" or info.@"fn".params.len != 2 or info.@"fn".return_type == null) {
+    if (info != .@"fn" or info.@"fn".param_types.len != 2 or info.@"fn".return_type == null) {
         @compileError(@tagName(kind) ++ " props take fn (context, std.mem.Allocator) T or E!T");
     }
     const Return = info.@"fn".return_type.?;
@@ -683,9 +683,9 @@ pub fn propKind(comptime T: type) PropKind {
 /// `P` can return.
 pub fn PropsError(comptime P: type) type {
     comptime var E = error{};
-    inline for (std.meta.fields(P)) |field| {
-        switch (comptime propKind(field.type)) {
-            .optional, .deferred, .once => E = E || Unmerged(field.type).Error,
+    inline for (@typeInfo(P).@"struct".field_types) |FieldType| {
+        switch (comptime propKind(FieldType)) {
+            .optional, .deferred, .once => E = E || Unmerged(FieldType).Error,
             .eager, .always => {},
         }
     }
@@ -810,7 +810,7 @@ pub const RouteContext = struct {
     /// It must outlive the `renderWith` call it is passed to.
     pub fn of(ctx: anytype) RouteContext {
         const info = @typeInfo(@TypeOf(ctx));
-        if (info != .pointer or info.pointer.size != .one or info.pointer.is_const) {
+        if (info != .pointer or info.pointer.size != .one or info.pointer.attrs.@"const") {
             @compileError("RouteContext.of takes a mutable single-item pointer such as *App.Context");
         }
         return .{ .tag = contextTag(info.pointer.child), .ptr = ctx };
@@ -993,7 +993,7 @@ pub fn Inertia(comptime SharedProps: type) type {
         ) Error(@TypeOf(props))!void {
             comptime {
                 const info = @typeInfo(@TypeOf(props));
-                if (info != .@"struct" or (info.@"struct".is_tuple and info.@"struct".fields.len != 0)) {
+                if (info != .@"struct" or (info.@"struct".is_tuple and info.@"struct".field_names.len != 0)) {
                     @compileError("Inertia props must be a struct with named fields");
                 }
             }
@@ -1133,7 +1133,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             const E = @TypeOf(errors);
             comptime {
                 const info = @typeInfo(E);
-                if (info != .@"struct" or (info.@"struct".is_tuple and info.@"struct".fields.len != 0)) {
+                if (info != .@"struct" or (info.@"struct".is_tuple and info.@"struct".field_names.len != 0)) {
                     @compileError("Inertia errors must be a struct with named fields");
                 }
             }
@@ -1148,11 +1148,12 @@ pub fn Inertia(comptime SharedProps: type) type {
             json.beginObject() catch return error.OutOfMemory;
             json.objectField("errors") catch return error.OutOfMemory;
             json.beginObject() catch return error.OutOfMemory;
-            inline for (std.meta.fields(E)) |field| {
-                const value = @field(errors, field.name);
-                const present = if (comptime @typeInfo(field.type) == .optional) value != null else true;
-                if (present and request.validates(field.name)) {
-                    json.objectField(field.name) catch return error.OutOfMemory;
+            const fields = @typeInfo(E).@"struct";
+            inline for (fields.field_names, fields.field_types) |field_name, FieldType| {
+                const value = @field(errors, field_name);
+                const present = if (comptime @typeInfo(FieldType) == .optional) value != null else true;
+                if (present and request.validates(field_name)) {
+                    json.objectField(field_name) catch return error.OutOfMemory;
                     json.write(value) catch return error.OutOfMemory;
                     sent += 1;
                 }
@@ -1204,7 +1205,7 @@ pub fn Inertia(comptime SharedProps: type) type {
             if (existing.next() != null) return error.LocationAlreadySet;
             if (!inertia) {
                 try res.setHeader("Location", destination);
-                emptyBody(res, @intFromEnum(followUpStatus(req)));
+                emptyBody(res, @backingInt(followUpStatus(req)));
                 return;
             }
             try reserveHeaders(res, 1, "X-Inertia-Location".len + destination.len);
@@ -1308,17 +1309,17 @@ pub fn Inertia(comptime SharedProps: type) type {
             json.objectField("props") catch return error.OutOfMemory;
             json.beginObject() catch return error.OutOfMemory;
             if (shared) |value| {
-                inline for (std.meta.fields(SharedProps)) |field| {
-                    const replaced = comptime std.mem.eql(u8, field.name, "errors");
-                    if (comptime !@hasField(P, field.name)) {
+                inline for (@typeInfo(SharedProps).@"struct".field_names) |field_name| {
+                    const replaced = comptime std.mem.eql(u8, field_name, "errors");
+                    if (comptime !@hasField(P, field_name)) {
                         if (!replaced or stored == null) {
-                            try writeProp(json, arena, partial, once_visit, field.name, @field(value, field.name));
+                            try writeProp(json, arena, partial, once_visit, field_name, @field(value, field_name));
                         }
                     }
                 }
             }
-            inline for (std.meta.fields(P)) |field| {
-                try writeProp(json, arena, partial, once_visit, field.name, @field(props, field.name));
+            inline for (@typeInfo(P).@"struct".field_names) |field_name| {
+                try writeProp(json, arena, partial, once_visit, field_name, @field(props, field_name));
             }
             // Clients treat `errors` as always present, as Laravel sends it.
             const shared_errors = shared != null and @hasField(SharedProps, "errors");
@@ -1346,8 +1347,8 @@ pub fn Inertia(comptime SharedProps: type) type {
                 // The list names every shared prop, even on partial reloads.
                 json.objectField("sharedProps") catch return error.OutOfMemory;
                 json.beginArray() catch return error.OutOfMemory;
-                inline for (std.meta.fields(SharedProps)) |field| {
-                    json.write(field.name) catch return error.OutOfMemory;
+                inline for (@typeInfo(SharedProps).@"struct".field_names) |field_name| {
+                    json.write(field_name) catch return error.OutOfMemory;
                 }
                 json.endArray() catch return error.OutOfMemory;
             }
@@ -1400,12 +1401,13 @@ pub fn Inertia(comptime SharedProps: type) type {
         fn deferredProps(comptime P: type) []const DeferredProp {
             var found: []const DeferredProp = &.{};
             for (.{ SharedProps, P }, .{ true, false }) |T, is_shared| {
-                for (std.meta.fields(T)) |field| {
-                    if (propKind(field.type) != .deferred) continue;
-                    if (is_shared and @hasField(P, field.name)) continue;
-                    checkListedName("deferred", field.name);
-                    const once_key: ?[]const u8 = if (listsOnce(field.type)) field.type.inertia_once_key orelse field.name else null;
-                    found = found ++ .{DeferredProp{ .group = Unmerged(field.type).inertia_group, .name = field.name, .shared = is_shared, .once_key = once_key }};
+                const fields = @typeInfo(T).@"struct";
+                for (fields.field_names, fields.field_types) |field_name, FieldType| {
+                    if (propKind(FieldType) != .deferred) continue;
+                    if (is_shared and @hasField(P, field_name)) continue;
+                    checkListedName("deferred", field_name);
+                    const once_key: ?[]const u8 = if (listsOnce(FieldType)) FieldType.inertia_once_key orelse field_name else null;
+                    found = found ++ .{DeferredProp{ .group = Unmerged(FieldType).inertia_group, .name = field_name, .shared = is_shared, .once_key = once_key }};
                 }
             }
             return found;
@@ -1431,17 +1433,18 @@ pub fn Inertia(comptime SharedProps: type) type {
         fn onceProps(comptime P: type) []const OnceProp {
             var found: []const OnceProp = &.{};
             for (.{ SharedProps, P }, .{ true, false }) |T, is_shared| {
-                for (std.meta.fields(T)) |field| {
-                    if (!listsOnce(field.type)) continue;
-                    if (is_shared and @hasField(P, field.name)) continue;
-                    checkListedName("once", field.name);
-                    const key = field.type.inertia_once_key orelse field.name;
+                const fields = @typeInfo(T).@"struct";
+                for (fields.field_names, fields.field_types) |field_name, FieldType| {
+                    if (!listsOnce(FieldType)) continue;
+                    if (is_shared and @hasField(P, field_name)) continue;
+                    checkListedName("once", field_name);
+                    const key = FieldType.inertia_once_key orelse field_name;
                     for (found) |earlier| {
                         if (std.mem.eql(u8, earlier.key, key)) {
-                            @compileError("once props \"" ++ earlier.name ++ "\" and \"" ++ field.name ++ "\" share the key \"" ++ key ++ "\"");
+                            @compileError("once props \"" ++ earlier.name ++ "\" and \"" ++ field_name ++ "\" share the key \"" ++ key ++ "\"");
                         }
                     }
-                    found = found ++ .{OnceProp{ .name = field.name, .key = key, .shared = is_shared }};
+                    found = found ++ .{OnceProp{ .name = field_name, .key = key, .shared = is_shared }};
                 }
             }
             return found;
@@ -1491,17 +1494,18 @@ pub fn Inertia(comptime SharedProps: type) type {
         fn mergeProps(comptime P: type) []const MergeProp {
             var found: []const MergeProp = &.{};
             for (.{ SharedProps, P }, .{ true, false }) |T, is_shared| {
-                for (std.meta.fields(T)) |field| {
-                    const mode = mergeMode(field.type) orelse continue;
-                    if (is_shared and @hasField(P, field.name)) continue;
-                    checkListedName("merged", field.name);
+                const fields = @typeInfo(T).@"struct";
+                for (fields.field_names, fields.field_types) |field_name, FieldType| {
+                    const mode = mergeMode(FieldType) orelse continue;
+                    if (is_shared and @hasField(P, field_name)) continue;
+                    checkListedName("merged", field_name);
                     found = found ++ .{MergeProp{
-                        .name = field.name,
+                        .name = field_name,
                         .mode = mode,
-                        .match_on = field.type.inertia_match_on,
-                        .kind = propKind(field.type),
+                        .match_on = FieldType.inertia_match_on,
+                        .kind = propKind(FieldType),
                         .shared = is_shared,
-                        .scroll = @hasDecl(field.type, "inertia_scroll"),
+                        .scroll = @hasDecl(FieldType, "inertia_scroll"),
                     }};
                 }
             }
@@ -2048,7 +2052,7 @@ test "shared props built from the route context read session state" {
         .response_allocator = testing.allocator,
         .plugins = .{
             .sessions = .{
-                .keys = &.{.{ .id = 1, .secret = "a" ** 32 }},
+                .keys = &.{.{ .id = 1, .secret = &comptime @as([32]u8, @splat('a')) }},
                 .lifetime_seconds = 300,
                 .now_seconds = struct {
                     fn now() i64 {
@@ -2244,7 +2248,7 @@ test "unsafe targets, components, and configuration are rejected" {
         try testing.expectError(error.InvalidLayout, bad.validate());
         try testing.expectError(error.InvalidLayout, bad.render(&req, &res, "Home", .{}));
     }
-    for ([_][]const u8{ "", "a\"b", "a b", "x" ** 65 }) |root_id| {
+    for ([_][]const u8{ "", "a\"b", "a b", &comptime @as([65]u8, @splat('x')) }) |root_id| {
         const bad: TestInertia = .{ .layout = test_layout, .root_id = root_id };
         try testing.expectError(error.InvalidRootId, bad.validate());
     }
@@ -2652,8 +2656,8 @@ test "optional callback errors propagate and leave the response unchanged" {
 
 test "malformed, duplicate, and oversized partial headers fail without changing the response" {
     var state: PartialTest = .{};
-    const too_many = "a," ** max_partial_props ++ "a";
-    const too_long = "a" ** (max_partial_bytes + 1);
+    const too_many = repeatStr("a,", max_partial_props) ++ "a";
+    const too_long = &comptime @as([(max_partial_bytes + 1)]u8, @splat('a'));
     const cases = .{
         .{ "X-Inertia-Partial-Data", "", error.MalformedPartialHeader },
         .{ "X-Inertia-Partial-Data", "todos,", error.MalformedPartialHeader },
@@ -2691,11 +2695,11 @@ test "malformed, duplicate, and oversized partial headers fail without changing 
     // The limits themselves are accepted.
     var at_limit = response.Response.init(testing.allocator);
     defer at_limit.deinit();
-    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = "a," ** (max_partial_props - 1) ++ "todos" }}), &at_limit);
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = repeatStr("a,", (max_partial_props - 1)) ++ "todos" }}), &at_limit);
     try expectProps("\"todos\":[\"milk\"],\"flash\":\"saved\",\"errors\":{}", at_limit.body);
     var long_name = response.Response.init(testing.allocator);
     defer long_name.deinit();
-    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = "a" ** max_partial_bytes }}), &long_name);
+    try state.render(&partial_plugin, partialHeaders("Todos/Index", &.{.{ .name = "X-Inertia-Partial-Data", .value = &comptime @as([max_partial_bytes]u8, @splat('a')) }}), &long_name);
 
     const duplicates = .{
         &[_]router.Header{ .{ .name = "X-Inertia", .value = "true" }, .{ .name = "X-Inertia-Partial-Component", .value = "Todos/Index" }, .{ .name = "x-inertia-partial-component", .value = "Todos/Index" } },
@@ -3255,7 +3259,7 @@ test "reset scroll props are replaced and marked reset, and filtered ones are no
 }
 
 test "invalid scroll page names fail without changing the response" {
-    const long = "p" ** 65;
+    const long = &comptime @as([65]u8, @splat('p'));
     inline for (.{ "", "a b", "page&x=1", "users[page]", long }) |name| {
         // Checked even when the prop is not sent.
         inline for (.{ &inertia_headers, partialHeaders("Feed", &.{.{ .name = "X-Inertia-Partial-Data", .value = "title" }}) }) |headers| {
@@ -3276,8 +3280,8 @@ test "invalid scroll page names fail without changing the response" {
     const req = testRequest(.get, "/feed", &inertia_headers);
     var ok = response.Response.init(testing.allocator);
     defer ok.deinit();
-    try scroll_plugin.render(&req, &ok, "Feed", .{ .items = scroll(@as([]const u32, &.{1}), .{ .page_name = "p" ** 64, .current = 1 }) });
-    try testing.expect(std.mem.indexOf(u8, ok.body, "\"pageName\":\"" ++ "p" ** 64 ++ "\"") != null);
+    try scroll_plugin.render(&req, &ok, "Feed", .{ .items = scroll(@as([]const u32, &.{1}), .{ .page_name = &comptime @as([64]u8, @splat('p')), .current = 1 }) });
+    try testing.expect(std.mem.indexOf(u8, ok.body, "\"pageName\":\"" ++ (&comptime @as([64]u8, @splat('p'))) ++ "\"") != null);
 }
 
 const ScrollShared = struct {
@@ -3595,8 +3599,8 @@ test "malformed, duplicate, and oversized once headers fail without changing the
         .{ "plans, rates", error.MalformedPartialHeader },
         .{ "a..b", error.MalformedPartialHeader },
         .{ "plans;x", error.MalformedPartialHeader },
-        .{ "a," ** max_partial_props ++ "a", error.PartialHeaderTooLarge },
-        .{ "a" ** (max_partial_bytes + 1), error.PartialHeaderTooLarge },
+        .{ repeatStr("a,", max_partial_props) ++ "a", error.PartialHeaderTooLarge },
+        .{ &comptime @as([(max_partial_bytes + 1)]u8, @splat('a')), error.PartialHeaderTooLarge },
     };
     inline for (cases) |case| {
         var res = response.Response.init(testing.allocator);
@@ -3939,7 +3943,7 @@ test "flash counts toward the body limit and a failure leaves it unread" {
     const ordinary = testRequest(.get, "/", &.{});
     // The largest flash: one message of every remaining byte, each of which
     // the script element escapes to six.
-    const text = "<" ** (flash_mod.max_bytes - 4);
+    const text = &comptime @as([(flash_mod.max_bytes - 4)]u8, @splat('<'));
     const prefix = "<script data-page=\"app\" type=\"application/json\">{\"component\":\"Home\",\"props\":{\"errors\":{}},\"url\":\"/\",\"version\":null,\"flash\":{\"n\":\"";
     const suffix = "\"}}</script><div id=\"app\"></div>";
     const size = prefix.len + text.len * "\\u003c".len + suffix.len;
@@ -4077,11 +4081,11 @@ test "X-Inertia-Error-Bag nests errors under the bag and bad bags change nothing
         shown.body,
     );
 
-    const longest = "b" ** max_error_bag_bytes;
+    const longest = &comptime @as([max_error_bag_bytes]u8, @splat('b'));
     const at_limit = try FlashTest.visit(&app, .post, "/todos", null, ErrorsTest.withBag(longest), &a);
     try testing.expectEqual(@as(u16, 303), at_limit.status);
 
-    for ([_][]const u8{ "", "has space", "dot.ted", "b" ** (max_error_bag_bytes + 1), "caf\xc3\xa9" }) |bag| {
+    for ([_][]const u8{ "", "has space", "dot.ted", &comptime @as([(max_error_bag_bytes + 1)]u8, @splat('b')), "caf\xc3\xa9" }) |bag| {
         const headers = inertia_headers ++ [_]router.Header{.{ .name = "X-Inertia-Error-Bag", .value = bag }};
         try testing.expectError(error.MalformedErrorBagHeader, FlashTest.visit(&app, .post, "/todos", null, &headers, &a));
     }
@@ -4160,7 +4164,7 @@ test "redirectWithErrors validates the path, fragments, limits, and size first" 
     try testing.expect(!set_state.dirty);
 
     // Errors share the flash budget with unread messages.
-    const big = "x" ** (flash_mod.max_bytes - 3 - errors_flash_kind.len - "{\"text\":\"\"}".len);
+    const big = &comptime @as([(flash_mod.max_bytes - 3 - errors_flash_kind.len - "{\"text\":\"\"}".len)]u8, @splat('x'));
     var fits_state = try emptySession();
     var fits = response.Response.init(testing.allocator);
     defer fits.deinit();
@@ -4169,7 +4173,7 @@ test "redirectWithErrors validates the path, fragments, limits, and size first" 
     var full = response.Response.init(testing.allocator);
     defer full.deinit();
     try testing.expectError(error.FlashTooLarge, plugin.redirectWithErrors(&plain_post, &full, .{ .plugin = &flash, .session = &full_state }, "/todos", .{ .text = big }));
-    try testing.expectError(error.FlashTooLarge, plugin.redirectWithErrors(&plain_post, &full, .{ .plugin = &flash, .session = &full_state }, "/todos", .{ .text = "x" ** flash_mod.max_bytes }));
+    try testing.expectError(error.FlashTooLarge, plugin.redirectWithErrors(&plain_post, &full, .{ .plugin = &flash, .session = &full_state }, "/todos", .{ .text = &comptime @as([flash_mod.max_bytes]u8, @splat('x')) }));
     try testing.expectEqual(@as(usize, 0), full.header_count);
     try testing.expect(!full_state.dirty);
 }
@@ -4489,8 +4493,8 @@ test "non-precognitive requests are unaffected and cannot be answered" {
 
 test "malformed, duplicate, and oversized precognition headers fail without changing the response" {
     const plugin: TestInertia = .{ .layout = test_layout };
-    const too_many = "a," ** max_precognition_fields ++ "a";
-    const too_long = "a" ** (max_precognition_bytes + 1);
+    const too_many = repeatStr("a,", max_precognition_fields) ++ "a";
+    const too_long = &comptime @as([(max_precognition_bytes + 1)]u8, @splat('a'));
     const cases = .{
         .{ &[_]router.Header{.{ .name = "Precognition", .value = "false" }}, error.MalformedPrecognitionHeader },
         .{ &[_]router.Header{.{ .name = "Precognition", .value = "TRUE" }}, error.MalformedPrecognitionHeader },
@@ -4516,7 +4520,7 @@ test "malformed, duplicate, and oversized precognition headers fail without chan
         try testing.expectEqual(@as(usize, 0), res.header_count);
     }
     // The limits themselves are accepted.
-    const at_limit = "a," ** (max_precognition_fields - 1) ++ "a";
+    const at_limit = repeatStr("a,", (max_precognition_fields - 1)) ++ "a";
     try testing.expect(try precognition(&precognitionRequest(&.{.{ .name = "Precognition-Validate-Only", .value = at_limit }})) != null);
 }
 
@@ -4652,7 +4656,7 @@ test "SSR failures fall back to the client-side shell and are reported" {
     try testing.expectEqualStrings(shell, res.body);
 
     SsrReports.reset();
-    const big_answer = "{\"body\":\"" ++ "x" ** 300 ++ "\"}";
+    const big_answer = "{\"body\":\"" ++ (&comptime @as([300]u8, @splat('x'))) ++ "\"}";
     var server: ssr_client.TestServer = undefined;
     try server.start(ssrReply(big_answer), 0);
     const limited: TestInertia = .{ .layout = ssr_layout, .ssr = server.config(), .on_ssr_failure = SsrReports.report };
@@ -4699,4 +4703,13 @@ test "@inertiaHead is optional, single, before @inertia, and removed without SSR
         try testing.expectError(error.InvalidSsr, bad.validate());
         try testing.expectError(error.InvalidSsr, bad.render(&req, &res, "Home", .{}));
     }
+}
+
+inline fn repeatStr(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime blk: {
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const final = buf;
+        break :blk &final;
+    };
 }

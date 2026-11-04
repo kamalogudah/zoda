@@ -17,7 +17,7 @@ sample todos so there is something to page through.
 
 ## Run it
 
-You need Zig 0.16.0 and Node.js 20 or newer. From the repository root:
+You need Zig 0.17.1 and Node.js 20 or newer. From the repository root:
 
 ```sh
 (cd examples/inertia/react && npm install && npm run build)

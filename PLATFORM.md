@@ -17,14 +17,14 @@ The exact compiler version Zoda is developed and tested against:
 
 | | |
 |---|---|
-| **Zig version** | `0.16.0` |
-| **Release date** | 2026-04-13 |
-| **Notes** | [ziglang.org release notes](https://ziglang.org/download/0.16.0/) |
+| **Zig version** | `0.17.1` |
+| **Release date** | 2026-11-02 |
+| **Notes** | [ziglang.org release notes](https://ziglang.org/download/0.17.1/) |
 
 This is an exact, reproducible pin. Toolchain upgrades are deliberate
 decisions: update this file and the CI workflow, and validate that a clean
 checkout still passes before merging an upgrade. The build.zig.zon
-`minimum_zig_version = "0.16.0"` remains the compatibility floor and must never
+`minimum_zig_version = "0.17.1"` remains the compatibility floor and must never
 exceed the pinned version.
 
 ## 2. Supported platform
@@ -51,27 +51,27 @@ Linux it is silently ignored.
 ## 3. Installing the pinned compiler
 
 Download tarballs are published at
-[ziglang.org/download/0.16.0](https://ziglang.org/download/0.16.0/).
+[ziglang.org/download/0.17.1](https://ziglang.org/download/0.17.1/).
 
 **Primary method — official tarball (`x86_64-linux`):**
 
 ```sh
 curl -fL -o zig.tar.xz \
-  https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
-echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig.tar.xz" | sha256sum -c
+  https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz
+echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  zig.tar.xz" | sha256sum -c
 tar -xf zig.tar.xz
-export PATH="$PWD/zig-x86_64-linux-0.16.0:$PATH"
+export PATH="$PWD/zig-x86_64-linux-0.17.1:$PATH"
 ```
 
-**Alternative methods** (must still report `zig version` → `0.16.0`):
+**Alternative methods** (must still report `zig version` → `0.17.1`):
 
-- Snap: `sudo snap install zig --channel=0.16/beta` (classic confinement)
-- Homebrew (on Linux): `brew install zig@0.16.0`
+- Snap: `sudo snap install zig --channel=0.17/beta` (classic confinement)
+- Homebrew (on Linux): `brew install zig@0.17.1`
 
 Verify before use:
 
 ```sh
-zig version   # must print exactly: 0.16.0
+zig version   # must print exactly: 0.17.1
 ```
 
 ## 4. Clean-checkout validation
@@ -80,7 +80,7 @@ From a fresh clone with the pinned compiler on the primary platform, the
 following must all pass:
 
 ```sh
-zig version                 # 0.16.0
+zig version                 # 0.17.1
 zig fmt --check build.zig src
 zig build                   # compiles the library, executable, and tests
 zig build test              # runs library + executable test suites

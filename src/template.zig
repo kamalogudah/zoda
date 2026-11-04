@@ -128,9 +128,9 @@ fn startsClosingTag(source: []const u8, name: []const u8) bool {
 }
 
 fn appendField(out: *std.ArrayList(u8), res: *response.Response, name: []const u8, data: anytype, trusted: bool) RenderError!void {
-    inline for (@typeInfo(@TypeOf(data)).@"struct".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) {
-            const value = @field(data, field.name);
+    inline for (@typeInfo(@TypeOf(data)).@"struct".field_names) |field_name| {
+        if (std.mem.eql(u8, name, field_name)) {
+            const value = @field(data, field_name);
             if (@TypeOf(value) == TrustedHtml) {
                 if (!trusted) return error.UnsupportedFieldType;
                 return appendBounded(out, res, value.bytes);
