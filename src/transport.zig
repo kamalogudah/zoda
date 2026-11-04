@@ -348,7 +348,7 @@ fn processRequest(
     }
 
     if (deadlines) |operation_deadlines| operation_deadlines.write();
-    const status: std.http.Status = @enumFromInt(res.status_code);
+    const status: std.http.Status = @fromBackingInt(@intCast(res.status_code));
     if (bodyless) {
         try writeBodylessHead(wire_req.server.out, version, status, keep_alive, extra.items);
         return if (keep_alive) .keep_alive else .close;
@@ -450,7 +450,7 @@ fn statusAllowsBody(code: u16) bool {
 }
 
 fn statusFromCode(code: u16) std.http.Status {
-    return @enumFromInt(code);
+    return @fromBackingInt(@intCast(code));
 }
 
 fn methodFromStd(method: std.http.Method) router.Method {
@@ -464,6 +464,7 @@ fn methodFromStd(method: std.http.Method) router.Method {
         .OPTIONS => .options,
         .TRACE => .trace,
         .CONNECT => .connect,
+        .QUERY => .query,
     };
 }
 
@@ -518,7 +519,7 @@ fn writeBodylessHead(
     keep_alive: bool,
     headers: []const std.http.Header,
 ) !void {
-    try out.print("{t} {d} {s}\r\n", .{ version, @intFromEnum(status), status.phrase() orelse "" });
+    try out.print("{t} {d} {s}\r\n", .{ version, @backingInt(status), status.phrase() orelse "" });
     switch (version) {
         .@"HTTP/1.0" => if (keep_alive) try out.writeAll("connection: keep-alive\r\n"),
         .@"HTTP/1.1" => if (!keep_alive) try out.writeAll("connection: close\r\n"),
@@ -535,7 +536,7 @@ fn writeRawError(out: *std.Io.Writer, status: std.http.Status) !void {
     const phrase = status.phrase() orelse "Error";
     try out.print(
         "HTTP/1.1 {d} {s}\r\nconnection: close\r\ncontent-length: {d}\r\ncontent-type: text/plain\r\n\r\n{s}",
-        .{ @intFromEnum(status), phrase, phrase.len, phrase },
+        .{ @backingInt(status), phrase, phrase.len, phrase },
     );
     try out.flush();
 }
@@ -691,6 +692,22 @@ test "HEAD retains representation length and emits no body" {
     try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\n"));
 }
 
+test "QUERY maps to router.Method.query and its body reaches dispatch" {
+    try std.testing.expectEqual(router.Method.query, methodFromStd(.QUERY));
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    const output = try runTest(
+        "QUERY /search HTTP/1.1\r\nHost: example\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nq=zig",
+        &app,
+        .{},
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expect(std.mem.startsWith(u8, output, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.indexOf(u8, output, "x-target: /search\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\nq=zig"));
+}
+
 test "chunk sizes are strict hexadecimal with optional extensions" {
     try std.testing.expectEqual(@as(u64, 0x1f), try parseChunkSize("1F"));
     try std.testing.expectEqual(@as(u64, 3), try parseChunkSize("3;name=value"));
@@ -769,6 +786,6 @@ test "HTTP/2 prior knowledge and h2c upgrade stay HTTP/1.1 only" {
     );
     defer std.testing.allocator.free(upgrade);
     try std.testing.expect(std.mem.startsWith(u8, upgrade, "HTTP/1.1 200"));
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(upgrade, "upgrade") == null);
+    try std.testing.expect(std.ascii.findIgnoreCase(upgrade, "upgrade") == null);
     try std.testing.expectEqual(@as(usize, 1), calls);
 }

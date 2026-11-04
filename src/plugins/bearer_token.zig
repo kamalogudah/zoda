@@ -147,7 +147,7 @@ test "registered plugin validates routes and guards before NotFound" {
     const duplicate_headers = [_]router.Header{ .{ .name = "Authorization", .value = "Bearer accepted" }, .{ .name = "AUTHORIZATION", .value = "Bearer accepted" } };
     const rejected_headers = .{
         &[_]router.Header{.{ .name = "Authorization", .value = "Bearer a b" }},
-        &[_]router.Header{.{ .name = "Authorization", .value = "Bearer " ++ ("a" ** 4097) }},
+        &[_]router.Header{.{ .name = "Authorization", .value = "Bearer " ++ (&comptime @as([4097]u8, @splat('a'))) }},
         &duplicate_headers,
     };
     inline for (rejected_headers) |headers| {

@@ -310,7 +310,7 @@ test "devloop: demo rebuilds, restarts, and recovers from a compile failure" {
     const last_pid = watcher.pid().?;
     watcher.deinit();
     try testing.expectEqual(@as(?std.process.Child.Id, null), watcher.pid());
-    try testing.expectError(error.ProcessNotFound, std.posix.kill(last_pid, @enumFromInt(0)));
+    try testing.expectError(error.ProcessNotFound, std.posix.kill(last_pid, @fromBackingInt(@intCast(0))));
     try testing.expectEqual(@as(?[]u8, null), try get(io, &address));
 
     var builds: [edits + 4]i64 = undefined;

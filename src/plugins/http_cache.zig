@@ -334,7 +334,7 @@ test "cache policy refuses invalid, repeated, and personalized shared caching" {
 test "validators format strong and weak tags and reject invalid values" {
     var res = response.Response.init(testing.allocator);
     defer res.deinit();
-    const bad = [_][]const u8{ "a\"b", "with space", "tab\t", "\x7f", "é", "a\r\nX: y", "x" ** (max_tag_bytes + 1) };
+    const bad = [_][]const u8{ "a\"b", "with space", "tab\t", "\x7f", "é", "a\r\nX: y", &comptime @as([(max_tag_bytes + 1)]u8, @splat('x')) };
     for (bad) |tag| try testing.expectError(error.InvalidETag, setETag(&res, .strong(tag)));
     try testing.expectEqual(@as(usize, 0), res.header_count);
     try setETag(&res, .weak("v1-!#~"));

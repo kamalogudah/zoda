@@ -12,7 +12,7 @@ struct, so the compiler knows every plugin your app uses.
 
 You need:
 
-- Zig **0.16.0** exactly (other versions are not supported)
+- Zig **0.17.1** exactly (other versions are not supported)
 - Linux on x86_64 (the primary platform; others are best-effort)
 - Node.js and npm, for Part 2 only
 

@@ -45,8 +45,8 @@ Documentation-only and test-only changes do not need a new measurement.
 ### What to do
 
 1. Make sure no other server is listening on the benchmark port
-   (`ss -ltnp | grep 8080`). Zig 0.16 sets `SO_REUSEPORT`, so a stray process
-   silently takes part of the traffic.
+   (`ss -ltnp | grep 8080`). Zig 0.16 and 0.17 set `SO_REUSEPORT`, so a stray
+   process silently takes part of the traffic.
 2. Run the commands in
    [Standard benchmark procedure](performance_improvement.md#standard-benchmark-procedure)
    exactly as written. Use a ReleaseFast build.

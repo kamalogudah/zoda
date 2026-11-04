@@ -457,7 +457,7 @@ test "SSR settings are validated" {
         .{ .path = "render" },
         .{ .path = "/a b" },
         .{ .path = "/a\r\nX: y" },
-        .{ .path = "/" ++ "a" ** max_path_bytes },
+        .{ .path = "/" ++ (&comptime @as([max_path_bytes]u8, @splat('a'))) },
     };
     for (bad) |config| try testing.expectError(error.InvalidSsr, config.validate());
 }

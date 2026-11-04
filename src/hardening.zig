@@ -590,7 +590,7 @@ test "limits reject oversized heads and bodies with bounded memory" {
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(testing.allocator);
         try payload.appendSlice(testing.allocator, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n");
-        for (0..64) |_| try payload.appendSlice(testing.allocator, "20\r\n" ++ "c" ** 32 ++ "\r\n");
+        for (0..64) |_| try payload.appendSlice(testing.allocator, "20\r\n" ++ (&comptime @as([32]u8, @splat('c'))) ++ "\r\n");
         try payload.appendSlice(testing.allocator, "0\r\n\r\n");
         try expectRejected(&h, payload.items, 413);
     }
@@ -601,7 +601,7 @@ test "limits reject oversized heads and bodies with bounded memory" {
         var client = try h.connect();
         defer client.close();
         try client.send("POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n40000000\r\n");
-        try client.send("c" ** 2048);
+        try client.send(&comptime @as([2048]u8, @splat('c')));
         const reply = try client.readResponse(false);
         defer reply.deinit();
         try testing.expectEqual(@as(u16, 413), reply.status);
@@ -609,10 +609,10 @@ test "limits reject oversized heads and bodies with bounded memory" {
     }
 
     // Head limits: target, header count, header bytes, and wire head size.
-    try expectRejected(&h, "GET /" ++ "a" ** 300 ++ " HTTP/1.1\r\nHost: t\r\n\r\n", 414);
+    try expectRejected(&h, "GET /" ++ (&comptime @as([300]u8, @splat('a'))) ++ " HTTP/1.1\r\nHost: t\r\n\r\n", 414);
     try expectRejected(&h, "GET / HTTP/1.1\r\nA: 1\r\nB: 1\r\nC: 1\r\nD: 1\r\nE: 1\r\nF: 1\r\nG: 1\r\nH: 1\r\nI: 1\r\n\r\n", 431);
-    try expectRejected(&h, "GET / HTTP/1.1\r\nX-Big: " ++ "v" ** 600 ++ "\r\n\r\n", 431);
-    try expectRejected(&h, "GET / HTTP/1.1\r\nX-Big: " ++ "v" ** 4096 ++ "\r\n\r\n", 431);
+    try expectRejected(&h, "GET / HTTP/1.1\r\nX-Big: " ++ (&comptime @as([600]u8, @splat('v'))) ++ "\r\n\r\n", 431);
+    try expectRejected(&h, "GET / HTTP/1.1\r\nX-Big: " ++ (&comptime @as([4096]u8, @splat('v'))) ++ "\r\n\r\n", 431);
 
     try testing.expectEqual(@as(usize, 0), h.dispatches());
     try h.expectBaseline();

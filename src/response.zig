@@ -265,7 +265,7 @@ pub const Response = struct {
         if (self.content_type.len != 0) self.allocator.free(@constCast(self.content_type));
         self.body = &.{};
         self.content_type = &.{};
-        self.status_code = @intFromEnum(status);
+        self.status_code = @backingInt(status);
         self.handled = true;
         self.generated = false;
     }

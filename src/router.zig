@@ -40,6 +40,7 @@ pub const Method = enum {
     options,
     trace,
     connect,
+    query,
 };
 
 /// An ordered query pair. The Phase 0.5 request parser (`src/request.zig`)

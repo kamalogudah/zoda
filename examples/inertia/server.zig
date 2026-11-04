@@ -577,7 +577,7 @@ fn testApp(store: *Store) !App {
         .response_allocator = std.testing.allocator,
         .plugins = .{
             .inertia = .{ .layout = layout, .version = .{ .value = "v1" }, .shared = .{ .value = .{ .app = "Zoda", .framework = "test" } }, .encrypt_history = true, .now_milliseconds = testMilliseconds },
-            .sessions = .{ .keys = &.{.{ .id = 1, .secret = "x" ** 32 }}, .lifetime_seconds = 300, .now_seconds = testClock },
+            .sessions = .{ .keys = &.{.{ .id = 1, .secret = &comptime @as([32]u8, @splat('x')) }}, .lifetime_seconds = 300, .now_seconds = testClock },
             .store = .{ .value = store },
         },
         .route_fn = route,
@@ -735,7 +735,7 @@ test "validation errors redirect back and show once, and stale clients reload" {
     try std.testing.expect(sessionCookie(&again) == null);
 
     // Without a bag, an overlong todo's error is top-level.
-    var long = try visit(&app, .post, "/todos", &browser.with(inertia_json), "{\"text\":\"" ++ "x" ** (max_text_bytes + 1) ++ "\"}");
+    var long = try visit(&app, .post, "/todos", &browser.with(inertia_json), "{\"text\":\"" ++ (&comptime @as([(max_text_bytes + 1)]u8, @splat('x'))) ++ "\"}");
     defer long.deinit();
     const long_headers = [_]zoda.request.Header{
         .{ .name = "X-Inertia", .value = "true" },
