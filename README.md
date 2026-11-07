@@ -15,7 +15,15 @@ explicitly. It targets JSON APIs and server-rendered sites.
 
 ## Requirements
 
-- Zig **0.17.1** (exact pin). Other versions are not supported.
+- Zig **0.17.1** (exact pin) on `main`. Each Zoda release pins exactly one
+  Zig version; pick the release that matches your compiler:
+
+  | Zig version | Zoda release |
+  | --- | --- |
+  | 0.17.1 | [`v0.17.1`](https://github.com/kamalogudah/zoda/tree/v0.17.1) and `main` |
+  | 0.16.0 | [`v0.16.0`](https://github.com/kamalogudah/zoda/tree/v0.16.0) |
+
+  Other Zig versions are not supported.
 - Primary platform: `x86_64-linux-gnu`. Other targets are best-effort.
 
 [`PLATFORM.md`](PLATFORM.md) covers installation, the allocator and threading
@@ -80,10 +88,15 @@ directly with `./zig-out/bin/zoda serve [port] [docroot]`; with a
 
 ## Using Zoda in your project
 
-Add the dependency (Zoda is not tagged yet, so point it at a commit):
+Add the dependency, pinned to the release tag that matches your Zig version
+(see [Requirements](#requirements)):
 
 ```sh
-zig fetch --save git+https://github.com/kamalogudah/zoda
+# Zig 0.17.1
+zig fetch --save git+https://github.com/kamalogudah/zoda#v0.17.1
+
+# Zig 0.16.0
+zig fetch --save git+https://github.com/kamalogudah/zoda#v0.16.0
 ```
 
 Then import the module in `build.zig`:
