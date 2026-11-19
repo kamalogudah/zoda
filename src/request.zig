@@ -37,6 +37,7 @@ const router = @import("router.zig");
 
 pub const Method = router.Method;
 pub const QueryPair = router.QueryPair;
+pub const Trailer = router.Trailer;
 
 /// Configurable request bounds (§3.4 defaults). The transport exposes these
 /// incrementally while reading (phase 0.5, #7); here they bound target parsing
@@ -48,6 +49,10 @@ pub const Limits = struct {
     max_headers: usize = 100,
     /// Maximum total header name+value bytes.
     header_bytes: usize = 32 * 1024,
+    /// Maximum number of chunk trailer fields (separate from `max_headers`).
+    max_trailers: usize = 8,
+    /// Maximum chunk trailer section bytes, field lines and CRLFs included.
+    trailer_bytes: usize = 4 * 1024,
     /// Maximum number of decoded path segments.
     max_path_segments: usize = 128,
     /// Maximum number of query pairs.
@@ -112,6 +117,8 @@ pub const RequestArena = struct {
     query: []const QueryPair = &.{},
     /// Repeated header fields retained in request order.
     headers: []const Header = &.{},
+    /// Allowlisted chunk trailers, kept apart from `headers`.
+    trailers: []const Trailer = &.{},
     /// Owned copy of the request body.
     body: []const u8 = &.{},
 
@@ -168,6 +175,7 @@ pub const RequestArena = struct {
             .segments = self.segments,
             .query = self.query,
             .headers = self.headers,
+            .trailers = self.trailers,
             .body = self.body,
         };
     }

@@ -142,6 +142,7 @@ fn processRequest(
     defer arena.deinit();
 
     var headers: std.ArrayList(request.Header) = .empty;
+    var trailer_list: std.ArrayList(request.Trailer) = .empty;
     var header_bytes: usize = 0;
     var saw_content_length = false;
     var saw_transfer_encoding = false;
@@ -202,7 +203,7 @@ fn processRequest(
         var trailer_section: std.ArrayList(u8) = .empty;
 
         if (transfer_encoding == .chunked) {
-            readChunked(wire_req.server.reader.in, &body, &trailer_section, arena.allocator(), limits.header_bytes) catch |err| {
+            readChunked(wire_req.server.reader.in, &body, &trailer_section, arena.allocator(), limits.trailer_bytes) catch |err| {
                 try reject(wire_req, switch (err) {
                     error.BodyTooLarge => .payload_too_large,
                     error.TrailersTooLarge => .request_header_fields_too_large,
@@ -243,8 +244,8 @@ fn processRequest(
             return .close;
         };
 
-        // Chunk trailers share the request header limits and are exposed to
-        // dispatch as additional ordered header fields.
+        // Chunk trailers are parsed strictly, restricted to an allowlist, and
+        // stored apart from the head fields. They never reach `arena.headers`.
         var trailers: []const u8 = trailer_section.items;
         while (trailers.len != 0) {
             const end = std.mem.indexOf(u8, trailers, "\r\n") orelse {
@@ -258,42 +259,33 @@ fn processRequest(
                 try reject(wire_req, .bad_request, version, deadlines);
                 return .close;
             };
-            const header: std.http.Header = .{
+            const trailer: request.Trailer = .{
                 .name = line[0..colon],
                 .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
             };
-            if (!validHeader(header.name, header.value) or
-                std.ascii.eqlIgnoreCase(header.name, "content-length") or
-                std.ascii.eqlIgnoreCase(header.name, "transfer-encoding"))
-            {
+            if (!validHeader(trailer.name, trailer.value) or !trailerAllowed(trailer.name)) {
                 try reject(wire_req, .bad_request, version, deadlines);
                 return .close;
             }
-            if (headers.items.len >= limits.max_headers) {
+            for (trailer_list.items) |seen| {
+                if (std.ascii.eqlIgnoreCase(seen.name, trailer.name)) {
+                    try reject(wire_req, .bad_request, version, deadlines);
+                    return .close;
+                }
+            }
+            if (trailer_list.items.len >= limits.max_trailers) {
                 try reject(wire_req, .request_header_fields_too_large, version, deadlines);
                 return .close;
             }
-            const field_bytes = std.math.add(usize, header.name.len, header.value.len) catch {
-                try reject(wire_req, .request_header_fields_too_large, version, deadlines);
-                return .close;
-            };
-            header_bytes = std.math.add(usize, header_bytes, field_bytes) catch {
-                try reject(wire_req, .request_header_fields_too_large, version, deadlines);
-                return .close;
-            };
-            if (header_bytes > limits.header_bytes) {
-                try reject(wire_req, .request_header_fields_too_large, version, deadlines);
-                return .close;
-            }
-            const name = arena.allocator().dupe(u8, header.name) catch {
+            const name = arena.allocator().dupe(u8, trailer.name) catch {
                 try reject(wire_req, .internal_server_error, version, deadlines);
                 return .close;
             };
-            const value = arena.allocator().dupe(u8, header.value) catch {
+            const value = arena.allocator().dupe(u8, trailer.value) catch {
                 try reject(wire_req, .internal_server_error, version, deadlines);
                 return .close;
             };
-            headers.append(arena.allocator(), .{ .name = name, .value = value }) catch {
+            trailer_list.append(arena.allocator(), .{ .name = name, .value = value }) catch {
                 try reject(wire_req, .internal_server_error, version, deadlines);
                 return .close;
             };
@@ -306,6 +298,10 @@ fn processRequest(
     }
 
     arena.headers = headers.toOwnedSlice(arena.allocator()) catch {
+        try reject(wire_req, .internal_server_error, version, deadlines);
+        return .close;
+    };
+    arena.trailers = trailer_list.toOwnedSlice(arena.allocator()) catch {
         try reject(wire_req, .internal_server_error, version, deadlines);
         return .close;
     };
@@ -360,6 +356,25 @@ fn processRequest(
         .extra_headers = extra.items,
     });
     return if (keep_alive) .keep_alive else .close;
+}
+
+/// Trailer fields accepted from clients: integrity digests only. Everything
+/// else, including framing, routing, authentication, cookie, origin/CSRF,
+/// content-interpretation, and proxy-identity fields, is refused with 400 and
+/// the connection closes. Deny-by-default because identity headers cannot be
+/// enumerated.
+const allowed_trailers = [_][]const u8{
+    "content-digest",
+    "repr-digest",
+    "digest",
+    "content-md5",
+    "x-checksum-sha256",
+    "x-checksum-crc32",
+};
+
+fn trailerAllowed(name: []const u8) bool {
+    for (allowed_trailers) |allowed| if (std.ascii.eqlIgnoreCase(name, allowed)) return true;
+    return false;
 }
 
 const ChunkedError = error{ Malformed, BodyTooLarge, TrailersTooLarge, OutOfMemory, ReadFailed };
@@ -563,6 +578,16 @@ const TestApp = struct {
             try res.setHeader("Content-Length", "16");
             try res.setHeader("ETag", "\"v1\"");
             res.notModified();
+        } else if (std.mem.eql(u8, req.target, "/probe")) {
+            // Reports provenance: forbidden names via head lookup, digest via trailers.
+            var leaked: usize = 0;
+            for ([_][]const u8{ "authorization", "cookie", "origin", "x-csrf-token", "x-forwarded-for", "content-digest" }) |name| {
+                if (try req.getHeaderOne(name) != null) leaked += 1;
+            }
+            const digest = (try req.getTrailerOne("Content-Digest")) orelse "none";
+            const text = try std.fmt.allocPrint(self.allocator, "leaked={d} trailers={d} digest={s}", .{ leaked, req.trailers.len, digest });
+            defer self.allocator.free(text);
+            try res.text(200, text);
         } else {
             try res.text(200, req.body);
             try res.setHeader("x-target", req.target);
@@ -741,7 +766,7 @@ test "chunked framing ambiguities are rejected before dispatch" {
     try std.testing.expectEqual(@as(usize, 0), calls);
 
     // Valid extensions and trailers are accepted.
-    const valid = try runTest(head ++ "3;ext=1\r\nabc\r\n0\r\nX-Sum: 1\r\n\r\n", &app, .{});
+    const valid = try runTest(head ++ "3;ext=1\r\nabc\r\n0\r\nContent-Digest: sha-256=:AAAA:\r\n\r\n", &app, .{});
     defer std.testing.allocator.free(valid);
     try std.testing.expect(std.mem.startsWith(u8, valid, "HTTP/1.1 200"));
     try std.testing.expect(std.mem.endsWith(u8, valid, "\r\n\r\nabc"));
@@ -788,4 +813,57 @@ test "HTTP/2 prior knowledge and h2c upgrade stay HTTP/1.1 only" {
     try std.testing.expect(std.mem.startsWith(u8, upgrade, "HTTP/1.1 200"));
     try std.testing.expect(std.ascii.findIgnoreCase(upgrade, "upgrade") == null);
     try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "trailers stay out of headers and only allowlisted fields reach the trailer API" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    const head = "POST /probe HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n";
+    const ok = try runTest(head ++ "Content-Digest: sha-256=:AAAA:\r\n\r\n", &app, .{});
+    defer std.testing.allocator.free(ok);
+    try std.testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.endsWith(u8, ok, "leaked=0 trailers=1 digest=sha-256=:AAAA:"));
+
+    // Forbidden names are rejected, never exposed, and close the connection:
+    // the pipelined follow-up request is not served.
+    const followup = "GET /probe HTTP/1.1\r\nHost: example\r\n\r\n";
+    inline for (.{
+        "Authorization: Bearer x", "Cookie: sid=1",              "Host: evil",
+        "Origin: https://evil",    "X-CSRF-Token: t",            "X-XSRF-TOKEN: t",
+        "Content-Type: text/html", "X-Forwarded-For: 1.2.3.4",   "X-Remote-User: root",
+        "Content-Length: 1",       "Transfer-Encoding: chunked", "X-Anything: 1",
+    }) |field| {
+        calls = 0;
+        const out = try runTest(head ++ field ++ "\r\n\r\n" ++ followup, &app, .{});
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 400"));
+        try std.testing.expectEqual(@as(usize, 0), calls);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "HTTP/1.1 "));
+    }
+}
+
+test "trailer duplicates, syntax, and limits are enforced" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    const head = "POST /probe HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n";
+    inline for (.{
+        "Content-Digest: a\r\ncontent-digest: b\r\n\r\n",
+        "Content-Digest : a\r\n\r\n",
+        "Content-Digest: a\x00b\r\n\r\n",
+        " Content-Digest: a\r\n\r\n",
+        "Bad Name: a\r\n\r\n",
+        ": a\r\n\r\n",
+    }) |trailers| {
+        const out = try runTest(head ++ trailers, &app, .{});
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 400"));
+    }
+    const two = head ++ "Content-Digest: a\r\nDigest: b\r\n\r\n";
+    const count = try runTest(two, &app, .{ .request_limits = .{ .max_trailers = 1 } });
+    defer std.testing.allocator.free(count);
+    try std.testing.expect(std.mem.startsWith(u8, count, "HTTP/1.1 431"));
+    const bytes = try runTest(two, &app, .{ .request_limits = .{ .trailer_bytes = 16 } });
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 431"));
+    try std.testing.expectEqual(@as(usize, 0), calls);
 }

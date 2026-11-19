@@ -286,6 +286,38 @@ const ua = try req.getHeaderOne("user-agent"); // case-insensitive lookup
 const body = req.body;                    // fully buffered body
 ```
 
+### Chunked request trailers
+
+Trailer fields are **never** part of `req.headers`; `getHeaderOne` and
+`getAllHeaders` (and every plugin built on them: bearer tokens, CSRF, sessions,
+host authorization) see only the initial request head. Trailers are kept in a
+separate `req.trailers` slice of `zoda.request.Trailer` (a distinct type from
+`Header`), read with `req.getTrailerOne(name)` / `req.getAllTrailers(name)`.
+
+The transport accepts only an integrity-digest allowlist: `Content-Digest`,
+`Repr-Digest`, `Digest`, `Content-MD5`, `X-Checksum-SHA256`, `X-Checksum-CRC32`.
+Any other trailer name (framing, routing, `Host`, `Authorization`, `Cookie`,
+`Origin`, CSRF tokens, `Content-Type`, `X-Forwarded-*`, custom identity
+fields, and so on) is answered with `400` and the connection is closed. So are
+repeated trailer names, malformed field syntax, and control bytes. Trailers are
+bounded by `request_limits.max_trailers` (default 8, `431` when exceeded) and
+`request_limits.trailer_bytes` (default 4 KiB, `431`), separate from the head
+limits. Trailer values are unverified client input arriving after the body:
+never use them for authentication, routing, or origin decisions.
+
+**Reverse proxy requirements.** Run Zoda behind a proxy that (1) strips or
+overwrites every identity header (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`,
+`X-Remote-User`, and any custom ones) on the *request head*, and (2) drops
+chunked request trailers (or terminates the request and re-sends it without
+them). Zoda does not trust forwarded headers, and a trailer-supplied identity
+field is rejected rather than ignored, but a proxy that forwards trailers
+verbatim can still hand the backend fields the proxy never inspected.
+Test case for a deployment: send `POST` with `Transfer-Encoding: chunked`,
+`0\r\nX-Forwarded-For: 1.2.3.4\r\n\r\n` through the proxy. Expect `400` from
+the backend or the proxy; a `200` that reports the forwarded value is a bug.
+The in-tree equivalent is the transport test "trailers stay out of headers and
+only allowlisted fields reach the trailer API".
+
 ### Typed JSON requests
 
 Register `zoda.JsonParser` separately from the JSON response plugin. It parses
@@ -760,7 +792,7 @@ listener is closed. All `server.Config` fields have defaults:
 | `keep_alive_idle_timeout` | 5 s |
 | `shutdown_grace_period` | 10 s, then remaining sockets are shut down |
 | `max_requests_per_connection` | 100 |
-| `request_limits` | 8 KiB target, 100 headers / 32 KiB header bytes, 128 path segments, 256 query pairs, 1 MiB body |
+| `request_limits` | 8 KiB target, 100 headers / 32 KiB header bytes, 8 trailers / 4 KiB trailer bytes, 128 path segments, 256 query pairs, 1 MiB body |
 | `stats` | optional `*server.Stats` with live `active`/`peak`/`admitted`/`rejected` counters |
 
 Requests that break a limit get a 400, 413, 414, or 431 response, and the

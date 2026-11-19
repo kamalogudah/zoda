@@ -16,6 +16,8 @@ This is a targeted source review of HTTP transport and request bounds, server ad
 
 ### S1 — Security-sensitive trailers become ordinary headers
 
+**Status: addressed.** Trailers are stored separately, allowlisted, and bounded; see README "Chunked request trailers". The text below describes the original finding.
+
 **Priority: high when an upstream security decision depends on headers; otherwise medium. Confidence: high in the code behavior; deployment exploitability unverified.**
 
 In `src/transport.zig:242`, `processRequest` parses chunk trailers, rejects only `Content-Length` and `Transfer-Encoding` by name, then appends remaining fields into the same list as initial headers (`src/transport.zig:296`). That merged list becomes `arena.headers` before dispatch. Authentication and CSRF helpers read this list without provenance: see `BearerToken.parse` in `src/plugins/bearer_token.zig` and `validHeader` in `src/plugins/csrf.zig`.

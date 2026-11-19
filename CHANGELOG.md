@@ -5,6 +5,16 @@ All notable changes to Zoda are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Chunked request trailers no longer merge into request headers (security
+  analysis S1). They live in `Request.trailers` (type `Trailer`, accessors
+  `getTrailerOne` / `getAllTrailers`). Only an integrity-digest allowlist is
+  accepted; any other, duplicate, or malformed trailer gets `400` and closes the
+  connection. New limits `request_limits.max_trailers` (8) and `trailer_bytes`
+  (4 KiB). **Breaking:** clients sending other trailers are now rejected. See
+  README "Chunked request trailers" for proxy requirements.
+
 ### Changed
 
 - **Toolchain upgraded to Zig 0.17.1**, the latest stable release. This is

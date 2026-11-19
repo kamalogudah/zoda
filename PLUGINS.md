@@ -22,7 +22,9 @@ documented beside its code in `src/plugins/`, and its support status is in
 
 Core middleware that is not a plugin (host authorization, default response
 headers, response timing, and static files) is documented in the
-[README](README.md#middleware).
+[README](README.md#middleware). Plugins and helpers read only initial
+request headers; chunked trailers are a separate, allowlisted API (see
+[README](README.md#chunked-request-trailers)).
 
 ## JSON responses
 
