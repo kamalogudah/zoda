@@ -53,6 +53,10 @@ pub const Config = struct {
     shutdown_grace_period: Io.Clock.Duration = .{ .raw = .fromSeconds(10), .clock = .awake },
     max_requests_per_connection: usize = 100,
     request_limits: @import("request.zig").Limits = .default,
+    /// Per-path overrides of `request_limits.max_body_bytes` (longest decoded
+    /// path-segment prefix wins). Lets one upload route accept a larger body
+    /// without raising the limit for every route.
+    body_limit_rules: []const transport.BodyLimitRule = &.{},
     /// Observation threshold only: a handler that runs longer is counted in
     /// `Stats.handlers_over_budget`. It does NOT cancel or time out the
     /// handler; its response is still written. Null disables the counter.
@@ -176,6 +180,7 @@ pub fn serve(
                 context.app,
                 .{
                     .request_limits = context.config.request_limits,
+                    .body_limit_rules = context.config.body_limit_rules,
                     .max_requests = context.config.max_requests_per_connection,
                     .deadlines = connection_io.deadlineHooks(),
                     .handler_hooks = .{

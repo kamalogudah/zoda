@@ -7,6 +7,12 @@ All notable changes to Zoda are recorded here. The format follows
 
 ### Added
 
+- `server.Config.body_limit_rules` (`transport.BodyLimitRule`): per-path
+  request body limits matched on decoded path-segment prefixes, longest prefix
+  wins. The limit is chosen from the request head, so an over-limit
+  `Content-Length` is refused with 413 before any body is buffered. Lets one
+  upload route exceed the global `max_body_bytes` (#96). Streaming and
+  app-rendered 413 responses are not included.
 - `zoda.multipart.parse(allocator, content_type, body)`: strict
   `multipart/form-data` parsing (RFC 2046/7578 framing) into zero-copy parts
   with `name`, optional `filename` and `content_type`, and `data`; malformed

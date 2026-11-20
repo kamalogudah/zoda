@@ -27,6 +27,9 @@ const router = @import("router.zig");
 
 pub const Config = struct {
     request_limits: request.Limits = .default,
+    /// Per-path overrides of `request_limits.max_body_bytes`, decided from the
+    /// request head before any body byte is read. See `BodyLimitRule`.
+    body_limit_rules: []const BodyLimitRule = &.{},
     /// Sequential requests accepted before the adapter closes the connection.
     max_requests: usize = 100,
     /// Optional operation-boundary hooks used by the socket runtime.
@@ -35,6 +38,43 @@ pub const Config = struct {
     /// time; they cannot interrupt, cancel, or bound it.
     handler_hooks: ?HandlerHooks = null,
 };
+
+/// Overrides the body limit for requests whose decoded path starts with
+/// `prefix`. `prefix` is a `/`-separated path matched on whole decoded
+/// segments (`/upload` matches `/upload` and `/upload/x`, not `/uploads`).
+/// The rule's limit replaces `Limits.max_body_bytes` for matching requests, so
+/// it can raise it (one upload route) or lower it. The longest matching prefix
+/// wins; with no match the global limit applies. A request over its limit is
+/// refused with 413 before the body is buffered.
+pub const BodyLimitRule = struct {
+    prefix: []const u8,
+    max_body_bytes: usize,
+};
+
+/// Effective body limit for a request with decoded `segments`.
+pub fn bodyLimitFor(rules: []const BodyLimitRule, segments: []const []const u8, default_limit: usize) usize {
+    var best_len: ?usize = null;
+    var limit = default_limit;
+    for (rules) |rule| {
+        const matched = prefixSegments(rule.prefix, segments) orelse continue;
+        if (best_len == null or matched > best_len.?) {
+            best_len = matched;
+            limit = rule.max_body_bytes;
+        }
+    }
+    return limit;
+}
+
+/// Number of segments `prefix` spans if it is a segment-wise prefix of
+/// `segments`, else null. Empty segments are ignored in the prefix only.
+fn prefixSegments(prefix: []const u8, segments: []const []const u8) ?usize {
+    var it = std.mem.tokenizeScalar(u8, prefix, '/');
+    var n: usize = 0;
+    while (it.next()) |part| : (n += 1) {
+        if (n >= segments.len or !std.mem.eql(u8, segments[n], part)) return null;
+    }
+    return n;
+}
 
 /// Called immediately before and after every `app.dispatch` (including when it
 /// fails). Purely observational: the transport never abandons a running handler.
@@ -110,7 +150,7 @@ pub fn serveConnection(
         };
 
         const keep_alive = wire_req.head.keep_alive and request_index + 1 < config.max_requests;
-        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, keep_alive, config.deadlines, config.handler_hooks);
+        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, config.body_limit_rules, keep_alive, config.deadlines, config.handler_hooks);
         if (outcome == .close) return;
     }
 }
@@ -123,6 +163,7 @@ fn processRequest(
     wire_req: *std.http.Server.Request,
     app: *const AppType,
     limits: request.Limits,
+    body_rules: []const BodyLimitRule,
     keep_alive: bool,
     deadlines: ?Deadlines,
     handler_hooks: ?HandlerHooks,
@@ -140,18 +181,21 @@ fn processRequest(
         try reject(wire_req, .bad_request, version, deadlines);
         return .close;
     }
-    if (content_length) |len| {
-        if (len > limits.max_body_bytes) {
-            try reject(wire_req, .payload_too_large, version, deadlines);
-            return .close;
-        }
-    }
 
     var arena = request.parseOriginForm(allocator, limits, wire_req.head.target) catch |err| {
         try reject(wire_req, statusFromCode(buffering.parseErrorStatus(err)), version, deadlines);
         return .close;
     };
     defer arena.deinit();
+
+    // Decided from the decoded path, before any body byte is read.
+    const max_body = bodyLimitFor(body_rules, arena.segments, limits.max_body_bytes);
+    if (content_length) |len| {
+        if (len > max_body) {
+            try reject(wire_req, .payload_too_large, version, deadlines);
+            return .close;
+        }
+    }
 
     var headers: std.ArrayList(request.Header) = .empty;
     var trailer_list: std.ArrayList(request.Trailer) = .empty;
@@ -210,7 +254,7 @@ fn processRequest(
     }
     if (transfer_encoding != .none or content_length != null) {
         if (deadlines) |operation_deadlines| operation_deadlines.body();
-        var body = buffering.BoundedAccumulator.init(arena.allocator(), limits.max_body_bytes);
+        var body = buffering.BoundedAccumulator.init(arena.allocator(), max_body);
         defer body.deinit();
         var trailer_section: std.ArrayList(u8) = .empty;
 
@@ -657,6 +701,37 @@ test "request framing and decoded body limits reject and close" {
     defer std.testing.allocator.free(oversized);
     try std.testing.expect(std.mem.startsWith(u8, oversized, "HTTP/1.1 413"));
     try std.testing.expectEqual(@as(usize, 0), calls);
+}
+
+test "body limit rules override the limit per path before the body is read" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    const rules = [_]BodyLimitRule{
+        .{ .prefix = "/upload", .max_body_bytes = 8 },
+        .{ .prefix = "/upload/tiny", .max_body_bytes = 1 },
+    };
+    const cfg: Config = .{ .request_limits = .{ .max_body_bytes = 2 }, .body_limit_rules = &rules };
+
+    const ok = try runTest("POST /upload HTTP/1.1\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", &app, cfg);
+    defer std.testing.allocator.free(ok);
+    try std.testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+
+    const encoded = try runTest("POST /%75pload HTTP/1.1\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", &app, cfg);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.startsWith(u8, encoded, "HTTP/1.1 200"));
+
+    const other = try runTest("POST /uploads HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", &app, cfg);
+    defer std.testing.allocator.free(other);
+    try std.testing.expect(std.mem.startsWith(u8, other, "HTTP/1.1 413"));
+
+    const longest = try runTest("POST /upload/tiny HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", &app, cfg);
+    defer std.testing.allocator.free(longest);
+    try std.testing.expect(std.mem.startsWith(u8, longest, "HTTP/1.1 413"));
+
+    const chunked = try runTest("POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n123456789\r\n0\r\n\r\n", &app, cfg);
+    defer std.testing.allocator.free(chunked);
+    try std.testing.expect(std.mem.startsWith(u8, chunked, "HTTP/1.1 413"));
+    try std.testing.expectEqual(@as(usize, 2), calls);
 }
 
 test "target, header count, and malformed syntax map to bounded errors" {
