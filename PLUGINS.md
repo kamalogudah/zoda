@@ -140,16 +140,23 @@ the slice. Query strings are never searched for credentials.
 
 Register `zoda.Sessions` as a plugin instance. Supply a trusted UTC Unix-second
 clock, a lifetime from 1 second to 30 days, and one or more application-owned
-keys of at least 32 cryptographically random bytes. The first key signs new cookies; older keys remain
-available for verification during rotation. Key IDs must be unique.
+keys of 32 cryptographically random bytes. The first key signs new cookies;
+older keys remain available for verification during rotation. Key IDs and
+secrets must be unique. See [Session keys](#session-keys) for generation,
+loading, rotation, and compromise response.
+
+> **Session payloads are signed, not encrypted.** The cookie holder can decode
+> every byte. Never store passwords, access tokens, API keys, secrets, or
+> sensitive personal data in the payload. Store an opaque identifier and keep
+> the data server-side. Stateless cookies are also not immediately revocable.
 
 ```zig
 const Plugins = struct { sessions: zoda.Sessions };
 
-// `unixSeconds` is the application's trusted wall-clock function. Keep the
-// secret bytes alive for the app lifetime; load them from secure configuration.
+// `unixSeconds` is the application's trusted wall-clock function. `key` comes
+// from runtime secret configuration (see "Session keys"); never from source.
 const plugins = Plugins{ .sessions = .{
-    .keys = &.{.{ .id = 1, .secret = app_secret }},
+    .keys = &.{key},
     .lifetime_seconds = 3600,
     .now_seconds = unixSeconds,
 } };
@@ -185,6 +192,64 @@ CSRF protection before using cookie sessions for state-changing requests.
 If a route fails after `save`, a propagated error discards its partial response.
 Recovery middleware can call `res.clear()` and then explicitly `save` the
 recovered session; cleanup never creates or restores a cookie.
+
+### Session keys
+
+`Sessions` checks only that each secret is at least 32 bytes and that IDs and
+secrets are unique. **A length check is not an entropy check**: the framework
+cannot detect a guessable, reused, or leaked key, and anyone who learns a key
+can forge a cookie for any payload. Key quality is the deployer's job.
+
+**Generate** 32 random bytes from the OS CSPRNG, once, outside the app:
+
+```sh
+openssl rand -base64 32
+```
+
+**Load** the value at startup from protected runtime configuration (a secret
+manager, an orchestrator secret, or a root-only file or environment variable
+that is not in version control, images, logs, or crash reports) with
+`Key.fromBase64`, which requires exactly 32 decoded bytes and fails closed:
+
+```zig
+pub fn main(init: std.process.Init) !void {
+    const encoded = init.environ_map.get("ZODA_SESSION_KEY") orelse
+        return error.MissingSessionKey; // refuse to start; never fall back
+    var key_buf: [zoda.plugins.sessions.key_bytes]u8 = undefined; // outlives the app
+    const key = try zoda.plugins.sessions.Key.fromBase64(1, encoded, &key_buf);
+    // ... .sessions = .{ .keys = &.{key}, .lifetime_seconds = 3600, .now_seconds = unixSeconds }
+}
+```
+
+`Key.generate(io, id, &buf)` fills a key from the CSPRNG for development and
+tests. A generated key is lost on restart, so every user is signed out, and it
+differs per process, so it breaks multi-instance deployments. Do not use it in
+production. Every key literal in this repository (`"TEST-ONLY-do-not-deploy-this-key!"`
+and the repeated-letter keys in unit tests) is **TEST ONLY**, public, and must
+never be deployed.
+
+**Rotate** on a schedule you choose and whenever a key may have been exposed:
+
+1. Generate a new key with a new unused ID, for example 2.
+2. Deploy `.keys = &.{ key2, key1 }`. New cookies are signed with key 2; cookies
+   signed by key 1 still verify. Every instance must run this configuration
+   before the next step, or instances that only know key 2 reject key 1 cookies.
+3. Keep key 1 for at least `lifetime_seconds` (cookies carry a bounded expiry),
+   then deploy `.keys = &.{key2}`.
+
+Effects: a cookie is re-signed only when the app calls `save`, so an unsaved
+old cookie keeps its old key ID until it expires. **Removing a key (or reusing
+its ID with a different secret) invalidates every cookie it signed**; those
+requests load as an empty session and users must sign in again. Up to 8 keys
+may be configured.
+
+**Compromise response.** Overlap keeps a leaked key trusted, so for a suspected
+leak do not overlap: deploy a new key *without* the old one, accept the forced
+sign-out, and treat everything signed by the old key as forged. For
+store-backed sessions the HMAC no longer protects identity (it comes from the
+store record), but a leaked key still lets an attacker forge payload, CSRF
+secret, and flash content, so rotate anyway and call `revokeSubject` for
+affected accounts. Then fix how the key leaked.
 
 ### Revocable sessions
 

@@ -511,7 +511,8 @@ pub fn main(init: std.process.Init) !void {
     // Sessions only carry flash messages, validation errors, and the CSRF
     // secret here, so a fresh key per run is enough: a restart drops pending
     // messages, and an open tab's next change is refused until it reloads.
-    // A real app loads a stable secret from its configuration.
+    // DEV ONLY: a real app loads a stable key from protected runtime config
+    // with `Key.fromBase64` (PLUGINS.md "Session keys"). Cookies are signed, not encrypted.
     clock_io = io;
     var secret: [32]u8 = undefined;
     try std.Io.randomSecure(io, &secret);
@@ -577,7 +578,7 @@ fn testApp(store: *Store) !App {
         .response_allocator = std.testing.allocator,
         .plugins = .{
             .inertia = .{ .layout = layout, .version = .{ .value = "v1" }, .shared = .{ .value = .{ .app = "Zoda", .framework = "test" } }, .encrypt_history = true, .now_milliseconds = testMilliseconds },
-            .sessions = .{ .keys = &.{.{ .id = 1, .secret = &comptime @as([32]u8, @splat('x')) }}, .lifetime_seconds = 300, .now_seconds = testClock },
+            .sessions = .{ .keys = &.{.{ .id = 1, .secret = "TEST-ONLY-do-not-deploy-this-key!" }}, .lifetime_seconds = 300, .now_seconds = testClock },
             .store = .{ .value = store },
         },
         .route_fn = route,

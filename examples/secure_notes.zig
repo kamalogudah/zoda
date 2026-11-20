@@ -257,8 +257,10 @@ pub fn main(init: std.process.Init) !void {
     try zoda.static.checkSupport(public_root);
     try zoda.static.checkSupport(private_root);
 
-    // A fresh key per run logs everyone out on restart. Load a stable secret
-    // from protected configuration in a real deployment.
+    // DEV ONLY: a fresh key per run logs everyone out on restart and breaks
+    // multi-instance deployments. A real deployment loads a stable key from
+    // protected runtime configuration with `sessions.Key.fromBase64`
+    // (PLUGINS.md "Session keys"). Cookie payloads are signed, not encrypted.
     var secret: [32]u8 = undefined;
     try std.Io.randomSecure(io, &secret);
     var session_store = sessions.MemoryStore(256).init(unixSeconds);
@@ -315,7 +317,7 @@ const Fixture = struct {
         self.notes = .{ .allocator = testing.allocator, .io = io };
         try self.server.init(testing.allocator, .{
             .sessions = .{
-                .keys = &.{.{ .id = 1, .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }},
+                .keys = &.{.{ .id = 1, .secret = "TEST-ONLY-do-not-deploy-this-key!" }},
                 .lifetime_seconds = 300,
                 .now_seconds = testClock,
                 .store = self.session_store.store(),

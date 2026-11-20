@@ -7,6 +7,15 @@ All notable changes to Zoda are recorded here. The format follows
 
 ### Security
 
+- Strengthened session key guidance (security analysis S5, #90). New
+  `Sessions.Key.fromBase64` (exact 32-byte secret, fails closed) and
+  `Key.generate` helpers; `Sessions` now also rejects two keys with the same
+  secret. PLUGINS.md "Session keys" documents generation, runtime loading,
+  rotation with overlapping verification keys and its invalidation effects,
+  and compromise response, and states prominently that payloads are signed,
+  not encrypted, and not revocable without a store. Hard-coded example and
+  test keys are labelled TEST ONLY. Length checks are not entropy checks.
+
 - Defined the handler execution contract (security analysis S4, #89). The
   framework does not bound or cancel `app.dispatch`; socket deadlines cover
   I/O only. `server.Stats` now reports `handlers_active`, `handlers_completed`,

@@ -296,7 +296,7 @@ test "PLUGINS flash messages example" {
     var app = try FlashApp.init(std.testing.allocator, .{
         .response_allocator = std.testing.allocator,
         .plugins = .{ .sessions = .{
-            .keys = &.{.{ .id = 1, .secret = "example-secret-of-at-least-32-bytes!" }},
+            .keys = &.{.{ .id = 1, .secret = "TEST-ONLY-do-not-deploy-this-key!" }},
             .lifetime_seconds = 3600,
             .now_seconds = flashClock,
         } },
@@ -913,7 +913,7 @@ test "PLUGINS Inertia.js flash example" {
         .response_allocator = std.testing.allocator,
         .plugins = .{
             .sessions = .{
-                .keys = &.{.{ .id = 1, .secret = "example-secret-of-at-least-32-bytes!" }},
+                .keys = &.{.{ .id = 1, .secret = "TEST-ONLY-do-not-deploy-this-key!" }},
                 .lifetime_seconds = 3600,
                 .now_seconds = flashClock,
             },
@@ -981,7 +981,7 @@ test "PLUGINS Inertia.js validation errors example" {
         .response_allocator = std.testing.allocator,
         .plugins = .{
             .sessions = .{
-                .keys = &.{.{ .id = 1, .secret = "example-secret-of-at-least-32-bytes!" }},
+                .keys = &.{.{ .id = 1, .secret = "TEST-ONLY-do-not-deploy-this-key!" }},
                 .lifetime_seconds = 3600,
                 .now_seconds = flashClock,
             },
@@ -1053,7 +1053,7 @@ test "PLUGINS Inertia.js history encryption example" {
         .response_allocator = std.testing.allocator,
         .plugins = .{
             .sessions = .{
-                .keys = &.{.{ .id = 1, .secret = "example-secret-of-at-least-32-bytes!" }},
+                .keys = &.{.{ .id = 1, .secret = "TEST-ONLY-do-not-deploy-this-key!" }},
                 .lifetime_seconds = 3600,
                 .now_seconds = flashClock,
             },

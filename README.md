@@ -436,7 +436,7 @@ Built-in plugins:
 | `zoda.JsonParser` | Parsing bounded request JSON into a caller-selected type |
 | `zoda.NotFound` | A configured text fallback for route misses |
 | `zoda.BearerToken` | Parsing and validating `Authorization: Bearer` credentials |
-| `zoda.Sessions` | Signed client-side cookie sessions with explicit saves |
+| `zoda.Sessions` | Signed (not encrypted) client-side cookie sessions with explicit saves; keys must come from runtime secret config, see PLUGINS.md "Session keys" |
 | `zoda.plugins.csrf` | Session-bound CSRF tokens |
 | `zoda.Flash` | One-time messages carried in the session |
 | `zoda.plugins.http_cache` | Explicit `Cache-Control`, `ETag`, `Vary`, and conditional GET |

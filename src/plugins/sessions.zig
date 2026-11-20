@@ -26,11 +26,47 @@ comptime {
     std.debug.assert(fields + framing <= max_cookie_bytes);
 }
 
-/// The first key signs new cookies; all keys verify them. IDs must be unique.
+/// Required length of keys made by `Key.generate` and `Key.fromBase64`.
+pub const key_bytes: usize = 32;
+
+/// An HMAC-SHA256 signing key. The first key in `Sessions.keys` signs new
+/// cookies; every key verifies them. IDs must be unique, as must the secrets.
 /// Key bytes are caller-owned and must remain valid for the app lifetime.
+///
+/// `Sessions` only checks that a secret is at least 32 bytes long. Length is
+/// not entropy: the framework cannot tell a random key from a predictable one,
+/// so never type a key into source code. Create keys with `generate` or
+/// `openssl rand -base64 32`, and load them with `fromBase64` from protected
+/// runtime configuration (see PLUGINS.md "Session keys").
+///
+/// A key authenticates cookies; it does not encrypt them. Anyone holding a
+/// cookie can read its payload.
 pub const Key = struct {
     id: u8,
     secret: []const u8,
+
+    pub const KeyError = error{InvalidSessionKey};
+
+    /// Fills `out` from the OS CSPRNG and returns a key over it. A key made
+    /// at startup is lost on restart, which signs every user out; persist
+    /// stable keys in protected configuration instead.
+    pub fn generate(io: std.Io, id: u8, out: *[key_bytes]u8) std.Io.RandomSecureError!Key {
+        try std.Io.randomSecure(io, out);
+        return .{ .id = id, .secret = out };
+    }
+
+    /// Decodes a standard-alphabet base64 secret (padding optional), as
+    /// printed by `openssl rand -base64 32`, into `out`. Surrounding ASCII
+    /// whitespace is ignored. The secret must decode to exactly 32 bytes.
+    pub fn fromBase64(id: u8, text: []const u8, out: *[key_bytes]u8) KeyError!Key {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        const decoder = std.base64.standard_no_pad.Decoder;
+        const unpadded = std.mem.trimEnd(u8, trimmed, "=");
+        const size = decoder.calcSizeForSlice(unpadded) catch return error.InvalidSessionKey;
+        if (size != key_bytes) return error.InvalidSessionKey;
+        decoder.decode(out, unpadded) catch return error.InvalidSessionKey;
+        return .{ .id = id, .secret = out };
+    }
 };
 
 /// Opaque session identifier length in bytes (128 random bits).
@@ -140,6 +176,11 @@ pub fn MemoryStore(comptime capacity: usize) type {
     };
 }
 
+/// Client-side session cookies. **Payloads are signed, not encrypted**: the
+/// cookie holder can decode every byte, so never store passwords, tokens,
+/// secrets, or sensitive personal data in them. A stateless cookie also cannot
+/// be revoked before it expires; set `store` for revocation. Key rotation
+/// invalidates sessions as described in PLUGINS.md "Session keys".
 pub const Sessions = struct {
     keys: []const Key = &.{},
     /// Optional server-side registry. When set, only revocable v4 cookies are
@@ -304,6 +345,7 @@ pub const Sessions = struct {
             if (key.secret.len < 32) return error.InvalidSessionConfig;
             for (self.keys[0..i]) |earlier| {
                 if (earlier.id == key.id) return error.InvalidSessionConfig;
+                if (std.mem.eql(u8, earlier.secret, key.secret)) return error.InvalidSessionConfig;
             }
         }
     }
@@ -399,6 +441,7 @@ fn findCookie(req: *const router.Request) ?[]const u8 {
     return found;
 }
 
+// TEST ONLY: predictable, public values. Never use them outside tests.
 const test_key_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const test_key_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -519,6 +562,19 @@ test "configuration, payload size, deletion, and key rotation" {
     try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
     missing = .{ .keys = &.{ .{ .id = 1, .secret = test_key_a }, .{ .id = 1, .secret = test_key_b } }, .lifetime_seconds = 300, .now_seconds = time1000 };
     try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
+    missing = .{ .keys = &.{ .{ .id = 1, .secret = test_key_a }, .{ .id = 2, .secret = test_key_a } }, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
+    missing = .{ .keys = &.{ .{ .id = 1, .secret = test_key_a }, .{ .id = 2, .secret = "short" } }, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
+    const nine = comptime blk: {
+        var keys: [9]Key = undefined;
+        for (&keys, 0..) |*k, i| k.* = .{ .id = @intCast(i), .secret = test_key_a ++ &[_]u8{@intCast('a' + i)} };
+        break :blk keys;
+    };
+    missing = .{ .keys = &nine, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
+    missing = .{ .keys = &.{.{ .id = 1, .secret = test_key_a }}, .lifetime_seconds = 0, .now_seconds = time1000 };
+    try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
     missing = .{ .keys = &.{.{ .id = 1, .secret = test_key_a }}, .lifetime_seconds = max_lifetime_seconds + 1, .now_seconds = time1000 };
     try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
 
@@ -551,6 +607,55 @@ test "configuration, payload size, deletion, and key rotation" {
     loaded.clear();
     try rotated.save(&loaded, &res);
     try std.testing.expectEqualStrings(cookie_name ++ "=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax", res.headers[2].value);
+}
+
+test "key helpers decode exact 32-byte secrets and reject everything else" {
+    var buf: [key_bytes]u8 = undefined;
+    const b64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const key = try Key.fromBase64(7, b64 ++ "\n", &buf);
+    try std.testing.expectEqual(@as(u8, 7), key.id);
+    try std.testing.expectEqual(@as(usize, 32), key.secret.len);
+    try std.testing.expectEqual(@as(u8, 31), key.secret[31]);
+    const unpadded = try Key.fromBase64(7, b64[0 .. b64.len - 1], &buf);
+    try std.testing.expectEqualSlices(u8, key.secret, unpadded.secret);
+    try std.testing.expectError(error.InvalidSessionKey, Key.fromBase64(1, "", &buf));
+    try std.testing.expectError(error.InvalidSessionKey, Key.fromBase64(1, "c2hvcnQ=", &buf));
+    try std.testing.expectError(error.InvalidSessionKey, Key.fromBase64(1, "!!!" ++ b64[3..], &buf));
+    try std.testing.expectError(error.InvalidSessionKey, Key.fromBase64(1, b64 ++ "AAAA", &buf));
+
+    const io = std.testing.io;
+    var a: [key_bytes]u8 = undefined;
+    var b: [key_bytes]u8 = undefined;
+    const ka = try Key.generate(io, 1, &a);
+    const kb = try Key.generate(io, 2, &b);
+    try std.testing.expect(!std.mem.eql(u8, ka.secret, kb.secret));
+    const plugin = Sessions{ .keys = &.{ ka, kb }, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try plugin.validate();
+}
+
+test "rotation: retired keys verify until removed, then their cookies are dropped" {
+    var req: router.Request = .{ .method = .get, .segments = &.{} };
+    const k1 = Key{ .id = 1, .secret = test_key_a };
+    const k2 = Key{ .id = 2, .secret = test_key_b };
+    const phase1 = Sessions{ .keys = &.{k1}, .lifetime_seconds = 300, .now_seconds = time1000 };
+    var state = try phase1.initRequest(&req);
+    try state.set("payload");
+    var res = response.Response.init(std.testing.allocator);
+    defer res.deinit();
+    try phase1.save(&state, &res);
+    const headers = [_]router.Header{.{ .name = "Cookie", .value = cookieValue(res.headers[0].value) }};
+    var cookie_req: router.Request = .{ .method = .get, .segments = &.{}, .headers = &headers };
+
+    // Overlap: new key signs, old key still verifies.
+    const overlap = Sessions{ .keys = &.{ k2, k1 }, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectEqualStrings("payload", (try overlap.initRequest(&cookie_req)).value());
+    // Verify-only order: the first key signs, so listing k1 first keeps v1.1 cookies.
+    // Retired: k1 removed, existing cookies silently become anonymous.
+    const retired = Sessions{ .keys = &.{k2}, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectEqual(@as(usize, 0), (try retired.initRequest(&cookie_req)).value().len);
+    // Same ID with a different secret (a replaced key) also fails verification.
+    const replaced = Sessions{ .keys = &.{.{ .id = 1, .secret = test_key_b }}, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectEqual(@as(usize, 0), (try replaced.initRequest(&cookie_req)).value().len);
 }
 
 test "failed response header append keeps the session dirty" {
