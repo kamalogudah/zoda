@@ -10,6 +10,9 @@
 //! emitted for every plugin instance that declares a non-`void` `State` type
 //! and an `initRequest` hook. Initialization runs in declaration order; cleanup
 //! runs in reverse order, including partial initialization failures.
+//!
+//! Plugin fields need not be containers: fields whose type cannot declare
+//! hooks (optional pointers, integers, ...) are skipped.
 const std = @import("std");
 const router = @import("router.zig");
 const response = @import("response.zig");
@@ -34,6 +37,23 @@ pub const AppConfig = struct {
 /// Injected application clock (ADR-0001 §5.4); see `timing.zig`.
 pub const Clock = timing.Clock;
 
+/// True when `T` can carry declarations (struct, enum, union, opaque) and
+/// declares `name`. Plain fields such as `?*Connection` have no plugin hooks
+/// and are skipped rather than failing `@hasDecl`.
+inline fn hasPluginDecl(comptime T: type, comptime name: []const u8) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, name),
+        else => false,
+    };
+}
+
+/// True when plugin type `T` has a non-`void` `State` and the given hook.
+inline fn hasRequestState(comptime T: type, comptime hook: []const u8) bool {
+    if (comptime !hasPluginDecl(T, "State")) return false;
+    if (T.State == void) return false;
+    return hasPluginDecl(T, hook);
+}
+
 /// Generates a struct containing one field per plugin instance that declares a
 /// non-`void` `State` type and an `initRequest` hook. Field names match the
 /// plugin instance names.
@@ -42,7 +62,7 @@ pub fn RequestState(comptime Plugins: type) type {
     const count = comptime blk: {
         var c: usize = 0;
         for (info.field_types) |PT| {
-            if (@hasDecl(PT, "State") and PT.State != void and @hasDecl(PT, "initRequest")) c += 1;
+            if (hasRequestState(PT, "initRequest")) c += 1;
         }
         break :blk c;
     };
@@ -51,7 +71,7 @@ pub fn RequestState(comptime Plugins: type) type {
     var attrs: [count]std.builtin.Type.Struct.FieldAttributes = undefined;
     var i: usize = 0;
     inline for (info.field_names, info.field_types) |name, PT| {
-        if (@hasDecl(PT, "State") and PT.State != void and @hasDecl(PT, "initRequest")) {
+        if (hasRequestState(PT, "initRequest")) {
             names[i] = name;
             types[i] = PT.State;
             attrs[i] = .{};
@@ -78,14 +98,14 @@ pub fn initRequestState(
             const idx = info.field_names.len - 1 - rev_offset;
             const name = info.field_names[idx];
             const PT = info.field_types[idx];
-            if (initialized[idx] and @hasDecl(PT, "deinitRequest")) {
+            if (initialized[idx] and hasPluginDecl(PT, "deinitRequest")) {
                 @field(plugins, name).deinitRequest(&@field(state, name));
             }
         }
     }
 
     inline for (info.field_names, info.field_types, 0..) |name, PT, idx| {
-        if (@hasDecl(PT, "State") and PT.State != void and @hasDecl(PT, "initRequest")) {
+        if (hasRequestState(PT, "initRequest")) {
             const plugin_ptr = &@field(plugins, name);
             @field(state, name) = try plugin_ptr.initRequest(req);
             initialized[idx] = true;
@@ -105,7 +125,7 @@ pub fn deinitRequestState(
         const idx = info.field_names.len - 1 - rev_offset;
         const name = info.field_names[idx];
         const PT = info.field_types[idx];
-        if (@hasDecl(PT, "State") and PT.State != void and @hasDecl(PT, "deinitRequest")) {
+        if (hasRequestState(PT, "deinitRequest")) {
             @field(plugins, name).deinitRequest(&@field(state, name));
         }
     }
@@ -179,7 +199,7 @@ pub fn App(comptime Plugins: type) type {
                 for (0..info.field_names.len) |rev_offset| {
                     const idx = info.field_names.len - 1 - rev_offset;
                     const PT = info.field_types[idx];
-                    if (@hasDecl(PT, "wrapRoute")) {
+                    if (hasPluginDecl(PT, "wrapRoute")) {
                         route = PT.wrapRoute(RouteHook(info.field_names[idx]), route);
                     }
                 }
@@ -2214,4 +2234,16 @@ test "README route-wrapper example compiles and runs" {
         try std.testing.expectEqual(case.checked, checked != null);
         if (checked) |v| try std.testing.expectEqualStrings("checker", v);
     }
+}
+
+test "non-container Plugins fields are skipped" {
+    const Conn = struct {};
+    const Plugins = struct { database: ?*Conn = null, json: Json = .{} };
+    const A = App(Plugins);
+    const S = RequestState(Plugins);
+    try std.testing.expect(!@hasField(S, "database"));
+    const R = struct {
+        fn route(_: *A.Context, _: *router.Request, _: *response.Response) anyerror!void {}
+    };
+    _ = A.composeRoute(R.route);
 }
