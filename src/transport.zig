@@ -31,6 +31,17 @@ pub const Config = struct {
     max_requests: usize = 100,
     /// Optional operation-boundary hooks used by the socket runtime.
     deadlines: ?Deadlines = null,
+    /// Optional observation hooks around `app.dispatch`. They measure handler
+    /// time; they cannot interrupt, cancel, or bound it.
+    handler_hooks: ?HandlerHooks = null,
+};
+
+/// Called immediately before and after every `app.dispatch` (including when it
+/// fails). Purely observational: the transport never abandons a running handler.
+pub const HandlerHooks = struct {
+    context: *anyopaque,
+    begin: *const fn (context: *anyopaque) void,
+    end: *const fn (context: *anyopaque) void,
 };
 
 /// Hooks mark total header, body-read, and response-write operations. A hook
@@ -99,7 +110,7 @@ pub fn serveConnection(
         };
 
         const keep_alive = wire_req.head.keep_alive and request_index + 1 < config.max_requests;
-        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, keep_alive, config.deadlines);
+        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, keep_alive, config.deadlines, config.handler_hooks);
         if (outcome == .close) return;
     }
 }
@@ -114,6 +125,7 @@ fn processRequest(
     limits: request.Limits,
     keep_alive: bool,
     deadlines: ?Deadlines,
+    handler_hooks: ?HandlerHooks,
 ) anyerror!Outcome {
     const version = wire_req.head.version;
     const wire_method = wire_req.head.method;
@@ -307,7 +319,10 @@ fn processRequest(
     };
 
     var req = arena.requestView(methodFromStd(wire_method));
-    var res = app.dispatch(&req) catch {
+    if (handler_hooks) |hooks| hooks.begin(hooks.context);
+    const dispatched = app.dispatch(&req);
+    if (handler_hooks) |hooks| hooks.end(hooks.context);
+    var res = dispatched catch {
         try reject(wire_req, .internal_server_error, version, deadlines);
         return .close;
     };

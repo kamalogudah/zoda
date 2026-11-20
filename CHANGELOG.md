@@ -7,6 +7,15 @@ All notable changes to Zoda are recorded here. The format follows
 
 ### Security
 
+- Defined the handler execution contract (security analysis S4, #89). The
+  framework does not bound or cancel `app.dispatch`; socket deadlines cover
+  I/O only. `server.Stats` now reports `handlers_active`, `handlers_completed`,
+  `handlers_over_budget`, and handler duration totals/max, and
+  `Config.handler_budget` sets an observation-only threshold. README
+  "Handler execution budgets" lists the required upstream rate limits,
+  dependency timeouts, and bounded queues. A stalled-handler socket test
+  checks slot occupancy, admission shedding, counters, shutdown, and leaks.
+
 - Made authentication and CSRF coverage auditable (security analysis S3).
   New `zoda.route_table` declares routes as `.public` or `.protected` (no
   default), runs authentication, then CSRF proof on unsafe methods, then the

@@ -801,12 +801,47 @@ listener is closed. All `server.Config` fields have defaults:
 | `shutdown_grace_period` | 10 s, then remaining sockets are shut down |
 | `max_requests_per_connection` | 100 |
 | `request_limits` | 8 KiB target, 100 headers / 32 KiB header bytes, 8 trailers / 4 KiB trailer bytes, 128 path segments, 256 query pairs, 1 MiB body |
-| `stats` | optional `*server.Stats` with live `active`/`peak`/`admitted`/`rejected` counters |
+| `handler_budget` | null; observation threshold only (see below), never cancels a handler |
+| `stats` | optional `*server.Stats` with live `active`/`peak`/`admitted`/`rejected` counters plus `handlers_active`/`handlers_completed`/`handlers_over_budget` and `handler_nanoseconds_total`/`handler_nanoseconds_max` |
 
 Requests that break a limit get a 400, 413, 414, or 431 response, and the
 connection is closed. The server rejects `Expect`, content codings, and
 ambiguous framing (for example, a signed `Content-Length` or malformed
 chunked encoding).
+
+### Handler execution budgets
+
+Socket timeouts and handler time are separate things:
+
+- **Framework-managed I/O deadlines** (`header_timeout`, `body_read_timeout`,
+  `write_timeout`, `keep_alive_idle_timeout`) bound socket operations only.
+- **`app.dispatch` is a synchronous call that Zoda cannot interrupt.** There is
+  no handler deadline, cancellation token, or forced termination. A handler
+  blocked on a database, an external service, or a CPU loop keeps its
+  connection slot, request arena, and response memory until it returns, and
+  none of the socket timeouts fire while it runs. Server shutdown waits for it
+  to return (or for the task to reach an `Io` cancellation point) before the
+  connection's memory is freed.
+- Zoda deliberately does not abandon a running handler: detaching it would
+  leave work holding request/response memory and able to write after
+  cancellation.
+
+What Zoda provides is observation: `handlers_active` (a stalled handler stays
+counted), `handlers_completed`, `handler_nanoseconds_total`/`_max`, and
+`handlers_over_budget` when `handler_budget` is set. Alert on `handlers_active`
+approaching `max_connections` and on `rejected` growth.
+
+**Production requirements (application/deployment responsibility):**
+
+- Put a reverse proxy or load balancer in front with per-client and
+  per-endpoint rate limits, and its own upstream response timeout.
+- Give every outbound call (database, HTTP, queue) an explicit timeout.
+- Send expensive work to a bounded queue or worker pool and reject when full,
+  rather than running it in the handler.
+- Use process isolation (separate worker process, supervisor restart) for work
+  that must be forcibly stopped.
+- Size `max_connections` and memory from measured peaks; a bounded body does
+  not bound total process memory.
 
 ### Performance
 

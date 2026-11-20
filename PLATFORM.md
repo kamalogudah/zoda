@@ -156,6 +156,12 @@ Allocation behavior is a public contract, not an implementation detail:
   double-frees, and the fuzz example uses `std.testing.fuzz`/`std.testing.Smith`
   provided by the pinned compiler.
 
+- **Handler execution.** `app.dispatch` runs synchronously on its connection
+  task and is not bounded by any framework deadline; socket timeouts do not
+  cancel it. Applications must bound their own handler time (see README
+  "Handler execution budgets"). Handler duration is observable through
+  `server.Stats`.
+
 ## 7. Validation evidence
 
 Recorded for Phase A on the primary platform:

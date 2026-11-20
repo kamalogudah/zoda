@@ -1,5 +1,11 @@
 //! Bounded concurrent socket runtime (ADR-0001 §4 Phase 2).
 //!
+//! Handler execution is NOT bounded here. Socket deadlines cover header, body,
+//! write, and idle I/O only; `app.dispatch` is a synchronous call that the
+//! runtime cannot interrupt. A stalled handler holds its connection slot until
+//! it returns (see PLATFORM.md "Handler execution budgets"). `Stats` exposes
+//! handler counts and durations for observation.
+//!
 //! Zig 0.16.0's `std.Io.Group.concurrent` supplies connection tasks and
 //! cancellation, while the pinned POSIX socket timeout options enforce the
 //! remaining absolute monotonic deadline before each syscall. The allocator passed to `serve` is used by
@@ -47,6 +53,10 @@ pub const Config = struct {
     shutdown_grace_period: Io.Clock.Duration = .{ .raw = .fromSeconds(10), .clock = .awake },
     max_requests_per_connection: usize = 100,
     request_limits: @import("request.zig").Limits = .default,
+    /// Observation threshold only: a handler that runs longer is counted in
+    /// `Stats.handlers_over_budget`. It does NOT cancel or time out the
+    /// handler; its response is still written. Null disables the counter.
+    handler_budget: ?Io.Clock.Duration = null,
     /// Optional caller-owned counters. When null, `serve` keeps private ones.
     stats: ?*Stats = null,
 };
@@ -59,6 +69,40 @@ pub const Stats = struct {
     peak: std.atomic.Value(usize) = .init(0),
     admitted: std.atomic.Value(usize) = .init(0),
     rejected: std.atomic.Value(usize) = .init(0),
+    /// Handlers currently executing (a stalled handler stays counted).
+    handlers_active: std.atomic.Value(usize) = .init(0),
+    handlers_completed: std.atomic.Value(usize) = .init(0),
+    handlers_over_budget: std.atomic.Value(usize) = .init(0),
+    handler_nanoseconds_total: std.atomic.Value(u64) = .init(0),
+    handler_nanoseconds_max: std.atomic.Value(u64) = .init(0),
+};
+
+/// Per-connection handler timer feeding `Stats`. Handlers run sequentially on
+/// a connection, so `started` needs no synchronization.
+const HandlerTimer = struct {
+    io: Io,
+    stats: *Stats,
+    budget: ?Io.Clock.Duration,
+    started: Io.Clock.Timestamp = undefined,
+
+    fn begin(context: *anyopaque) void {
+        const self: *HandlerTimer = @ptrCast(@alignCast(context));
+        self.started = Io.Clock.Timestamp.now(self.io, .awake);
+        _ = self.stats.handlers_active.fetchAdd(1, .acq_rel);
+    }
+
+    fn end(context: *anyopaque) void {
+        const self: *HandlerTimer = @ptrCast(@alignCast(context));
+        const elapsed = self.started.untilNow(self.io).raw.nanoseconds;
+        const ns: u64 = if (elapsed < 0) 0 else @intCast(@min(elapsed, std.math.maxInt(u64)));
+        _ = self.stats.handler_nanoseconds_total.fetchAdd(ns, .monotonic);
+        _ = self.stats.handler_nanoseconds_max.fetchMax(ns, .monotonic);
+        if (self.budget) |budget| {
+            if (elapsed > budget.raw.nanoseconds) _ = self.stats.handlers_over_budget.fetchAdd(1, .monotonic);
+        }
+        _ = self.stats.handlers_completed.fetchAdd(1, .monotonic);
+        _ = self.stats.handlers_active.fetchSub(1, .acq_rel);
+    }
 };
 
 /// Accepts connections until the listener is closed or this task is canceled.
@@ -93,6 +137,7 @@ pub fn serve(
         app: *const AppType,
         config: Config,
         active: *std.atomic.Value(usize),
+        stats: *Stats,
 
         fn run(context: *@This()) Io.Cancelable!void {
             // Released last: a zero admission count implies every
@@ -119,6 +164,11 @@ pub fn serve(
                 &connection_io.reader,
                 &connection_io.writer,
             );
+            var handler_timer: HandlerTimer = .{
+                .io = context.io,
+                .stats = context.stats,
+                .budget = context.config.handler_budget,
+            };
             transport.serveConnection(
                 AppType,
                 context.allocator,
@@ -128,6 +178,11 @@ pub fn serve(
                     .request_limits = context.config.request_limits,
                     .max_requests = context.config.max_requests_per_connection,
                     .deadlines = connection_io.deadlineHooks(),
+                    .handler_hooks = .{
+                        .context = &handler_timer,
+                        .begin = HandlerTimer.begin,
+                        .end = HandlerTimer.end,
+                    },
                 },
             ) catch {};
         }
@@ -173,6 +228,7 @@ pub fn serve(
             .app = app,
             .config = config,
             .active = active,
+            .stats = stats,
         };
         connections.concurrent(io, Context.run, .{context}) catch |err| {
             allocator.destroy(context);
@@ -667,4 +723,80 @@ test "real socket dispatch failure is generic and closes" {
     var reader = client.reader(io, &read_buffer);
     try expectSocketResponse(&reader.interface, 500, "Internal Server Error", 21);
     _ = server_future.cancel(io) catch {};
+}
+
+test "stalled handler holds its slot, is observable, and cleans up" {
+    const response = @import("response.zig");
+    const router = @import("router.zig");
+    const TestApp = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        release: *std.atomic.Value(bool),
+
+        pub fn dispatch(self: *const @This(), _: *router.Request) !response.Response {
+            while (!self.release.load(.acquire)) try Io.sleep(self.io, .fromMilliseconds(2), .awake);
+            var result = response.Response.init(self.allocator);
+            errdefer result.deinit();
+            try result.text(200, "late");
+            return result;
+        }
+    };
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, run_io: Io, run_listener: *net.Server, run_app: *const TestApp, run_config: Config) !void {
+            return serve(TestApp, allocator, run_io, run_listener, run_app, run_config);
+        }
+    };
+
+    const io = std.testing.io;
+    const address: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var release: std.atomic.Value(bool) = .init(false);
+    var stats: Stats = .{};
+    const app: TestApp = .{ .allocator = std.testing.allocator, .io = io, .release = &release };
+    var server_future = try io.concurrent(Runner.run, .{
+        std.testing.allocator, io, &listener, &app,
+        Config{
+            .max_connections = 1,
+            .handler_budget = .{ .raw = .fromMilliseconds(20), .clock = .awake },
+            .shutdown_grace_period = .{ .raw = .fromMilliseconds(25), .clock = .awake },
+            .stats = &stats,
+        },
+    });
+
+    const slow = try net.IpAddress.connect(&listener.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer slow.close(io);
+    var slow_buffer: [128]u8 = undefined;
+    var slow_writer = slow.writer(io, &slow_buffer);
+    try slow_writer.interface.writeAll("GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    try slow_writer.interface.flush();
+
+    var waited: usize = 0;
+    while (stats.handlers_active.load(.acquire) == 0) : (waited += 1) {
+        try std.testing.expect(waited < 1000);
+        try Io.sleep(io, .fromMilliseconds(2), .awake);
+    }
+    // Documented behavior: the stalled handler occupies the only slot, so
+    // further clients are shed at admission; no socket deadline interrupts it.
+    try Io.sleep(io, .fromMilliseconds(60), .awake);
+    try std.testing.expectEqual(@as(usize, 1), stats.handlers_active.load(.acquire));
+    const second = try net.IpAddress.connect(&listener.socket.address, io, .{ .mode = .stream, .protocol = .tcp });
+    defer second.close(io);
+    waited = 0;
+    while (stats.rejected.load(.acquire) == 0) : (waited += 1) {
+        try std.testing.expect(waited < 1000);
+        try Io.sleep(io, .fromMilliseconds(2), .awake);
+    }
+
+    release.store(true, .release);
+    var read_buffer: [512]u8 = undefined;
+    var reader = slow.reader(io, &read_buffer);
+    try expectSocketResponse(&reader.interface, 200, "late", 4);
+
+    _ = server_future.cancel(io) catch {};
+    try std.testing.expectEqual(@as(usize, 0), stats.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), stats.handlers_active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), stats.handlers_completed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), stats.handlers_over_budget.load(.acquire));
+    try std.testing.expect(stats.handler_nanoseconds_max.load(.acquire) >= 20 * std.time.ns_per_ms);
 }
