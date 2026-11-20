@@ -295,7 +295,7 @@ pub const Store = struct {
             else => return error.Transport,
         };
 
-        switch (@intFromEnum(result.status)) {
+        switch (@backingInt(result.status)) {
             200...299 => {},
             404 => return error.NotFound,
             else => return error.RequestFailed,
