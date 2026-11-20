@@ -15,6 +15,14 @@ All notable changes to Zoda are recorded here. The format follows
   (4 KiB). **Breaking:** clients sending other trailers are now rejected. See
   README "Chunked request trailers" for proxy requirements.
 
+- Added revocable sessions (security analysis S2). `Sessions.store` takes a
+  server-side `Store`; `login`, `logout`, and `revokeSubject` create, revoke,
+  and mass-revoke sessions, and cookies use a new `v4` format carrying an opaque
+  ID. `MemoryStore(capacity)` is a bounded reference store. Store outages fail
+  closed (`initRequest` returns `SessionStoreUnavailable`). Stateless sessions
+  remain the default and `clear()` is documented as browser-only deletion. See
+  PLUGINS.md "Revocable sessions".
+
 ### Changed
 
 - **Toolchain upgraded to Zig 0.17.1**, the latest stable release. This is

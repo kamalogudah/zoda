@@ -169,8 +169,11 @@ The MAC covers every field before it. Invalid, expired,
 oversized, or duplicate session cookies load as an empty session. Payloads are
 limited to 2,048 bytes and cookie values to 4,096 bytes. Signing authenticates
 contents but **does not make them confidential**; do not put secrets in the
-payload. A copied cookie can be replayed until its expiry. Removing a key stops
-accepting cookies signed by that key.
+payload. **In the default stateless mode a copied cookie can be replayed until
+its expiry, and `clear()` only deletes the browser's copy; it does not revoke
+the session.** Removing a key stops accepting cookies signed by that key. For
+logout, password reset, or suspension that must take effect immediately, use
+[revocable sessions](#revocable-sessions).
 
 `save` appends a separate `Set-Cookie` field with `Path=/; Secure; HttpOnly;
 SameSite=Lax` and `Max-Age` set to the configured lifetime. The `__Host-`
@@ -182,6 +185,52 @@ CSRF protection before using cookie sessions for state-changing requests.
 If a route fails after `save`, a propagated error discards its partial response.
 Recovery middleware can call `res.clear()` and then explicitly `save` the
 recovered session; cleanup never creates or restores a cookie.
+
+### Revocable sessions
+
+Set `Sessions.store` to a server-side registry to get revocation. Contract:
+
+- **Allowlist.** A session is valid only while the store holds its record.
+  Unknown, revoked, expired, and forged IDs all load as an empty session.
+- **Cookie.** `v4.<key-id>.<expiry>.<base64url-128-bit-ID>.<payload>.<CSRF>.<flash>.<HMAC>`.
+  The MAC and expiry are still checked first, so unsigned input never reaches
+  the store. With a store configured, stateless v1-v3 cookies are rejected (they
+  could not be revoked); without one, v4 is rejected.
+- **Identity.** Read the account from `state.subject()`, which comes from the
+  store record, never from the payload. An empty subject means anonymous.
+- **Login.** After verifying credentials, `try sessions.login(io, &state, "user-42")`
+  then `save`. This issues a fresh random ID (revoking any prior one, so session
+  fixation is not possible) and a fresh CSRF secret.
+- **Logout.** `try sessions.logout(&state)` revokes the record, then `save`
+  sends the deletion cookie. A copied cookie fails on its next use. If it
+  returns `SessionStoreUnavailable` the record may still be live: do not report
+  success; retry or alert.
+- **Revoke an account.** `try sessions.revokeSubject("user-42")` after a password
+  reset, suspension, or privilege change removes every session of that account.
+  Mint a new session afterwards with `login`.
+- **Emergency invalidation.** Key rotation still works: remove a key from
+  `keys` to drop every cookie it signed, with or without a store.
+
+Failure semantics: `initRequest` returns `error.SessionStoreUnavailable` when a
+presented session cannot be checked. It never falls back to the signed cookie.
+Handle it as 503 (anonymous pages may choose to proceed without a session).
+`login` returns `SessionStoreFull` when capacity is exhausted. `Store` calls
+must be bounded, thread-safe, and linearizable: once `revoke`/`revokeSubject`
+returns, no later `lookup` may succeed, so a cache with stale reads breaks
+revocation.
+
+Deployment requirements:
+
+- **Persistence and scaling.** `MemoryStore(capacity)` is process-local, fixed
+  size, O(capacity) per call, and lost on restart. It suits tests and a single
+  process. Multiple processes or hosts need a shared implementation of
+  `sessions.Store` (a database or Redis) so a revocation is visible everywhere.
+- **Cleanup.** Records carry an absolute expiry (`lifetime_seconds` from login;
+  cookie refreshes do not extend it). `MemoryStore` reclaims expired slots on
+  `login`; external stores should purge expired rows periodically.
+- **Capacity.** Size the store for concurrent logins; a full store rejects new
+  logins instead of evicting live sessions.
+- **Clock.** The store and `Sessions.now_seconds` must use a trusted clock.
 
 ## CSRF helpers
 
