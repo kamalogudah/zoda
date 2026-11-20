@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: every job only checks out and builds, so the token is
+# read-only. No workflow uses secrets or needs write access. The pull_request
+# trigger (not pull_request_target) keeps fork PRs unprivileged.
+permissions:
+  contents: read
+
 env:
   ZIG_VERSION: "0.17.1"
 
@@ -14,8 +20,10 @@ jobs:
     name: Format check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig fmt --check build.zig src examples
@@ -24,8 +32,10 @@ jobs:
     name: Build and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Verify pinned Zig version

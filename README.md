@@ -60,6 +60,15 @@ get /users/42/ -> 404 text/plain
 post /users/42 -> 404 text/plain
 ```
 
+### CI supply-chain policy
+
+Workflows in `.github/workflows/` pin every action to a full commit SHA with a
+`# vX.Y.Z` comment, and declare `permissions: contents: read` (no job needs
+write access or secrets). `.github/dependabot.yml` opens weekly update PRs for
+the pins; review the upstream diff before merging. To bump manually, resolve
+the new tag with `gh api repos/<owner>/<repo>/tags` and replace both the SHA
+and the version comment.
+
 ## Development loop
 
 ```sh
