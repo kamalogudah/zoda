@@ -103,6 +103,12 @@ pub const Request = struct {
     /// Allowlisted chunk trailer fields; see `getTrailerOne`.
     trailers: []const Trailer = &.{},
     body: []const u8 = &.{},
+    /// True when the body was streamed to a `transport.BodySink`; `body` is
+    /// then empty and does not mean the request had no body.
+    body_streamed: bool = false,
+    /// The streaming sink's `context` (see `transport.BodyStreamHook`), set
+    /// only when `body_streamed`.
+    body_sink: ?*anyopaque = null,
 
     /// Same-request checkpoint: returns the current cursor position. A saved
     /// checkpoint is meaningful only for the request it came from; it must not

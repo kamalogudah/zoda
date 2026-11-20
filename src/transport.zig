@@ -40,6 +40,76 @@ pub const Config = struct {
     /// Lets the app render the response for an over-limit request body. See
     /// `BodyTooLargeHook`. Null keeps the bare 413.
     on_body_too_large: ?BodyTooLargeHook = null,
+    /// Lets the app stream selected request bodies to a sink instead of
+    /// buffering them. Null buffers every body. See `BodyStreamHook`.
+    body_stream: ?BodyStreamHook = null,
+};
+
+/// Receives a request body incrementally instead of the transport buffering it
+/// in the request arena. Decoded bytes (chunked framing already removed) are
+/// passed to `write` in order, in pieces of at most 8 KiB. Exactly one of
+/// `finish` or `abort` is called:
+///
+/// - `finish` runs after the whole body (and any chunk trailers) was received
+///   and validated, before `app.dispatch`. Failing it rejects the request
+///   (400 for `error.InvalidBody`, otherwise 500) without dispatching.
+/// - `abort` runs if the body is not completed: over the limit (413), malformed
+///   framing or trailers, read failure or deadline, or a failed `write`.
+///   It must release whatever the sink holds and must not fail.
+///
+/// A sink runs on the connection's thread and blocks it, like a handler; it
+/// should write to a file, hash, or parse and not wait on slow dependencies.
+/// The body-read deadline (`Deadlines.begin_body`) and the size limit
+/// (`BodyLimitRule` / `max_body_bytes`) apply exactly as for buffered bodies.
+pub const BodySink = struct {
+    context: *anyopaque,
+    write: *const fn (context: *anyopaque, chunk: []const u8) anyerror!void,
+    finish: *const fn (context: *anyopaque) anyerror!void,
+    abort: *const fn (context: *anyopaque) void,
+};
+
+/// Decides, from the request head, whether a body is streamed. `open` runs
+/// after the head is validated and an over-limit `Content-Length` was refused,
+/// and only for requests that have a body (`Content-Length` > 0 or chunked).
+/// Return null to buffer the body as usual, or a `BodySink` to stream it.
+/// `allocator` is the request arena: allocate the sink state there, it is
+/// released after the response is written. `limit` is the effective body limit.
+/// If `open` fails the request is answered 500 without reading the body.
+///
+/// For a streamed request `app.dispatch` runs after `finish` with an empty
+/// `req.body`, `req.body_streamed == true`, and `req.body_sink` set to the
+/// sink's `context`, which is how a handler finds what the sink produced.
+/// Middleware that reads `req.body` (JSON parsing, ...) sees no body.
+pub const BodyStreamHook = struct {
+    context: *anyopaque,
+    open: *const fn (context: *anyopaque, head: *router.Request, allocator: std.mem.Allocator, limit: usize) anyerror!?BodySink,
+};
+
+/// Routes decoded body bytes either to a buffer or to a `BodySink`, enforcing
+/// one size limit on both.
+const BodyTarget = struct {
+    max_bytes: usize,
+    total: usize = 0,
+    buffer: ?buffering.BoundedAccumulator = null,
+    sink: ?BodySink = null,
+    sink_error: ?anyerror = null,
+
+    fn remaining(self: *const BodyTarget) usize {
+        return self.max_bytes - self.total;
+    }
+
+    fn append(self: *BodyTarget, chunk: []const u8) error{ BodyTooLarge, OutOfMemory, SinkFailed }!void {
+        if (chunk.len > self.remaining()) return error.BodyTooLarge;
+        if (self.sink) |sink| {
+            sink.write(sink.context, chunk) catch |err| {
+                self.sink_error = err;
+                return error.SinkFailed;
+            };
+        } else {
+            self.buffer.?.append(chunk) catch |err| return err;
+        }
+        self.total += chunk.len;
+    }
 };
 
 /// Invoked when a request body exceeds its limit (global `max_body_bytes` or a
@@ -166,7 +236,7 @@ pub fn serveConnection(
         };
 
         const keep_alive = wire_req.head.keep_alive and request_index + 1 < config.max_requests;
-        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, config.body_limit_rules, keep_alive, config.deadlines, config.handler_hooks, config.on_body_too_large);
+        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, config.body_limit_rules, keep_alive, config.deadlines, config.handler_hooks, config.on_body_too_large, config.body_stream);
         if (outcome == .close) return;
     }
 }
@@ -184,6 +254,7 @@ fn processRequest(
     deadlines: ?Deadlines,
     handler_hooks: ?HandlerHooks,
     too_large_hook: ?BodyTooLargeHook,
+    stream_hook: ?BodyStreamHook,
 ) anyerror!Outcome {
     const version = wire_req.head.version;
     const wire_method = wire_req.head.method;
@@ -278,14 +349,34 @@ fn processRequest(
             return .close;
         }
     }
+    var sink_context: ?*anyopaque = null;
+    var streamed = false;
+    const has_body = transfer_encoding != .none or (content_length != null and content_length.? != 0);
+    var sink_open: ?BodySink = null;
+    // Called on every exit where an opened sink was not finished.
+    defer if (sink_open) |sink| sink.abort(sink.context);
+    if (has_body) {
+        if (stream_hook) |hook| {
+            const opened = hook.open(hook.context, &head_view, arena.allocator(), max_body) catch {
+                try reject(wire_req, .internal_server_error, version, deadlines);
+                return .close;
+            };
+            if (opened) |sink| {
+                sink_open = sink;
+                sink_context = sink.context;
+                streamed = true;
+            }
+        }
+    }
     if (transfer_encoding != .none or content_length != null) {
         if (deadlines) |operation_deadlines| operation_deadlines.body();
-        var body = buffering.BoundedAccumulator.init(arena.allocator(), max_body);
-        defer body.deinit();
+        var target: BodyTarget = .{ .max_bytes = max_body, .sink = sink_open };
+        if (!streamed) target.buffer = buffering.BoundedAccumulator.init(arena.allocator(), max_body);
+        defer if (target.buffer) |*b| b.deinit();
         var trailer_section: std.ArrayList(u8) = .empty;
 
         if (transfer_encoding == .chunked) {
-            readChunked(wire_req.server.reader.in, &body, &trailer_section, arena.allocator(), limits.trailer_bytes) catch |err| {
+            readChunked(wire_req.server.reader.in, &target, &trailer_section, arena.allocator(), limits.trailer_bytes) catch |err| {
                 if (err == error.BodyTooLarge) {
                     try rejectBodyTooLarge(allocator, wire_req, version, deadlines, too_large_hook, &head_view, max_body);
                     return .close;
@@ -294,6 +385,7 @@ fn processRequest(
                     error.BodyTooLarge => unreachable,
                     error.TrailersTooLarge => .request_header_fields_too_large,
                     error.OutOfMemory => .internal_server_error,
+                    error.SinkFailed => sinkStatus(target.sink_error),
                     error.Malformed, error.ReadFailed => .bad_request,
                 }, version, deadlines);
                 return .close;
@@ -313,7 +405,7 @@ fn processRequest(
                     return .close;
                 };
                 if (n == 0) break;
-                body.append(chunk[0..n]) catch |err| switch (err) {
+                target.append(chunk[0..n]) catch |err| switch (err) {
                     error.BodyTooLarge => {
                         try rejectBodyTooLarge(allocator, wire_req, version, deadlines, too_large_hook, &head_view, max_body);
                         return .close;
@@ -322,13 +414,19 @@ fn processRequest(
                         try reject(wire_req, .internal_server_error, version, deadlines);
                         return .close;
                     },
+                    error.SinkFailed => {
+                        try reject(wire_req, sinkStatus(target.sink_error), version, deadlines);
+                        return .close;
+                    },
                 };
             }
         }
-        arena.body = body.toOwnedSlice() catch {
-            try reject(wire_req, .internal_server_error, version, deadlines);
-            return .close;
-        };
+        if (target.buffer) |*b| {
+            arena.body = b.toOwnedSlice() catch {
+                try reject(wire_req, .internal_server_error, version, deadlines);
+                return .close;
+            };
+        }
 
         // Chunk trailers are parsed strictly, restricted to an allowlist, and
         // stored apart from the head fields. They never reach `arena.headers`.
@@ -392,7 +490,20 @@ fn processRequest(
         return .close;
     };
 
+    if (sink_open) |sink| {
+        sink.finish(sink.context) catch |err| {
+            // `finish` failed: the sink must have released its own state; do
+            // not also abort it.
+            sink_open = null;
+            try reject(wire_req, sinkStatus(err), version, deadlines);
+            return .close;
+        };
+        sink_open = null;
+    }
+
     var req = arena.requestView(methodFromStd(wire_method));
+    req.body_streamed = streamed;
+    req.body_sink = sink_context;
     if (handler_hooks) |hooks| hooks.begin(hooks.context);
     const dispatched = app.dispatch(&req);
     if (handler_hooks) |hooks| hooks.end(hooks.context);
@@ -403,6 +514,11 @@ fn processRequest(
     defer res.deinit();
 
     return writeResponse(allocator, wire_req, &res, version, keep_alive, deadlines);
+}
+
+fn sinkStatus(err: ?anyerror) std.http.Status {
+    if (err) |e| if (e == error.InvalidBody) return .bad_request;
+    return .internal_server_error;
 }
 
 /// Writes `res` (status already must be valid unless it is rejected here as
@@ -503,7 +619,7 @@ fn trailerAllowed(name: []const u8) bool {
     return false;
 }
 
-const ChunkedError = error{ Malformed, BodyTooLarge, TrailersTooLarge, OutOfMemory, ReadFailed };
+const ChunkedError = error{ Malformed, BodyTooLarge, TrailersTooLarge, OutOfMemory, ReadFailed, SinkFailed };
 
 /// Longest accepted chunk-size line, extensions included.
 const max_chunk_line = 1024;
@@ -516,7 +632,7 @@ const max_chunk_line = 1024;
 /// `trailer_limit` bytes.
 fn readChunked(
     in: *std.Io.Reader,
-    body: *buffering.BoundedAccumulator,
+    body: *BodyTarget,
     trailers: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     trailer_limit: usize,
@@ -524,7 +640,7 @@ fn readChunked(
     while (true) {
         const size = try parseChunkSize(try takeCrlfLine(in));
         if (size == 0) break;
-        if (size > body.max_bytes - body.len()) return error.BodyTooLarge;
+        if (size > body.remaining()) return error.BodyTooLarge;
         var remaining: usize = @intCast(size);
         while (remaining != 0) {
             const available = in.peekGreedy(1) catch |err| return mapReadError(err);
@@ -712,6 +828,11 @@ const TestApp = struct {
             }
             const digest = (try req.getTrailerOne("Content-Digest")) orelse "none";
             const text = try std.fmt.allocPrint(self.allocator, "leaked={d} trailers={d} digest={s}", .{ leaked, req.trailers.len, digest });
+            defer self.allocator.free(text);
+            try res.text(200, text);
+        } else if (req.body_streamed) {
+            const ctx: *SinkCtx = @ptrCast(@alignCast(req.body_sink.?));
+            const text = try std.fmt.allocPrint(self.allocator, "streamed={d} body={d}", .{ ctx.bytes, req.body.len });
             defer self.allocator.free(text);
             try res.text(200, text);
         } else {
@@ -1082,5 +1203,151 @@ test "trailer duplicates, syntax, and limits are enforced" {
     const bytes = try runTest(two, &app, .{ .request_limits = .{ .trailer_bytes = 16 } });
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 431"));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+}
+
+const SinkCtx = struct {
+    bytes: usize = 0,
+    writes: usize = 0,
+    finished: bool = false,
+    aborted: bool = false,
+    fail_write: ?anyerror = null,
+    fail_finish: ?anyerror = null,
+    open_calls: usize = 0,
+    fail_open: bool = false,
+    last_limit: usize = 0,
+
+    fn open(context: *anyopaque, head: *router.Request, allocator: std.mem.Allocator, limit: usize) anyerror!?BodySink {
+        _ = allocator;
+        const self: *SinkCtx = @ptrCast(@alignCast(context));
+        self.open_calls += 1;
+        self.last_limit = limit;
+        if (self.fail_open) return error.OpenFailed;
+        if (!std.mem.startsWith(u8, head.target, "/upload")) return null;
+        return .{ .context = self, .write = write, .finish = finish, .abort = abort };
+    }
+
+    fn write(context: *anyopaque, chunk: []const u8) anyerror!void {
+        const self: *SinkCtx = @ptrCast(@alignCast(context));
+        if (self.fail_write) |err| return err;
+        self.bytes += chunk.len;
+        self.writes += 1;
+    }
+
+    fn finish(context: *anyopaque) anyerror!void {
+        const self: *SinkCtx = @ptrCast(@alignCast(context));
+        if (self.fail_finish) |err| return err;
+        self.finished = true;
+    }
+
+    fn abort(context: *anyopaque) void {
+        const self: *SinkCtx = @ptrCast(@alignCast(context));
+        self.aborted = true;
+    }
+};
+
+fn sinkConfig(ctx: *SinkCtx, rules: []const BodyLimitRule) Config {
+    return .{
+        .request_limits = .{ .max_body_bytes = 4 },
+        .body_limit_rules = rules,
+        .body_stream = .{ .context = ctx, .open = SinkCtx.open },
+    };
+}
+
+test "streamed body reaches the sink, not req.body, and ignores the buffer limit via rules" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    const rules = [_]BodyLimitRule{.{ .prefix = "/upload", .max_body_bytes = 64 }};
+    var ctx: SinkCtx = .{};
+    const cfg = sinkConfig(&ctx, &rules);
+
+    const out = try runTest("POST /upload HTTP/1.1\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world", &app, cfg);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "streamed=11 body=0"));
+    try std.testing.expect(ctx.finished and !ctx.aborted);
+    try std.testing.expectEqual(@as(usize, 64), ctx.last_limit);
+
+    // Chunked framing is removed before the sink sees the bytes.
+    var ctx2: SinkCtx = .{};
+    const chunked = try runTest("POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n", &app, sinkConfig(&ctx2, &rules));
+    defer std.testing.allocator.free(chunked);
+    try std.testing.expect(std.mem.endsWith(u8, chunked, "streamed=5 body=0"));
+    try std.testing.expect(ctx2.finished and !ctx2.aborted);
+}
+
+test "hook returning null buffers; bodyless requests never open a sink" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    var ctx: SinkCtx = .{};
+    const cfg = sinkConfig(&ctx, &.{});
+
+    const other = try runTest("POST /other HTTP/1.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi", &app, cfg);
+    defer std.testing.allocator.free(other);
+    try std.testing.expect(std.mem.endsWith(u8, other, "\r\n\r\nhi"));
+    try std.testing.expectEqual(@as(usize, 1), ctx.open_calls);
+
+    const empty = try runTest("POST /upload HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &app, cfg);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expect(std.mem.startsWith(u8, empty, "HTTP/1.1 200"));
+    try std.testing.expectEqual(@as(usize, 1), ctx.open_calls);
+}
+
+test "streamed body over the limit aborts the sink with 413, before open for Content-Length" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+
+    var ctx: SinkCtx = .{};
+    const declared = try runTest("POST /upload HTTP/1.1\r\nContent-Length: 9\r\n\r\n123456789", &app, sinkConfig(&ctx, &.{}));
+    defer std.testing.allocator.free(declared);
+    try std.testing.expect(std.mem.startsWith(u8, declared, "HTTP/1.1 413"));
+    try std.testing.expectEqual(@as(usize, 0), ctx.open_calls);
+
+    var ctx2: SinkCtx = .{};
+    const chunked = try runTest("POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n", &app, sinkConfig(&ctx2, &.{}));
+    defer std.testing.allocator.free(chunked);
+    try std.testing.expect(std.mem.startsWith(u8, chunked, "HTTP/1.1 413"));
+    try std.testing.expect(ctx2.aborted and !ctx2.finished);
+    try std.testing.expectEqual(@as(usize, 3), ctx2.bytes);
+    try std.testing.expectEqual(@as(usize, 0), calls);
+}
+
+test "sink failures reject without dispatch and abort once" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    const req = "POST /upload HTTP/1.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi";
+
+    var write_fail: SinkCtx = .{ .fail_write = error.DiskFull };
+    const a = try runTest(req, &app, sinkConfig(&write_fail, &.{}));
+    defer std.testing.allocator.free(a);
+    try std.testing.expect(std.mem.startsWith(u8, a, "HTTP/1.1 500"));
+    try std.testing.expect(write_fail.aborted);
+
+    var invalid: SinkCtx = .{ .fail_write = error.InvalidBody };
+    const b = try runTest(req, &app, sinkConfig(&invalid, &.{}));
+    defer std.testing.allocator.free(b);
+    try std.testing.expect(std.mem.startsWith(u8, b, "HTTP/1.1 400"));
+
+    var finish_fail: SinkCtx = .{ .fail_finish = error.InvalidBody };
+    const c = try runTest(req, &app, sinkConfig(&finish_fail, &.{}));
+    defer std.testing.allocator.free(c);
+    try std.testing.expect(std.mem.startsWith(u8, c, "HTTP/1.1 400"));
+    try std.testing.expect(!finish_fail.aborted);
+
+    var open_fail: SinkCtx = .{ .fail_open = true };
+    const d = try runTest(req, &app, sinkConfig(&open_fail, &.{}));
+    defer std.testing.allocator.free(d);
+    try std.testing.expect(std.mem.startsWith(u8, d, "HTTP/1.1 500"));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+}
+
+test "malformed chunked framing aborts the sink" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    var ctx: SinkCtx = .{};
+    const out = try runTest("POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n", &app, sinkConfig(&ctx, &.{}));
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 400"));
+    try std.testing.expect(ctx.aborted and !ctx.finished);
     try std.testing.expectEqual(@as(usize, 0), calls);
 }

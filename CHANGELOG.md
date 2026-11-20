@@ -7,6 +7,19 @@ All notable changes to Zoda are recorded here. The format follows
 
 ### Added
 
+- `server.Config.body_stream` (`transport.BodyStreamHook` / `BodySink`): the
+  app can stream selected request bodies to a caller-provided sink (file,
+  hasher, multipart parser) instead of buffering them in the request arena.
+  `open` decides from the request head (and may allocate sink state in the
+  request arena); `write` gets decoded bytes in order, `finish` runs after the
+  full body and trailers are validated, `abort` on any incomplete body. The
+  same size limit (`body_limit_rules`) and body-read deadline apply; an
+  over-limit body aborts the sink and goes through `on_body_too_large`.
+  `app.dispatch` runs after `finish` with an empty `req.body`,
+  `req.body_streamed == true`, and `req.body_sink` set to the sink context,
+  so middleware that reads `req.body` sees no body. `error.InvalidBody` from
+  the sink maps to 400, other errors to 500 (#100). Sinks run on the
+  connection thread and block it; the response is still buffered.
 - `server.Config.on_body_too_large` (`transport.BodyTooLargeHook`): the app can
   render the response for an over-limit request body (JSON error, custom
   headers, ...). The hook gets the request head and the exceeded limit; its

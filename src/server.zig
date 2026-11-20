@@ -61,6 +61,10 @@ pub const Config = struct {
     /// `transport.BodyTooLargeHook`). The connection is closed after it is
     /// written. Null sends the bare 413.
     on_body_too_large: ?transport.BodyTooLargeHook = null,
+    /// Streams selected request bodies to a caller-provided sink instead of
+    /// buffering them (see `transport.BodyStreamHook`). The same size limit and
+    /// body-read deadline apply. Null buffers every body.
+    body_stream: ?transport.BodyStreamHook = null,
     /// Observation threshold only: a handler that runs longer is counted in
     /// `Stats.handlers_over_budget`. It does NOT cancel or time out the
     /// handler; its response is still written. Null disables the counter.
@@ -186,6 +190,7 @@ pub fn serve(
                     .request_limits = context.config.request_limits,
                     .body_limit_rules = context.config.body_limit_rules,
                     .on_body_too_large = context.config.on_body_too_large,
+                    .body_stream = context.config.body_stream,
                     .max_requests = context.config.max_requests_per_connection,
                     .deadlines = connection_io.deadlineHooks(),
                     .handler_hooks = .{
