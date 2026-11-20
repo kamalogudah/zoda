@@ -1658,11 +1658,35 @@ fn logSsrFailure(req: *const zoda.router.Request, failure: zoda.plugins.inertia.
 
 | `Ssr` field | Default | Meaning |
 | --- | --- | --- |
-| `address` | `127.0.0.1:13714` | Literal `std.Io.net.IpAddress` of the SSR server. No name lookup happens. |
+| `address` | `127.0.0.1:13714` | Literal loopback `std.Io.net.IpAddress` (127.0.0.0/8 or `::1`) of the SSR server. No name lookup happens. Any other address is `error.InvalidSsr`. |
 | `path` | `"/render"` | Request path: `/` then printable ASCII without spaces, at most 256 bytes. |
 | `timeout_ms` | `1000` | Total budget for connecting, sending, and reading, 1 to 60,000. |
 | `max_response_bytes` | 1 MiB | Most bytes of the SSR server's answer, head included. |
 
+- **Trust boundary.** Read this before enabling `ssr`.
+  - *Transport.* Plain HTTP with no authentication or encryption, so only
+    loopback destinations are supported. `validate()` and `render` reject
+    every non-loopback `address` (including `0.0.0.0`, `::`, and
+    IPv4-mapped IPv6) with `error.InvalidSsr`; there is no remote mode and
+    no silent plaintext fallback. To reach a renderer on another host,
+    run it on the same machine; do not tunnel it behind the loopback port
+    unless that tunnel is itself authenticated and encrypted and you own
+    both ends.
+  - *Data exposure.* The renderer receives the full page JSON: every
+    prop, including flash data and shared props. Keep secrets, tokens, and
+    anything not needed to render the page out of props.
+  - *Markup trust.* The renderer is part of the trusted computing base.
+    Its `head` and `body` are inserted verbatim, unescaped, into a
+    document served from your origin. Anything that controls the renderer
+    controls the page. Never pass third-party or user-supplied renderer
+    output through it.
+  - *Service isolation.* Bind the renderer to loopback only (for
+    `@inertiajs/*/server`, pass `host: '127.0.0.1'`; its default is
+    `0.0.0.0`), run it as an unprivileged user, and
+    restrict who can reach the port (a dedicated user or network
+    namespace, container-private network, or firewall rule). Any local
+    process that can connect to the port can read page props sent to it,
+    and a local process that wins the port can serve markup.
 - **Request.** `POST <path> HTTP/1.1` with `Content-Type: application/json`
   and `Connection: close`. The body is exactly the page object an
   `X-Inertia` visit would get, unescaped.
@@ -1670,7 +1694,7 @@ fn logSsrFailure(req: *const zoda.router.Request, failure: zoda.plugins.inertia.
   missing; other fields are ignored), framed by `Content-Length`, chunked
   encoding, or the connection close. The `head` elements, joined with
   newlines, replace `@inertiaHead`; `body` replaces `@inertia`. Both are
-  inserted as is: the SSR server is trusted like the layout. In v3 `body`
+  inserted as is: the SSR server is trusted like the layout (see Trust boundary). In v3 `body`
   holds the `<script data-page>` element and
   `<div data-server-rendered="true" id="app">`, built from the page JSON
   Zoda sent, so `root_id` and `initial_page` must match the SSR server's
@@ -1684,10 +1708,10 @@ fn logSsrFailure(req: *const zoda.router.Request, failure: zoda.plugins.inertia.
 - **Deadline.** The budget is one absolute deadline on the monotonic clock,
   checked before every syscall, so a hung or slow SSR server costs at most
   `timeout_ms`. During that time the request holds its connection task:
-  keep the SSR server local and the timeout short.
+  the SSR server must be local and the timeout short.
 - **Settings.** `validate()` and `render` return `error.InvalidSsr` for a
-  zero or over-limit `timeout_ms`, a zero `max_response_bytes`, or a bad
-  `path`. `@inertiaHead` after `@inertia`, or twice, is
+  non-loopback `address`, a zero or over-limit `timeout_ms`, a zero
+  `max_response_bytes`, or a bad `path`. `@inertiaHead` after `@inertia`, or twice, is
   `error.InvalidLayout`.
 - **Not covered.** Only full visits are rendered; `X-Inertia` responses are
   JSON as always. The SSR server's error details (its 500 body) are not

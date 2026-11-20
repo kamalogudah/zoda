@@ -541,7 +541,9 @@ pub fn main(init: std.process.Init) !void {
                 // localhost, where this example runs.
                 .encrypt_history = true,
                 .now_milliseconds = unixMilliseconds,
-                // `npm run ssr` listens on the default 127.0.0.1:13714.
+                // `npm run ssr` listens on the default 127.0.0.1:13714. Zoda rejects any
+                // non-loopback SSR address: the renderer sees all props and its
+                // markup is inserted unescaped, so keep it local-only.
                 .ssr = if (ssr) .{ .timeout_ms = 500 } else null,
                 .on_ssr_failure = logSsrFailure,
             },

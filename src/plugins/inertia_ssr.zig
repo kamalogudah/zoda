@@ -14,6 +14,11 @@
 //! `zoda.static`, it fails closed on other targets with
 //! `error.SsrUnsupported`, and the plugin falls back to client rendering.
 //! The address is a literal: no name lookup happens in the request path.
+//!
+//! Trust boundary: the transport is plaintext HTTP, so only loopback
+//! destinations (127.0.0.0/8 and `::1`) are supported; `validate` rejects
+//! every other address. The renderer sees all page props and its markup is
+//! inserted verbatim, so it is part of the trusted computing base.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
@@ -30,7 +35,9 @@ pub const max_path_bytes = 256;
 /// Where and how long to render. Every field has a default; `.{}` targets
 /// the default Inertia SSR server.
 pub const Config = struct {
-    /// The SSR server's literal IP address and port.
+    /// The SSR server's literal IP address and port. Must be loopback: the
+    /// transport is plaintext and unauthenticated, and the renderer reads
+    /// every page prop and returns markup that is inserted unescaped.
     address: IpAddress = .{ .ip4 = .loopback(default_port) },
     /// Request path: `/` then printable ASCII without spaces.
     path: []const u8 = "/render",
@@ -41,6 +48,7 @@ pub const Config = struct {
     max_response_bytes: usize = 1 << 20,
 
     pub fn validate(self: Config) error{InvalidSsr}!void {
+        if (!isLoopback(self.address)) return error.InvalidSsr;
         if (self.timeout_ms == 0 or self.timeout_ms > max_timeout_ms) return error.InvalidSsr;
         if (self.max_response_bytes == 0) return error.InvalidSsr;
         if (self.path.len == 0 or self.path.len > max_path_bytes or self.path[0] != '/') return error.InvalidSsr;
@@ -49,6 +57,15 @@ pub const Config = struct {
         }
     }
 };
+
+/// True for 127.0.0.0/8 and `::1`. IPv4-mapped IPv6 (`::ffff:127.0.0.1`),
+/// unspecified (`0.0.0.0`, `::`) and every other address are not loopback.
+pub fn isLoopback(address: IpAddress) bool {
+    return switch (address) {
+        .ip4 => |a| a.bytes[0] == 127,
+        .ip6 => |a| std.mem.allEqual(u8, a.bytes[0..15], 0) and a.bytes[15] == 1,
+    };
+}
 
 /// Why a render produced no page. The plugin reports it and falls back.
 pub const Failure = error{
@@ -87,6 +104,9 @@ pub const Page = struct {
 /// are `error.OutOfMemory`; everything else is a `Failure`.
 pub fn render(allocator: std.mem.Allocator, config: Config, page: []const u8) (Failure || error{OutOfMemory})!Page {
     if (comptime !supported) return error.SsrUnsupported;
+    // The plugin validates first; this keeps a direct caller from ever
+    // sending page props to a non-loopback address.
+    if (!isLoopback(config.address)) return error.SsrConnectFailed;
     const raw = try exchange(allocator, config, page);
     defer allocator.free(raw);
     return parse(allocator, raw);
@@ -460,4 +480,27 @@ test "SSR settings are validated" {
         .{ .path = "/" ++ (&comptime @as([max_path_bytes]u8, @splat('a'))) },
     };
     for (bad) |config| try testing.expectError(error.InvalidSsr, config.validate());
+}
+
+test "only loopback SSR destinations are allowed" {
+    const ok = [_]IpAddress{
+        .{ .ip4 = .loopback(13714) },
+        .{ .ip4 = .{ .bytes = .{ 127, 1, 2, 3 }, .port = 1 } },
+        .{ .ip6 = .loopback(13714) },
+    };
+    for (ok) |address| try (Config{ .address = address }).validate();
+
+    const bad = [_]IpAddress{
+        .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 13714 } },
+        .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 5 }, .port = 13714 } },
+        .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 10 }, .port = 13714 } },
+        .{ .ip4 = .{ .bytes = .{ 8, 8, 8, 8 }, .port = 13714 } },
+        .{ .ip6 = .{ .bytes = @splat(0), .port = 13714 } },
+        .{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = 13714 } },
+        .{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 13714 } },
+    };
+    for (bad) |address| {
+        try testing.expectError(error.InvalidSsr, (Config{ .address = address }).validate());
+        try testing.expectError(error.SsrConnectFailed, render(testing.allocator, .{ .address = address }, "{}"));
+    }
 }

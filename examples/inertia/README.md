@@ -40,6 +40,14 @@ Start it, then start Zoda with `--ssr`:
 zig build run-inertia -- react --ssr
 ```
 
+**Security.** The SSR server is trusted code: it sees every page prop and
+its HTML is inserted into the page unescaped. Zoda talks to it over plain
+HTTP and accepts only loopback addresses, so it must run on the same host.
+The example's `src/ssr.jsx` sets `host: '127.0.0.1'` explicitly, because
+Inertia's own default is `0.0.0.0`. Do not expose port 13714 (no `0.0.0.0`,
+no published container port, no forwarding) and keep secrets out of props.
+Restrict the port to the user running the example on shared machines.
+
 Each full visit then posts its page JSON to the SSR server, with a 500 ms
 budget, and sends the rendered HTML: the page arrives as markup inside
 `<div data-server-rendered="true" id="app">`, and `main.jsx` hydrates it

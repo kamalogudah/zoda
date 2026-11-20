@@ -4698,7 +4698,7 @@ test "@inertiaHead is optional, single, before @inertia, and removed without SSR
         try testing.expectError(error.InvalidLayout, bad.validate());
         try testing.expectError(error.InvalidLayout, bad.render(&req, &res, "Home", .{}));
     }
-    for ([_]Ssr{ .{ .timeout_ms = 0 }, .{ .path = "/a b" }, .{ .max_response_bytes = 0 } }) |config| {
+    for ([_]Ssr{ .{ .timeout_ms = 0 }, .{ .path = "/a b" }, .{ .max_response_bytes = 0 }, .{ .address = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 5 }, .port = 13714 } } } }) |config| {
         const bad: TestInertia = .{ .layout = ssr_layout, .ssr = config };
         try testing.expectError(error.InvalidSsr, bad.validate());
         try testing.expectError(error.InvalidSsr, bad.render(&req, &res, "Home", .{}));
