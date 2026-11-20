@@ -50,6 +50,17 @@ runs inside `zig build test`.
   value and calls `deinit()`; parsed strings are copied and may outlive the
   request until then. See the [compiling route](examples/contract.zig) and
   [README](README.md#typed-json-requests).
+- `zoda.multipart` is a strict `multipart/form-data` parser for the buffered
+  body. `parse(allocator, content_type, body)` (or `parseWithLimits`) returns a
+  `Form` of `Part{name, filename, content_type, data}` whose strings are slices
+  of `body` (keep the request alive; only the part list is allocated, freed by
+  `Form.deinit()`). `Form.get` returns the first part with a name and `getAll`
+  iterates repeats. It refuses a preamble, boundary-like lines that are not
+  clean delimiters, trailing data, folded/malformed or unknown part headers,
+  repeated or non-`form-data` Content-Disposition, repeated `name`/`filename`,
+  `filename*`, and `Content-Transfer-Encoding`. Defaults cap parts at 128 and
+  part headers at 8 KiB. Names and filenames are not decoded or sanitized; treat
+  filenames as untrusted. The total size is bounded by the request body limit.
 - `zoda.app.App(Plugins)`: typed context, explicit plugin access, request
   state lifecycle, `composeRoute` wrappers, ordered middleware, default 404,
   and owned `Response` return from `dispatch`.

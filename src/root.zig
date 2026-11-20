@@ -14,6 +14,9 @@ pub const request = @import("request.zig");
 /// (ADR-0001 §3.4, §3.5).
 pub const response = @import("response.zig");
 
+/// Strict `multipart/form-data` parser for buffered request bodies.
+pub const multipart = @import("multipart.zig");
+
 /// Embedded HTML templates with typed text interpolation (ADR-0001 Phase 3.5).
 pub const template = @import("template.zig");
 
@@ -96,6 +99,7 @@ comptime {
     std.testing.refAllDecls(router);
     std.testing.refAllDecls(request);
     std.testing.refAllDecls(response);
+    std.testing.refAllDecls(multipart);
     std.testing.refAllDecls(template);
     std.testing.refAllDecls(buffering);
     std.testing.refAllDecls(transport);

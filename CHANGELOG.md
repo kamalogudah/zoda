@@ -5,6 +5,14 @@ All notable changes to Zoda are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `zoda.multipart.parse(allocator, content_type, body)`: strict
+  `multipart/form-data` parsing (RFC 2046/7578 framing) into zero-copy parts
+  with `name`, optional `filename` and `content_type`, and `data`; malformed
+  framing and headers are errors, with limits on part count and header size
+  (#95).
+
 ### Security
 
 - Strengthened session key guidance (security analysis S5, #90). New
