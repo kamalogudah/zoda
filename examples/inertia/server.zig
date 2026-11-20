@@ -793,9 +793,12 @@ test "changes need the XSRF-TOKEN cookie's value in X-XSRF-TOKEN" {
         defer refused.deinit();
         try std.testing.expectEqual(@as(u16, 403), refused.status_code);
     }
-    var deleted = try visit(&app, .delete, "/history", &no_token, "");
-    defer deleted.deinit();
-    try std.testing.expectEqual(@as(u16, 403), deleted.status_code);
+    // Every unsafe route, including ones that do not exist, is refused first.
+    inline for (.{ .{ .delete, "/history" }, .{ .patch, "/todos/1" }, .{ .delete, "/todos/1" }, .{ .put, "/todos" } }) |case| {
+        var rejected = try visit(&app, case[0], case[1], &no_token, "");
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 403), rejected.status_code);
+    }
     try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
 
     var accepted = try visit(&app, .post, "/todos", &browser.with(inertia_json), "{\"text\":\"Buy milk\"}");

@@ -560,6 +560,14 @@ The built-in `NotFound` plugin is a route wrapper; see
 [Not-found fallback](PLUGINS.md#not-found-fallback).
 
 
+### Protected routes
+
+`zoda.route_table` declares each route as public or protected and checks
+authentication, then CSRF, before the handler. See
+[PLUGINS.md](PLUGINS.md#protected-routes-and-middleware-order) and
+[examples/secure_notes.zig](examples/secure_notes.zig) for a production
+middleware order. Middleware registered after a responder cannot protect it.
+
 ### Host authorization
 
 `zoda.host_authorization.middleware(App, &hosts)` rejects requests before

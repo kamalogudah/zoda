@@ -579,6 +579,90 @@ registration and checks each outcome below.
   so they record the final response. Register `default_headers` before them so
   replacement pages also get the default headers.
 
+## Protected routes and middleware order
+
+Registering `BearerToken` or `Sessions` does not protect anything by itself:
+`BearerToken.guard_routes` defaults to `false`, CSRF checks are explicit calls,
+and a plugin only sees what runs after it. `zoda.route_table` makes the
+decision visible at registration and checks it in a fixed order.
+
+```zig
+const rt = zoda.route_table;
+const Routes = rt.Table(App, .{
+    .authenticate = rt.sessionAuth(App, "sessions"), // or rt.bearerAuth(App, "bearer")
+    .csrf_sessions = "sessions",
+});
+const routes = [_]Routes.Route{
+    .{ .method = .get, .path = "/health", .access = .public, .handler = health },
+    .{ .method = .post, .path = "/login", .access = .public, .handler = login },
+    .{ .method = .get, .path = "/notes", .access = .protected, .handler = list },
+    .{ .method = .delete, .path = "/notes/:id", .access = .protected, .handler = remove },
+};
+// .route_fn = App.composeRoute(Routes.route(&routes))
+```
+
+- **No silent default.** `access` has no default value, so a route without a
+  public/protected decision does not compile. A protected route without
+  `Options.authenticate`, and a route that needs CSRF without
+  `Options.csrf_sessions`, also fail at compile time. Duplicate method and
+  path shapes fail too.
+- **Order per route:** authentication (`401`, optional `WWW-Authenticate`),
+  then CSRF proof (`403`), then the handler. Handlers read the body, so the
+  body is never parsed for a request that failed either check.
+- **CSRF on unsafe methods.** Everything but GET, HEAD, OPTIONS, and TRACE
+  requires proof (`X-CSRF-Token` by default, or `csrf_header =
+  csrf.xsrf_header_name`) unless the row says `.csrf = .exempt`. Use the
+  exemption only where no ambient credential exists, such as a
+  bearer-token API, and keep it visible in review.
+- **Path matching.** Patterns are absolute; `:name` captures one segment,
+  available as `Params` (`params.int(u64, 0)`). A path or method that matches
+  no row is left unhandled, so the default 404 answers and no handler runs.
+- **Route map.** `Routes.entries(&routes)` returns the access and CSRF
+  requirement of every row, derived from the same array the router uses. Tests
+  iterate it so new routes are covered automatically.
+- **`sessionAuth`** requires a revocable `Sessions.store`; without one it
+  fails closed. **`bearerAuth`** uses `BearerToken.authorized`, which rejects
+  absent, malformed, duplicate, and oversized credentials.
+
+### Protecting static files and other responders
+
+The table guards only routes it dispatches. Static files and any middleware
+that answers without calling `next` run before the route function, so a check
+registered after them cannot protect them. Use `rt.gate`, registered before
+the responder:
+
+```zig
+const private: rt.Gate = .{ .prefix = &.{"private"} };
+.middleware = &.{
+    try security_policy.middleware(App, &policies),      // 1. headers on everything below
+    try zoda.default_headers.middleware(App, &defaults), // 2.
+    try zoda.host_authorization.middleware(App, &hosts), // 3. before any responder
+    rt.gate(App, authenticate, &private),                // 4. authenticate /private/*
+    zoda.static.middleware(App, &private_files),         // 5. protected files
+    zoda.static.middleware(App, &public_files),          // 6. public files
+},
+```
+
+Limitation: middleware registered after a short-circuiting responder never
+runs for the requests that responder answers. A gate refuses unauthenticated
+requests under its prefix even when the file does not exist, so existence is
+not revealed.
+
+### Production checklist
+
+1. Host authorization before every responder (static, gates, routes).
+2. Security-policy and default-header middleware outermost, so 401, 403, 404,
+   and static responses carry them.
+3. A `gate` ahead of every static prefix or custom responder that is not public.
+4. Every route declared in one table with an explicit `access`.
+5. Unsafe methods keep the default CSRF requirement; each `.exempt` has a reason.
+6. Tests enumerate the table: no credential, malformed, duplicate, revoked,
+   and expired sessions get `401`; missing, malformed, duplicate, and
+   other-session CSRF proof gets `403`; neither reaches a handler.
+
+The runnable reference is [examples/secure_notes.zig](examples/secure_notes.zig)
+(`zig build run-secure-notes`); its contract tests are the template for step 6.
+
 ## Security response policies
 
 `zoda.plugins.security_policy` adds `Content-Security-Policy`,

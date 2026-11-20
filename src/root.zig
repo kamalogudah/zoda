@@ -40,6 +40,9 @@ pub const default_headers = @import("default_headers.zig");
 /// Exact Host allowlist middleware for routes and static files.
 pub const host_authorization = @import("host_authorization.zig");
 
+/// Declarative public/protected route table with ordered auth and CSRF checks.
+pub const route_table = @import("route_table.zig");
+
 /// Static-file middleware with kernel-enforced document-root confinement
 /// (ADR-0001 §5.4).
 pub const static = @import("static.zig");
@@ -101,6 +104,7 @@ comptime {
     std.testing.refAllDecls(timing);
     std.testing.refAllDecls(default_headers);
     std.testing.refAllDecls(host_authorization);
+    std.testing.refAllDecls(route_table);
     std.testing.refAllDecls(static);
     std.testing.refAllDecls(plugins.json);
     std.testing.refAllDecls(plugins.json_parser);

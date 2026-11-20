@@ -7,6 +7,14 @@ All notable changes to Zoda are recorded here. The format follows
 
 ### Security
 
+- Made authentication and CSRF coverage auditable (security analysis S3).
+  New `zoda.route_table` declares routes as `.public` or `.protected` (no
+  default), runs authentication, then CSRF proof on unsafe methods, then the
+  handler, and exposes the route map for tests. `rt.gate` authenticates
+  static and other responders. `examples/secure_notes.zig` shows the full
+  middleware order with contract tests; see PLUGINS.md "Protected routes and
+  middleware order".
+
 - Chunked request trailers no longer merge into request headers (security
   analysis S1). They live in `Request.trailers` (type `Trailer`, accessors
   `getTrailerOne` / `getAllTrailers`). Only an integrity-digest allowlist is
