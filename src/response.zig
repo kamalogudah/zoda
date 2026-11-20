@@ -28,7 +28,8 @@
 //! is the wire adapter's responsibility and intentionally absent here (§3.4).
 //!
 //! Buffered only: a `Response` holds its complete body, bounded by
-//! `Limits.max_body_bytes`. Response streaming is not supported and is not
+//! `Limits.max_body_bytes` (configurable via `App.Options.response_limits`).
+//! Response streaming is not supported and is not
 //! implied by this type (ADR-0001 §4.2.5).
 const std = @import("std");
 

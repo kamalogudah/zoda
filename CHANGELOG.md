@@ -7,6 +7,11 @@ All notable changes to Zoda are recorded here. The format follows
 
 ### Added
 
+- `response_limits` on `App.Options` (and the `App` struct): configures
+  `response.Limits` for every response the app builds, parallel to
+  `server.Config.request_limits`. Raise `max_body_bytes` (default 1 MiB) to
+  serve larger buffered bodies from the app (#97). The body is still held in
+  memory; response streaming is not included.
 - `server.Config.body_limit_rules` (`transport.BodyLimitRule`): per-path
   request body limits matched on decoded path-segment prefixes, longest prefix
   wins. The limit is chosen from the request head, so an over-limit

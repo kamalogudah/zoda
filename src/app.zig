@@ -254,6 +254,10 @@ pub fn App(comptime Plugins: type) type {
 
         pub const Options = struct {
             response_allocator: std.mem.Allocator,
+            /// Bounds for every response this app builds, including the
+            /// buffered body cap (default 1 MiB). Raise `max_body_bytes` to
+            /// serve larger bodies; the whole body is still held in memory.
+            response_limits: response.Limits = .default,
             config: AppConfig = .{},
             plugins: Plugins,
             route_fn: RouteFn,
@@ -263,6 +267,7 @@ pub fn App(comptime Plugins: type) type {
         };
 
         response_allocator: std.mem.Allocator,
+        response_limits: response.Limits = .default,
         config: AppConfig,
         plugins: Plugins,
         route_fn: RouteFn,
@@ -278,6 +283,7 @@ pub fn App(comptime Plugins: type) type {
             const entries = try allocator.dupe(Middleware, options.middleware);
             return .{
                 .response_allocator = options.response_allocator,
+                .response_limits = options.response_limits,
                 .config = options.config,
                 .plugins = options.plugins,
                 .route_fn = options.route_fn,
@@ -307,7 +313,7 @@ pub fn App(comptime Plugins: type) type {
                 .config = &self.config,
                 .state = &state,
             };
-            var res = response.Response.init(self.response_allocator);
+            var res = response.Response.initWithLimits(self.response_allocator, self.response_limits);
             errdefer res.deinit();
             try self.runFrom(0, &ctx, req, &res);
             // A middleware short circuit can leave the response unhandled.
@@ -2246,4 +2252,37 @@ test "non-container Plugins fields are skipped" {
         fn route(_: *A.Context, _: *router.Request, _: *response.Response) anyerror!void {}
     };
     _ = A.composeRoute(R.route);
+}
+
+test "response_limits raises the buffered response body cap" {
+    const Plugins = struct {};
+    const Demo = App(Plugins);
+    const route = struct {
+        fn run(_: *Demo.Context, req: *router.Request, res: *response.Response) !void {
+            if (!req.isRoot()) return;
+            const bytes = try res.allocator.alloc(u8, 2 * 1024 * 1024);
+            errdefer res.allocator.free(bytes);
+            @memset(bytes, 'x');
+            try res.replaceOwnedBody(200, "application/pdf", bytes);
+        }
+    }.run;
+
+    var arena = try request.parseOriginForm(std.testing.allocator, .default, "/");
+    defer arena.deinit();
+
+    const default_app = Demo{ .response_allocator = std.testing.allocator, .config = .{ .name = "t" }, .plugins = .{}, .route_fn = route };
+    var req = arena.requestView(.get);
+    try std.testing.expectError(error.BodyTooLarge, default_app.dispatch(&req));
+
+    const big_app = Demo{
+        .response_allocator = std.testing.allocator,
+        .response_limits = .{ .max_body_bytes = 4 * 1024 * 1024 },
+        .config = .{ .name = "t" },
+        .plugins = .{},
+        .route_fn = route,
+    };
+    var req2 = arena.requestView(.get);
+    var res = try big_app.dispatch(&req2);
+    defer res.deinit();
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), res.body.len);
 }
