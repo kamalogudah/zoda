@@ -229,6 +229,9 @@ files, oversize sources, confinement, and freeing on every error path.
 
 ### 5.1 Response streaming
 
+> **Superseded by [ADR-0003](adr_0003_response_streaming.md)**, which
+> accepts a pull-source design. The text below is kept for history.
+
 **Current state.** Responses are buffered only (ADR-0001 §4.2.5).
 
 **Reopening conditions (unchanged).** Any one of these is accepted on the

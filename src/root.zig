@@ -14,6 +14,12 @@ pub const request = @import("request.zig");
 /// (ADR-0001 §3.4, §3.5).
 pub const response = @import("response.zig");
 
+/// Strict `multipart/form-data` parser for buffered request bodies.
+pub const multipart = @import("multipart.zig");
+
+/// Optional S3-compatible storage: AWS SigV4 signer and put/get/delete client.
+pub const s3 = @import("s3.zig");
+
 /// Embedded HTML templates with typed text interpolation (ADR-0001 Phase 3.5).
 pub const template = @import("template.zig");
 
@@ -39,6 +45,9 @@ pub const default_headers = @import("default_headers.zig");
 
 /// Exact Host allowlist middleware for routes and static files.
 pub const host_authorization = @import("host_authorization.zig");
+
+/// Declarative public/protected route table with ordered auth and CSRF checks.
+pub const route_table = @import("route_table.zig");
 
 /// Static-file middleware with kernel-enforced document-root confinement
 /// (ADR-0001 §5.4).
@@ -93,6 +102,8 @@ comptime {
     std.testing.refAllDecls(router);
     std.testing.refAllDecls(request);
     std.testing.refAllDecls(response);
+    std.testing.refAllDecls(multipart);
+    std.testing.refAllDecls(s3);
     std.testing.refAllDecls(template);
     std.testing.refAllDecls(buffering);
     std.testing.refAllDecls(transport);
@@ -101,6 +112,7 @@ comptime {
     std.testing.refAllDecls(timing);
     std.testing.refAllDecls(default_headers);
     std.testing.refAllDecls(host_authorization);
+    std.testing.refAllDecls(route_table);
     std.testing.refAllDecls(static);
     std.testing.refAllDecls(plugins.json);
     std.testing.refAllDecls(plugins.json_parser);

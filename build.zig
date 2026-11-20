@@ -167,6 +167,20 @@ pub fn build(b: *std.Build) void {
     examples_step.dependOn(&todo_tests.step);
     test_step.dependOn(&todo_tests.step);
 
+    const secure_notes_module = b.createModule(.{
+        .root_source_file = b.path("examples/secure_notes.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zoda", .module = mod }},
+    });
+    const secure_notes_exe = b.addExecutable(.{ .name = "secure-notes", .root_module = secure_notes_module });
+    const secure_notes_run = b.addRunArtifact(secure_notes_exe);
+    const secure_notes_step = b.step("run-secure-notes", "Run the production-composition notes app on localhost:8080");
+    secure_notes_step.dependOn(&secure_notes_run.step);
+    const secure_notes_tests = b.addRunArtifact(b.addTest(.{ .root_module = secure_notes_module }));
+    examples_step.dependOn(&secure_notes_tests.step);
+    test_step.dependOn(&secure_notes_tests.step);
+
     // Inertia.js todo app. Build a frontend first, then pick it after `--`:
     // `zig build run-inertia -- svelte`. Runs from the repo root so the
     // server finds `examples/inertia/<frontend>/dist`.

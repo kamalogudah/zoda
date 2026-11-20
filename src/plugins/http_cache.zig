@@ -136,7 +136,7 @@ pub const ETag = struct {
     }
 };
 
-pub const ETagError = response.HeaderError || error{ ETagAlreadySet, InvalidETag };
+pub const ETagError = response.HeaderError || error{ ETagAlreadySet, InvalidETag, StreamedBody };
 
 /// Appends the `ETag` field. The tag must be at most `max_tag_bytes` of
 /// visible ASCII other than `"` (`%x21 / %x23-7E`). Refuses a second
@@ -154,7 +154,10 @@ pub fn setETag(res: *response.Response, etag: ETag) ETagError!void {
 
 /// Sets a strong `ETag` derived from the current content type and body
 /// (the first 128 bits of SHA-256, hex). Call after the body is final.
+/// A streamed body cannot be hashed without buffering it: returns
+/// `error.StreamedBody`; use `setETag` with a tag the route derives instead.
 pub fn setBodyETag(res: *response.Response) ETagError!void {
+    if (res.stream != null) return error.StreamedBody;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(res.content_type);
     hash.update(&.{0});
@@ -555,4 +558,14 @@ test "helpers propagate allocation failures without leaking" {
         }
     }.build;
     try testing.checkAllAllocationFailures(testing.allocator, build, .{});
+}
+
+test "setBodyETag refuses a streamed body and setETag still works" {
+    var res = response.Response.init(testing.allocator);
+    defer res.deinit();
+    var reader = std.Io.Reader.fixed("abc");
+    try res.streamBody(200, "text/plain", .fromReader(&reader, 3));
+    try testing.expectError(error.StreamedBody, setBodyETag(&res));
+    try setETag(&res, .strong("v1"));
+    try testing.expect((try res.getHeaderOne("ETag")) != null);
 }

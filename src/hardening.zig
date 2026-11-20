@@ -442,7 +442,7 @@ test "pipelined requests keep their boundaries and the request cap closes" {
     var client = try h.connect();
     defer client.close();
     try client.send("POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\none" ++
-        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\ntwo\r\n0\r\nX-Trailer: yes\r\n\r\n" ++
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\ntwo\r\n0\r\nContent-MD5: yes\r\n\r\n" ++
         "HEAD / HTTP/1.1\r\nHost: t\r\n\r\n" ++
         "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\n\r\nfour" ++
         "GET / HTTP/1.1\r\nHost: t\r\n\r\n");

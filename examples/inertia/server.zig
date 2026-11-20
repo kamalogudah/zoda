@@ -511,7 +511,8 @@ pub fn main(init: std.process.Init) !void {
     // Sessions only carry flash messages, validation errors, and the CSRF
     // secret here, so a fresh key per run is enough: a restart drops pending
     // messages, and an open tab's next change is refused until it reloads.
-    // A real app loads a stable secret from its configuration.
+    // DEV ONLY: a real app loads a stable key from protected runtime config
+    // with `Key.fromBase64` (PLUGINS.md "Session keys"). Cookies are signed, not encrypted.
     clock_io = io;
     var secret: [32]u8 = undefined;
     try std.Io.randomSecure(io, &secret);
@@ -540,7 +541,9 @@ pub fn main(init: std.process.Init) !void {
                 // localhost, where this example runs.
                 .encrypt_history = true,
                 .now_milliseconds = unixMilliseconds,
-                // `npm run ssr` listens on the default 127.0.0.1:13714.
+                // `npm run ssr` listens on the default 127.0.0.1:13714. Zoda rejects any
+                // non-loopback SSR address: the renderer sees all props and its
+                // markup is inserted unescaped, so keep it local-only.
                 .ssr = if (ssr) .{ .timeout_ms = 500 } else null,
                 .on_ssr_failure = logSsrFailure,
             },
@@ -577,7 +580,7 @@ fn testApp(store: *Store) !App {
         .response_allocator = std.testing.allocator,
         .plugins = .{
             .inertia = .{ .layout = layout, .version = .{ .value = "v1" }, .shared = .{ .value = .{ .app = "Zoda", .framework = "test" } }, .encrypt_history = true, .now_milliseconds = testMilliseconds },
-            .sessions = .{ .keys = &.{.{ .id = 1, .secret = &comptime @as([32]u8, @splat('x')) }}, .lifetime_seconds = 300, .now_seconds = testClock },
+            .sessions = .{ .keys = &.{.{ .id = 1, .secret = "TEST-ONLY-do-not-deploy-this-key!" }}, .lifetime_seconds = 300, .now_seconds = testClock },
             .store = .{ .value = store },
         },
         .route_fn = route,
@@ -793,9 +796,12 @@ test "changes need the XSRF-TOKEN cookie's value in X-XSRF-TOKEN" {
         defer refused.deinit();
         try std.testing.expectEqual(@as(u16, 403), refused.status_code);
     }
-    var deleted = try visit(&app, .delete, "/history", &no_token, "");
-    defer deleted.deinit();
-    try std.testing.expectEqual(@as(u16, 403), deleted.status_code);
+    // Every unsafe route, including ones that do not exist, is refused first.
+    inline for (.{ .{ .delete, "/history" }, .{ .patch, "/todos/1" }, .{ .delete, "/todos/1" }, .{ .put, "/todos" } }) |case| {
+        var rejected = try visit(&app, case[0], case[1], &no_token, "");
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 403), rejected.status_code);
+    }
     try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
 
     var accepted = try visit(&app, .post, "/todos", &browser.with(inertia_json), "{\"text\":\"Buy milk\"}");

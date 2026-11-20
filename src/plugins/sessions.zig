@@ -1,6 +1,7 @@
 //! Authenticated, client-side cookie sessions (ADR-0001 §3.2, §3.4, Phase 5).
 //! The payload is authenticated with HMAC-SHA256, not encrypted: do not store
 //! confidential information in it. No response is written during cleanup.
+//! Optional server-side `Store` adds revocation (v4 cookies); see PLUGINS.md.
 const std = @import("std");
 const router = @import("../router.zig");
 const response = @import("../response.zig");
@@ -15,24 +16,177 @@ pub const max_cookie_bytes: usize = 4096;
 pub const max_lifetime_seconds: u32 = 30 * 24 * 60 * 60;
 
 comptime {
-    // The largest v3 Set-Cookie value (u8 key ID, i64 expiry, u32 Max-Age)
+    // The largest v4 Set-Cookie value (u8 key ID, i64 expiry, u32 Max-Age)
     // must fit the fixed header buffer in `save`.
     const fields = base64.Encoder.calcSize(max_payload_bytes) + base64.Encoder.calcSize(32) +
-        base64.Encoder.calcSize(flash.max_bytes) + base64.Encoder.calcSize(Hmac.mac_length);
-    const framing = cookie_name.len + "=v3.255.9223372036854775807.....".len +
+        base64.Encoder.calcSize(flash.max_bytes) + base64.Encoder.calcSize(Hmac.mac_length) +
+        base64.Encoder.calcSize(16);
+    const framing = cookie_name.len + "=v4.255.9223372036854775807......".len +
         "; Max-Age=4294967295; Path=/; Secure; HttpOnly; SameSite=Lax".len;
     std.debug.assert(fields + framing <= max_cookie_bytes);
 }
 
-/// The first key signs new cookies; all keys verify them. IDs must be unique.
+/// Required length of keys made by `Key.generate` and `Key.fromBase64`.
+pub const key_bytes: usize = 32;
+
+/// An HMAC-SHA256 signing key. The first key in `Sessions.keys` signs new
+/// cookies; every key verifies them. IDs must be unique, as must the secrets.
 /// Key bytes are caller-owned and must remain valid for the app lifetime.
+///
+/// `Sessions` only checks that a secret is at least 32 bytes long. Length is
+/// not entropy: the framework cannot tell a random key from a predictable one,
+/// so never type a key into source code. Create keys with `generate` or
+/// `openssl rand -base64 32`, and load them with `fromBase64` from protected
+/// runtime configuration (see PLUGINS.md "Session keys").
+///
+/// A key authenticates cookies; it does not encrypt them. Anyone holding a
+/// cookie can read its payload.
 pub const Key = struct {
     id: u8,
     secret: []const u8,
+
+    pub const KeyError = error{InvalidSessionKey};
+
+    /// Fills `out` from the OS CSPRNG and returns a key over it. A key made
+    /// at startup is lost on restart, which signs every user out; persist
+    /// stable keys in protected configuration instead.
+    pub fn generate(io: std.Io, id: u8, out: *[key_bytes]u8) std.Io.RandomSecureError!Key {
+        try std.Io.randomSecure(io, out);
+        return .{ .id = id, .secret = out };
+    }
+
+    /// Decodes a standard-alphabet base64 secret (padding optional), as
+    /// printed by `openssl rand -base64 32`, into `out`. Surrounding ASCII
+    /// whitespace is ignored. The secret must decode to exactly 32 bytes.
+    pub fn fromBase64(id: u8, text: []const u8, out: *[key_bytes]u8) KeyError!Key {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        const decoder = std.base64.standard_no_pad.Decoder;
+        const unpadded = std.mem.trimEnd(u8, trimmed, "=");
+        const size = decoder.calcSizeForSlice(unpadded) catch return error.InvalidSessionKey;
+        if (size != key_bytes) return error.InvalidSessionKey;
+        decoder.decode(out, unpadded) catch return error.InvalidSessionKey;
+        return .{ .id = id, .secret = out };
+    }
 };
 
+/// Opaque session identifier length in bytes (128 random bits).
+pub const sid_bytes: usize = 16;
+/// Longest subject (account ID) a revocable session may be bound to.
+pub const max_subject_bytes: usize = 64;
+
+/// Storage failures. Every one of them fails closed: a session whose status
+/// cannot be confirmed is never authenticated.
+pub const StoreError = error{ SessionStoreUnavailable, SessionStoreFull };
+
+pub const Record = struct {
+    subject: [max_subject_bytes]u8 = undefined,
+    subject_len: usize = 0,
+    /// UTC Unix seconds; the record is invalid at and after this instant.
+    expires_at: i64 = 0,
+};
+
+/// Server-side session registry (an allowlist: unknown IDs are rejected).
+/// Implementations must be safe for concurrent calls, bounded in the work
+/// each call does, and linearizable: once `revoke` or `revokeSubject` returns,
+/// no later `lookup` may report the revoked record. Return
+/// `error.SessionStoreUnavailable` when the status cannot be determined;
+/// never answer "found" from a cache that may have missed a revocation.
+pub const Store = struct {
+    ctx: *anyopaque,
+    create_fn: *const fn (*anyopaque, *const [sid_bytes]u8, []const u8, i64) StoreError!void,
+    lookup_fn: *const fn (*anyopaque, *const [sid_bytes]u8, *Record) StoreError!bool,
+    revoke_fn: *const fn (*anyopaque, *const [sid_bytes]u8) StoreError!void,
+    revoke_subject_fn: *const fn (*anyopaque, []const u8) StoreError!void,
+};
+
+/// Process-local reference store with fixed capacity and O(capacity) calls.
+/// Records vanish on restart (every user is logged out) and are not shared
+/// between processes, so use it for tests, development, and single-process
+/// deployments only. Expired slots are reclaimed on `create`.
+pub fn MemoryStore(comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+        const Slot = struct { used: bool = false, sid: [sid_bytes]u8 = undefined, record: Record = .{} };
+        slots: [capacity]Slot = @splat(.{}),
+        locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        now_seconds: *const fn () i64,
+
+        pub fn init(now_seconds: *const fn () i64) Self {
+            return .{ .now_seconds = now_seconds };
+        }
+
+        pub fn store(self: *Self) Store {
+            return .{ .ctx = self, .create_fn = create, .lookup_fn = lookup, .revoke_fn = revoke, .revoke_subject_fn = revokeSubject };
+        }
+
+        fn lock(self: *Self) void {
+            while (self.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+        }
+
+        fn unlock(self: *Self) void {
+            self.locked.store(false, .release);
+        }
+
+        fn create(ctx: *anyopaque, sid: *const [sid_bytes]u8, subject: []const u8, expires_at: i64) StoreError!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (subject.len > max_subject_bytes) return error.SessionStoreUnavailable;
+            self.lock();
+            defer self.unlock();
+            const now = self.now_seconds();
+            for (&self.slots) |*slot| {
+                if (slot.used and slot.record.expires_at > now) continue;
+                slot.* = .{ .used = true, .sid = sid.*, .record = .{ .subject_len = subject.len, .expires_at = expires_at } };
+                @memcpy(slot.record.subject[0..subject.len], subject);
+                return;
+            }
+            return error.SessionStoreFull;
+        }
+
+        fn lookup(ctx: *anyopaque, sid: *const [sid_bytes]u8, out: *Record) StoreError!bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.lock();
+            defer self.unlock();
+            const now = self.now_seconds();
+            for (&self.slots) |*slot| {
+                if (!slot.used or !std.crypto.timing_safe.eql([sid_bytes]u8, slot.sid, sid.*)) continue;
+                if (slot.record.expires_at <= now) return false;
+                out.* = slot.record;
+                return true;
+            }
+            return false;
+        }
+
+        fn revoke(ctx: *anyopaque, sid: *const [sid_bytes]u8) StoreError!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.lock();
+            defer self.unlock();
+            for (&self.slots) |*slot| {
+                if (slot.used and std.crypto.timing_safe.eql([sid_bytes]u8, slot.sid, sid.*)) slot.used = false;
+            }
+        }
+
+        fn revokeSubject(ctx: *anyopaque, subject: []const u8) StoreError!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.lock();
+            defer self.unlock();
+            for (&self.slots) |*slot| {
+                if (slot.used and std.mem.eql(u8, slot.record.subject[0..slot.record.subject_len], subject)) slot.used = false;
+            }
+        }
+    };
+}
+
+/// Client-side session cookies. **Payloads are signed, not encrypted**: the
+/// cookie holder can decode every byte, so never store passwords, tokens,
+/// secrets, or sensitive personal data in them. A stateless cookie also cannot
+/// be revoked before it expires; set `store` for revocation. Key rotation
+/// invalidates sessions as described in PLUGINS.md "Session keys".
 pub const Sessions = struct {
     keys: []const Key = &.{},
+    /// Optional server-side registry. When set, only revocable v4 cookies are
+    /// accepted (stateless v1-v3 cookies are rejected so they cannot bypass
+    /// revocation) and identity comes from `State.subject`, never the payload.
+    store: ?Store = null,
     lifetime_seconds: u32 = 0,
     /// UTC Unix seconds. Supply a trusted wall clock; tests can inject one.
     now_seconds: ?*const fn () i64 = null,
@@ -45,6 +199,10 @@ pub const Sessions = struct {
         csrf_secret: [32]u8 = undefined,
         csrf_present: bool = false,
         csrf_token: [base64.Encoder.calcSize(32)]u8 = undefined,
+        sid: [sid_bytes]u8 = undefined,
+        sid_present: bool = false,
+        subject_buf: [max_subject_bytes]u8 = undefined,
+        subject_len: usize = 0,
         /// Managed by `zoda.plugins.flash.Flash`.
         flash: flash.Store = .{},
 
@@ -61,8 +219,18 @@ pub const Sessions = struct {
             self.clearing = false;
         }
 
-        /// Requests a deletion cookie on the next explicit save.
+        /// The server-verified account this session is bound to, or empty when
+        /// unauthenticated. Only meaningful with a configured `Sessions.store`.
+        pub fn subject(self: *const State) []const u8 {
+            return self.subject_buf[0..self.subject_len];
+        }
+
+        /// Requests a deletion cookie on the next explicit save. This only
+        /// affects the browser: a copied cookie stays valid unless the session
+        /// is revoked server-side. Use `Sessions.logout` for that.
         pub fn clear(self: *State) void {
+            self.sid_present = false;
+            self.subject_len = 0;
             self.len = 0;
             self.dirty = true;
             self.clearing = true;
@@ -71,12 +239,56 @@ pub const Sessions = struct {
         }
     };
 
-    pub fn initRequest(self: *const Sessions, req: *router.Request) error{InvalidSessionConfig}!State {
+    /// With a store, a store failure while checking a presented session
+    /// returns `error.SessionStoreUnavailable` rather than loading it.
+    pub fn initRequest(self: *const Sessions, req: *router.Request) (error{InvalidSessionConfig} || StoreError)!State {
         try self.validate();
         var state: State = .{};
         const value_bytes = findCookie(req) orelse return state;
-        self.verify(value_bytes, &state);
+        try self.verify(value_bytes, &state);
         return state;
+    }
+
+    /// Binds the session to `subject` under a fresh random identifier
+    /// (rotating any previous one, which is revoked) and a fresh CSRF secret.
+    /// Call after verifying credentials, then `save`. Requires a store.
+    pub fn login(self: *const Sessions, io: std.Io, state: *State, subject: []const u8) (error{ InvalidSessionConfig, InvalidSessionTime, SubjectTooLong } || StoreError || std.Io.RandomSecureError)!void {
+        try self.validate();
+        const store = self.store orelse return error.InvalidSessionConfig;
+        if (subject.len == 0 or subject.len > max_subject_bytes) return error.SubjectTooLong;
+        const now = self.now_seconds.?();
+        if (now < 0) return error.InvalidSessionTime;
+        const expiry = std.math.add(i64, now, self.lifetime_seconds) catch return error.InvalidSessionTime;
+        var sid: [sid_bytes]u8 = undefined;
+        try std.Io.randomSecure(io, &sid);
+        try store.create_fn(store.ctx, &sid, subject, expiry);
+        if (state.sid_present) store.revoke_fn(store.ctx, &state.sid) catch {};
+        state.sid = sid;
+        state.sid_present = true;
+        @memcpy(state.subject_buf[0..subject.len], subject);
+        state.subject_len = subject.len;
+        state.csrf_present = false;
+        state.dirty = true;
+        state.clearing = false;
+    }
+
+    /// Revokes this session server-side, then clears local state. The local
+    /// state is cleared even on error, but an error means the server-side
+    /// record may still be live: do not report a successful logout.
+    pub fn logout(self: *const Sessions, state: *State) StoreError!void {
+        const sid = state.sid;
+        const present = state.sid_present;
+        state.clear();
+        const store = self.store orelse return;
+        if (present) try store.revoke_fn(store.ctx, &sid);
+    }
+
+    /// Revokes every session bound to `subject`. Call after password reset,
+    /// account suspension, or privilege changes. Takes effect on the next
+    /// request in every process that shares the store.
+    pub fn revokeSubject(self: *const Sessions, subject: []const u8) StoreError!void {
+        const store = self.store orelse return;
+        try store.revoke_subject_fn(store.ctx, subject);
     }
 
     pub fn deinitRequest(_: *const Sessions, _: *State) void {}
@@ -99,7 +311,13 @@ pub const Sessions = struct {
             var flash_bytes: [flash.max_bytes]u8 = undefined;
             const flash_raw = state.flash.persisted(&flash_bytes);
             var header: [max_cookie_bytes]u8 = undefined;
-            const prefix = if (flash_raw.len > 0) blk: {
+            const prefix = if (self.store != null) blk: {
+                var encoded_sid: [base64.Encoder.calcSize(sid_bytes)]u8 = undefined;
+                const sid_text = if (state.sid_present) base64.Encoder.encode(&encoded_sid, &state.sid) else "";
+                var encoded_flash: [base64.Encoder.calcSize(flash.max_bytes)]u8 = undefined;
+                const flash_text = base64.Encoder.encode(&encoded_flash, flash_raw);
+                break :blk std.fmt.bufPrint(&header, "{s}=v4.{d}.{d}.{s}.{s}.{s}.{s}", .{ cookie_name, self.keys[0].id, expiry, sid_text, payload, csrf, flash_text }) catch unreachable;
+            } else if (flash_raw.len > 0) blk: {
                 var encoded_flash: [base64.Encoder.calcSize(flash.max_bytes)]u8 = undefined;
                 const flash_text = base64.Encoder.encode(&encoded_flash, flash_raw);
                 break :blk std.fmt.bufPrint(&header, "{s}=v3.{d}.{d}.{s}.{s}.{s}", .{ cookie_name, self.keys[0].id, expiry, payload, csrf, flash_text }) catch unreachable;
@@ -127,20 +345,26 @@ pub const Sessions = struct {
             if (key.secret.len < 32) return error.InvalidSessionConfig;
             for (self.keys[0..i]) |earlier| {
                 if (earlier.id == key.id) return error.InvalidSessionConfig;
+                if (std.mem.eql(u8, earlier.secret, key.secret)) return error.InvalidSessionConfig;
             }
         }
     }
 
-    fn verify(self: *const Sessions, value_bytes: []const u8, state: *State) void {
+    fn verify(self: *const Sessions, value_bytes: []const u8, state: *State) StoreError!void {
         if (value_bytes.len > max_cookie_bytes) return;
         var parts = std.mem.splitScalar(u8, value_bytes, '.');
         const version = parts.next() orelse return;
-        // v2 adds a CSRF secret; v3 adds an optional CSRF secret and flash.
-        const has_flash = std.mem.eql(u8, version, "v3");
+        // v2 adds a CSRF secret; v3 adds an optional CSRF secret and flash;
+        // v4 (store-backed) adds an opaque session ID and always carries both.
+        const revocable = std.mem.eql(u8, version, "v4");
+        // A store makes v4 the only acceptable format and vice versa.
+        if (revocable != (self.store != null)) return;
+        const has_flash = revocable or std.mem.eql(u8, version, "v3");
         const has_csrf = has_flash or std.mem.eql(u8, version, "v2");
         if (!has_csrf and !std.mem.eql(u8, version, "v1")) return;
         const id_text = parts.next() orelse return;
         const expiry_text = parts.next() orelse return;
+        const sid_text = if (revocable) parts.next() orelse return else "";
         const payload_text = parts.next() orelse return;
         const csrf_text = if (has_csrf) parts.next() orelse return else "";
         const flash_text = if (has_flash) parts.next() orelse return else "";
@@ -165,12 +389,24 @@ pub const Sessions = struct {
         base64.Decoder.decode(state.bytes[0..payload_size], payload_text) catch return;
         // Commit nothing until every field decodes, so a rejected cookie
         // leaves an empty session.
+        var sid: [sid_bytes]u8 = undefined;
+        var record: Record = .{};
+        if (revocable and sid_text.len > 0) {
+            if (sid_text.len != base64.Encoder.calcSize(sid_bytes)) return;
+            base64.Decoder.decode(&sid, sid_text) catch return;
+            // Unknown, revoked, and expired IDs are all "not found"; an
+            // outage propagates instead of authenticating.
+            const store = self.store.?;
+            if (!try store.lookup_fn(store.ctx, &sid, &record)) return;
+            if (record.expires_at <= now or record.subject_len > max_subject_bytes) return;
+        }
         const csrf_present = has_csrf and !(has_flash and csrf_text.len == 0);
         if (csrf_present) {
             if (csrf_text.len != base64.Encoder.calcSize(32)) return;
             base64.Decoder.decode(&state.csrf_secret, csrf_text) catch return;
         }
-        if (has_flash) {
+        // v3 always carries flash; only v4 may leave the field empty.
+        if (has_flash and !(revocable and flash_text.len == 0)) {
             const flash_size = base64.Decoder.calcSizeForSlice(flash_text) catch return;
             if (flash_size > flash.max_bytes) return;
             var flash_bytes: [flash.max_bytes]u8 = undefined;
@@ -179,6 +415,12 @@ pub const Sessions = struct {
         }
         state.csrf_present = csrf_present;
         state.len = payload_size;
+        if (revocable and sid_text.len > 0) {
+            state.sid = sid;
+            state.sid_present = true;
+            state.subject_buf = record.subject;
+            state.subject_len = record.subject_len;
+        }
     }
 };
 
@@ -199,6 +441,7 @@ fn findCookie(req: *const router.Request) ?[]const u8 {
     return found;
 }
 
+// TEST ONLY: predictable, public values. Never use them outside tests.
 const test_key_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const test_key_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -319,6 +562,19 @@ test "configuration, payload size, deletion, and key rotation" {
     try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
     missing = .{ .keys = &.{ .{ .id = 1, .secret = test_key_a }, .{ .id = 1, .secret = test_key_b } }, .lifetime_seconds = 300, .now_seconds = time1000 };
     try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
+    missing = .{ .keys = &.{ .{ .id = 1, .secret = test_key_a }, .{ .id = 2, .secret = test_key_a } }, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
+    missing = .{ .keys = &.{ .{ .id = 1, .secret = test_key_a }, .{ .id = 2, .secret = "short" } }, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
+    const nine = comptime blk: {
+        var keys: [9]Key = undefined;
+        for (&keys, 0..) |*k, i| k.* = .{ .id = @intCast(i), .secret = test_key_a ++ &[_]u8{@intCast('a' + i)} };
+        break :blk keys;
+    };
+    missing = .{ .keys = &nine, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
+    missing = .{ .keys = &.{.{ .id = 1, .secret = test_key_a }}, .lifetime_seconds = 0, .now_seconds = time1000 };
+    try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
     missing = .{ .keys = &.{.{ .id = 1, .secret = test_key_a }}, .lifetime_seconds = max_lifetime_seconds + 1, .now_seconds = time1000 };
     try std.testing.expectError(error.InvalidSessionConfig, missing.initRequest(&req));
 
@@ -351,6 +607,55 @@ test "configuration, payload size, deletion, and key rotation" {
     loaded.clear();
     try rotated.save(&loaded, &res);
     try std.testing.expectEqualStrings(cookie_name ++ "=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax", res.headers[2].value);
+}
+
+test "key helpers decode exact 32-byte secrets and reject everything else" {
+    var buf: [key_bytes]u8 = undefined;
+    const b64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const key = try Key.fromBase64(7, b64 ++ "\n", &buf);
+    try std.testing.expectEqual(@as(u8, 7), key.id);
+    try std.testing.expectEqual(@as(usize, 32), key.secret.len);
+    try std.testing.expectEqual(@as(u8, 31), key.secret[31]);
+    const unpadded = try Key.fromBase64(7, b64[0 .. b64.len - 1], &buf);
+    try std.testing.expectEqualSlices(u8, key.secret, unpadded.secret);
+    try std.testing.expectError(error.InvalidSessionKey, Key.fromBase64(1, "", &buf));
+    try std.testing.expectError(error.InvalidSessionKey, Key.fromBase64(1, "c2hvcnQ=", &buf));
+    try std.testing.expectError(error.InvalidSessionKey, Key.fromBase64(1, "!!!" ++ b64[3..], &buf));
+    try std.testing.expectError(error.InvalidSessionKey, Key.fromBase64(1, b64 ++ "AAAA", &buf));
+
+    const io = std.testing.io;
+    var a: [key_bytes]u8 = undefined;
+    var b: [key_bytes]u8 = undefined;
+    const ka = try Key.generate(io, 1, &a);
+    const kb = try Key.generate(io, 2, &b);
+    try std.testing.expect(!std.mem.eql(u8, ka.secret, kb.secret));
+    const plugin = Sessions{ .keys = &.{ ka, kb }, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try plugin.validate();
+}
+
+test "rotation: retired keys verify until removed, then their cookies are dropped" {
+    var req: router.Request = .{ .method = .get, .segments = &.{} };
+    const k1 = Key{ .id = 1, .secret = test_key_a };
+    const k2 = Key{ .id = 2, .secret = test_key_b };
+    const phase1 = Sessions{ .keys = &.{k1}, .lifetime_seconds = 300, .now_seconds = time1000 };
+    var state = try phase1.initRequest(&req);
+    try state.set("payload");
+    var res = response.Response.init(std.testing.allocator);
+    defer res.deinit();
+    try phase1.save(&state, &res);
+    const headers = [_]router.Header{.{ .name = "Cookie", .value = cookieValue(res.headers[0].value) }};
+    var cookie_req: router.Request = .{ .method = .get, .segments = &.{}, .headers = &headers };
+
+    // Overlap: new key signs, old key still verifies.
+    const overlap = Sessions{ .keys = &.{ k2, k1 }, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectEqualStrings("payload", (try overlap.initRequest(&cookie_req)).value());
+    // Verify-only order: the first key signs, so listing k1 first keeps v1.1 cookies.
+    // Retired: k1 removed, existing cookies silently become anonymous.
+    const retired = Sessions{ .keys = &.{k2}, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectEqual(@as(usize, 0), (try retired.initRequest(&cookie_req)).value().len);
+    // Same ID with a different secret (a replaced key) also fails verification.
+    const replaced = Sessions{ .keys = &.{.{ .id = 1, .secret = test_key_b }}, .lifetime_seconds = 300, .now_seconds = time1000 };
+    try std.testing.expectEqual(@as(usize, 0), (try replaced.initRequest(&cookie_req)).value().len);
 }
 
 test "failed response header append keeps the session dirty" {
@@ -618,4 +923,205 @@ test "session cookie save and dispatch release partial allocations" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.check, .{});
+}
+
+var test_now: std.atomic.Value(i64) = std.atomic.Value(i64).init(1000);
+
+fn testNow() i64 {
+    return test_now.load(.monotonic);
+}
+
+fn revocableFixture(store: *MemoryStore(4)) Sessions {
+    test_now.store(1000, .monotonic);
+    return .{ .keys = &.{.{ .id = 1, .secret = test_key_a }}, .lifetime_seconds = 300, .now_seconds = testNow, .store = store.store() };
+}
+
+fn issue(plugin: *const Sessions, subject: []const u8, res: *response.Response) ![]const u8 {
+    var req: router.Request = .{ .method = .get, .segments = &.{} };
+    var state = try plugin.initRequest(&req);
+    try plugin.login(std.testing.io, &state, subject);
+    try state.set("app-data");
+    try plugin.save(&state, res);
+    return cookieValue(res.headers[res.header_count - 1].value);
+}
+
+fn loadWith(plugin: *const Sessions, cookie: []const u8) !Sessions.State {
+    const headers = [_]router.Header{.{ .name = "Cookie", .value = cookie }};
+    var req: router.Request = .{ .method = .get, .segments = &.{}, .headers = &headers };
+    return plugin.initRequest(&req);
+}
+
+test "logout revokes a copied cookie so replay fails immediately" {
+    var store = MemoryStore(4).init(testNow);
+    const plugin = revocableFixture(&store);
+    var res = response.Response.init(std.testing.allocator);
+    defer res.deinit();
+    const copied = try std.testing.allocator.dupe(u8, try issue(&plugin, "user-42", &res));
+    defer std.testing.allocator.free(copied);
+    try std.testing.expect(std.mem.startsWith(u8, copied, cookie_name ++ "=v4.1."));
+
+    var live = try loadWith(&plugin, copied);
+    try std.testing.expectEqualStrings("user-42", live.subject());
+    try std.testing.expectEqualStrings("app-data", live.value());
+    try plugin.logout(&live);
+    try res.setHeader("Set-Cookie", "x=1");
+    try plugin.save(&live, &res);
+
+    const replay = try loadWith(&plugin, copied);
+    try std.testing.expectEqual(@as(usize, 0), replay.subject().len);
+    try std.testing.expectEqual(@as(usize, 0), replay.value().len);
+}
+
+test "revokeSubject invalidates every session of one account only" {
+    var store = MemoryStore(4).init(testNow);
+    const plugin = revocableFixture(&store);
+    var res = response.Response.init(std.testing.allocator);
+    defer res.deinit();
+    const a1 = try std.testing.allocator.dupe(u8, try issue(&plugin, "alice", &res));
+    defer std.testing.allocator.free(a1);
+    const a2 = try std.testing.allocator.dupe(u8, try issue(&plugin, "alice", &res));
+    defer std.testing.allocator.free(a2);
+    const b1 = try std.testing.allocator.dupe(u8, try issue(&plugin, "bob", &res));
+    defer std.testing.allocator.free(b1);
+
+    try plugin.revokeSubject("alice");
+    try std.testing.expectEqual(@as(usize, 0), (try loadWith(&plugin, a1)).subject().len);
+    try std.testing.expectEqual(@as(usize, 0), (try loadWith(&plugin, a2)).subject().len);
+    try std.testing.expectEqualStrings("bob", (try loadWith(&plugin, b1)).subject());
+    // A login after the reset is a new session and works.
+    const fresh = try std.testing.allocator.dupe(u8, try issue(&plugin, "alice", &res));
+    defer std.testing.allocator.free(fresh);
+    try std.testing.expectEqualStrings("alice", (try loadWith(&plugin, fresh)).subject());
+}
+
+test "expired, unknown, forged, and stateless cookies fail closed" {
+    var store = MemoryStore(4).init(testNow);
+    const plugin = revocableFixture(&store);
+    var res = response.Response.init(std.testing.allocator);
+    defer res.deinit();
+    const good = try std.testing.allocator.dupe(u8, try issue(&plugin, "carol", &res));
+    defer std.testing.allocator.free(good);
+
+    // Same signing key, valid MAC, but the ID was never issued by this store.
+    var other_store = MemoryStore(4).init(testNow);
+    const other = revocableFixture(&other_store);
+    try std.testing.expectEqual(@as(usize, 0), (try loadWith(&other, good)).subject().len);
+
+    // A stateless cookie signed with the same key is refused in store mode.
+    const stateless: Sessions = .{ .keys = plugin.keys, .lifetime_seconds = 300, .now_seconds = testNow };
+    var sreq: router.Request = .{ .method = .get, .segments = &.{} };
+    var sstate = try stateless.initRequest(&sreq);
+    try sstate.set("user=1");
+    try stateless.save(&sstate, &res);
+    const v1 = cookieValue(res.headers[res.header_count - 1].value);
+    try std.testing.expectEqual(@as(usize, 0), (try loadWith(&plugin, v1)).value().len);
+    // ...and a v4 cookie is refused without a store.
+    try std.testing.expectEqual(@as(usize, 0), (try loadWith(&stateless, good)).value().len);
+
+    // Tampering fails the MAC before any store lookup.
+    const bad = try std.testing.allocator.dupe(u8, good);
+    defer std.testing.allocator.free(bad);
+    bad[cookie_name.len + 1 + "v4.1.1300.".len] ^= 1;
+    try std.testing.expectEqual(@as(usize, 0), (try loadWith(&plugin, bad)).subject().len);
+
+    // Expiry wins even though the server record is still present.
+    test_now.store(1300, .monotonic);
+    try std.testing.expectEqual(@as(usize, 0), (try loadWith(&plugin, good)).subject().len);
+    test_now.store(1000, .monotonic);
+}
+
+test "store outage fails closed and logout reports it" {
+    const Failing = struct {
+        down: bool = false,
+        inner: *MemoryStore(4),
+        fn create(c: *anyopaque, sid: *const [sid_bytes]u8, sub: []const u8, exp: i64) StoreError!void {
+            const self: *@This() = @ptrCast(@alignCast(c));
+            return self.inner.store().create_fn(self.inner.store().ctx, sid, sub, exp);
+        }
+        fn lookup(c: *anyopaque, sid: *const [sid_bytes]u8, out: *Record) StoreError!bool {
+            const self: *@This() = @ptrCast(@alignCast(c));
+            if (self.down) return error.SessionStoreUnavailable;
+            return self.inner.store().lookup_fn(self.inner.store().ctx, sid, out);
+        }
+        fn revoke(c: *anyopaque, sid: *const [sid_bytes]u8) StoreError!void {
+            const self: *@This() = @ptrCast(@alignCast(c));
+            if (self.down) return error.SessionStoreUnavailable;
+            return self.inner.store().revoke_fn(self.inner.store().ctx, sid);
+        }
+        fn revokeSubject(c: *anyopaque, sub: []const u8) StoreError!void {
+            const self: *@This() = @ptrCast(@alignCast(c));
+            if (self.down) return error.SessionStoreUnavailable;
+            return self.inner.store().revoke_subject_fn(self.inner.store().ctx, sub);
+        }
+    };
+    var mem = MemoryStore(4).init(testNow);
+    var failing: Failing = .{ .inner = &mem };
+    test_now.store(1000, .monotonic);
+    const plugin: Sessions = .{ .keys = &.{.{ .id = 1, .secret = test_key_a }}, .lifetime_seconds = 300, .now_seconds = testNow, .store = .{
+        .ctx = &failing,
+        .create_fn = Failing.create,
+        .lookup_fn = Failing.lookup,
+        .revoke_fn = Failing.revoke,
+        .revoke_subject_fn = Failing.revokeSubject,
+    } };
+    var res = response.Response.init(std.testing.allocator);
+    defer res.deinit();
+    const cookie = try std.testing.allocator.dupe(u8, try issue(&plugin, "dave", &res));
+    defer std.testing.allocator.free(cookie);
+
+    failing.down = true;
+    try std.testing.expectError(error.SessionStoreUnavailable, loadWith(&plugin, cookie));
+    try std.testing.expectError(error.SessionStoreUnavailable, plugin.revokeSubject("dave"));
+    var state: Sessions.State = .{};
+    state.sid_present = true;
+    try std.testing.expectError(error.SessionStoreUnavailable, plugin.logout(&state));
+    try std.testing.expect(!state.sid_present);
+    failing.down = false;
+    try std.testing.expectEqualStrings("dave", (try loadWith(&plugin, cookie)).subject());
+}
+
+test "store capacity is bounded and expired slots are reclaimed" {
+    var store = MemoryStore(2).init(testNow);
+    test_now.store(1000, .monotonic);
+    const plugin: Sessions = .{ .keys = &.{.{ .id = 1, .secret = test_key_a }}, .lifetime_seconds = 300, .now_seconds = testNow, .store = store.store() };
+    var state: Sessions.State = .{};
+    var second: Sessions.State = .{};
+    try plugin.login(std.testing.io, &state, "a");
+    try plugin.login(std.testing.io, &second, "a");
+    var other: Sessions.State = .{};
+    try std.testing.expectError(error.SessionStoreFull, plugin.login(std.testing.io, &other, "b"));
+    test_now.store(1301, .monotonic);
+    try plugin.login(std.testing.io, &other, "b");
+    test_now.store(1000, .monotonic);
+}
+
+test "concurrent requests race logout and never authenticate after it returns" {
+    var store = MemoryStore(4).init(testNow);
+    const plugin = revocableFixture(&store);
+    var res = response.Response.init(std.testing.allocator);
+    defer res.deinit();
+    const cookie = try std.testing.allocator.dupe(u8, try issue(&plugin, "erin", &res));
+    defer std.testing.allocator.free(cookie);
+
+    const Worker = struct {
+        fn run(p: *const Sessions, c: []const u8, revoked: *const std.atomic.Value(bool), violations: *std.atomic.Value(usize)) void {
+            for (0..2000) |_| {
+                const done = revoked.load(.acquire);
+                const st = loadWith(p, c) catch {
+                    _ = violations.fetchAdd(1, .monotonic);
+                    return;
+                };
+                if (done and st.subject().len != 0) _ = violations.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var revoked = std.atomic.Value(bool).init(false);
+    var violations = std.atomic.Value(usize).init(0);
+    var threads: [3]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &plugin, cookie, &revoked, &violations });
+    try plugin.revokeSubject("erin");
+    revoked.store(true, .release);
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(usize, 0), violations.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), (try loadWith(&plugin, cookie)).subject().len);
 }

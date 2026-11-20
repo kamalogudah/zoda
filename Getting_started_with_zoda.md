@@ -930,7 +930,8 @@ fn unixSeconds() i64 {
 // inside main, after opening assets and hashing the version:
 clock_io = io;
 var secret: [32]u8 = undefined;
-try std.Io.randomSecure(io, &secret); // a real app loads a stable secret from config
+try std.Io.randomSecure(io, &secret); // DEV ONLY: production loads a stable key from protected
+// runtime config with `Key.fromBase64`; see PLUGINS.md "Session keys"
 
 var app = try App.init(gpa, .{
     .response_allocator = gpa,

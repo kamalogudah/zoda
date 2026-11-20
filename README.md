@@ -60,6 +60,15 @@ get /users/42/ -> 404 text/plain
 post /users/42 -> 404 text/plain
 ```
 
+### CI supply-chain policy
+
+Workflows in `.github/workflows/` pin every action to a full commit SHA with a
+`# vX.Y.Z` comment, and declare `permissions: contents: read` (no job needs
+write access or secrets). `.github/dependabot.yml` opens weekly update PRs for
+the pins; review the upstream diff before merging. To bump manually, resolve
+the new tag with `gh api repos/<owner>/<repo>/tags` and replace both the SHA
+and the version comment.
+
 ## Development loop
 
 ```sh
@@ -286,6 +295,38 @@ const ua = try req.getHeaderOne("user-agent"); // case-insensitive lookup
 const body = req.body;                    // fully buffered body
 ```
 
+### Chunked request trailers
+
+Trailer fields are **never** part of `req.headers`; `getHeaderOne` and
+`getAllHeaders` (and every plugin built on them: bearer tokens, CSRF, sessions,
+host authorization) see only the initial request head. Trailers are kept in a
+separate `req.trailers` slice of `zoda.request.Trailer` (a distinct type from
+`Header`), read with `req.getTrailerOne(name)` / `req.getAllTrailers(name)`.
+
+The transport accepts only an integrity-digest allowlist: `Content-Digest`,
+`Repr-Digest`, `Digest`, `Content-MD5`, `X-Checksum-SHA256`, `X-Checksum-CRC32`.
+Any other trailer name (framing, routing, `Host`, `Authorization`, `Cookie`,
+`Origin`, CSRF tokens, `Content-Type`, `X-Forwarded-*`, custom identity
+fields, and so on) is answered with `400` and the connection is closed. So are
+repeated trailer names, malformed field syntax, and control bytes. Trailers are
+bounded by `request_limits.max_trailers` (default 8, `431` when exceeded) and
+`request_limits.trailer_bytes` (default 4 KiB, `431`), separate from the head
+limits. Trailer values are unverified client input arriving after the body:
+never use them for authentication, routing, or origin decisions.
+
+**Reverse proxy requirements.** Run Zoda behind a proxy that (1) strips or
+overwrites every identity header (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`,
+`X-Remote-User`, and any custom ones) on the *request head*, and (2) drops
+chunked request trailers (or terminates the request and re-sends it without
+them). Zoda does not trust forwarded headers, and a trailer-supplied identity
+field is rejected rather than ignored, but a proxy that forwards trailers
+verbatim can still hand the backend fields the proxy never inspected.
+Test case for a deployment: send `POST` with `Transfer-Encoding: chunked`,
+`0\r\nX-Forwarded-For: 1.2.3.4\r\n\r\n` through the proxy. Expect `400` from
+the backend or the proxy; a `200` that reports the forwarded value is a bug.
+The in-tree equivalent is the transport test "trailers stay out of headers and
+only allowlisted fields reach the trailer API".
+
 ### Typed JSON requests
 
 Register `zoda.JsonParser` separately from the JSON response plugin. It parses
@@ -404,7 +445,7 @@ Built-in plugins:
 | `zoda.JsonParser` | Parsing bounded request JSON into a caller-selected type |
 | `zoda.NotFound` | A configured text fallback for route misses |
 | `zoda.BearerToken` | Parsing and validating `Authorization: Bearer` credentials |
-| `zoda.Sessions` | Signed client-side cookie sessions with explicit saves |
+| `zoda.Sessions` | Signed (not encrypted) client-side cookie sessions with explicit saves; keys must come from runtime secret config, see PLUGINS.md "Session keys" |
 | `zoda.plugins.csrf` | Session-bound CSRF tokens |
 | `zoda.Flash` | One-time messages carried in the session |
 | `zoda.plugins.http_cache` | Explicit `Cache-Control`, `ETag`, `Vary`, and conditional GET |
@@ -527,6 +568,14 @@ defer app.deinit();
 The built-in `NotFound` plugin is a route wrapper; see
 [Not-found fallback](PLUGINS.md#not-found-fallback).
 
+
+### Protected routes
+
+`zoda.route_table` declares each route as public or protected and checks
+authentication, then CSRF, before the handler. See
+[PLUGINS.md](PLUGINS.md#protected-routes-and-middleware-order) and
+[examples/secure_notes.zig](examples/secure_notes.zig) for a production
+middleware order. Middleware registered after a responder cannot protect it.
 
 ### Host authorization
 
@@ -760,13 +809,48 @@ listener is closed. All `server.Config` fields have defaults:
 | `keep_alive_idle_timeout` | 5 s |
 | `shutdown_grace_period` | 10 s, then remaining sockets are shut down |
 | `max_requests_per_connection` | 100 |
-| `request_limits` | 8 KiB target, 100 headers / 32 KiB header bytes, 128 path segments, 256 query pairs, 1 MiB body |
-| `stats` | optional `*server.Stats` with live `active`/`peak`/`admitted`/`rejected` counters |
+| `request_limits` | 8 KiB target, 100 headers / 32 KiB header bytes, 8 trailers / 4 KiB trailer bytes, 128 path segments, 256 query pairs, 1 MiB body |
+| `handler_budget` | null; observation threshold only (see below), never cancels a handler |
+| `stats` | optional `*server.Stats` with live `active`/`peak`/`admitted`/`rejected` counters plus `handlers_active`/`handlers_completed`/`handlers_over_budget` and `handler_nanoseconds_total`/`handler_nanoseconds_max` |
 
 Requests that break a limit get a 400, 413, 414, or 431 response, and the
 connection is closed. The server rejects `Expect`, content codings, and
 ambiguous framing (for example, a signed `Content-Length` or malformed
 chunked encoding).
+
+### Handler execution budgets
+
+Socket timeouts and handler time are separate things:
+
+- **Framework-managed I/O deadlines** (`header_timeout`, `body_read_timeout`,
+  `write_timeout`, `keep_alive_idle_timeout`) bound socket operations only.
+- **`app.dispatch` is a synchronous call that Zoda cannot interrupt.** There is
+  no handler deadline, cancellation token, or forced termination. A handler
+  blocked on a database, an external service, or a CPU loop keeps its
+  connection slot, request arena, and response memory until it returns, and
+  none of the socket timeouts fire while it runs. Server shutdown waits for it
+  to return (or for the task to reach an `Io` cancellation point) before the
+  connection's memory is freed.
+- Zoda deliberately does not abandon a running handler: detaching it would
+  leave work holding request/response memory and able to write after
+  cancellation.
+
+What Zoda provides is observation: `handlers_active` (a stalled handler stays
+counted), `handlers_completed`, `handler_nanoseconds_total`/`_max`, and
+`handlers_over_budget` when `handler_budget` is set. Alert on `handlers_active`
+approaching `max_connections` and on `rejected` growth.
+
+**Production requirements (application/deployment responsibility):**
+
+- Put a reverse proxy or load balancer in front with per-client and
+  per-endpoint rate limits, and its own upstream response timeout.
+- Give every outbound call (database, HTTP, queue) an explicit timeout.
+- Send expensive work to a bounded queue or worker pool and reject when full,
+  rather than running it in the handler.
+- Use process isolation (separate worker process, supervisor restart) for work
+  that must be forcibly stopped.
+- Size `max_connections` and memory from measured peaks; a bounded body does
+  not bound total process memory.
 
 ### Performance
 

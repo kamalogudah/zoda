@@ -60,7 +60,7 @@ pub fn middleware(comptime AppT: type, config: *const Config(AppT)) ConfigError!
             // A silent inner short circuit would otherwise receive dispatch's
             // 404 after this entry unwinds. Materialize it before matching.
             if (!res.handled) try res.defaultNotFound();
-            if (res.body.len != 0 and !res.generated) return;
+            if ((res.body.len != 0 or res.stream != null) and !res.generated) return;
             for (cfg.handlers) |handler| {
                 if (handler.status == res.status_code) return handler.run(ctx, req, res);
             }

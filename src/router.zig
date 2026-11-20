@@ -52,6 +52,15 @@ pub const QueryPair = struct {
     value: []const u8,
 };
 
+/// A chunked-request trailer field. Deliberately a different type from
+/// `Header` so trailer provenance cannot be lost by passing one where the other
+/// is expected. Trailers arrive after the body and are never merged into
+/// `Request.headers`.
+pub const Trailer = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 /// A request header. Names retain their wire spelling; lookup is
 /// case-insensitive and repeated fields remain separate and ordered.
 pub const Header = struct {
@@ -89,8 +98,17 @@ pub const Request = struct {
     /// Raw origin-form request target.
     target: []const u8 = &.{},
     query: []const QueryPair = &.{},
+    /// Initial request-head fields only. Chunk trailers are never included.
     headers: []const Header = &.{},
+    /// Allowlisted chunk trailer fields; see `getTrailerOne`.
+    trailers: []const Trailer = &.{},
     body: []const u8 = &.{},
+    /// True when the body was streamed to a `transport.BodySink`; `body` is
+    /// then empty and does not mean the request had no body.
+    body_streamed: bool = false,
+    /// The streaming sink's `context` (see `transport.BodyStreamHook`), set
+    /// only when `body_streamed`.
+    body_sink: ?*anyopaque = null,
 
     /// Same-request checkpoint: returns the current cursor position. A saved
     /// checkpoint is meaningful only for the request it came from; it must not
@@ -212,6 +230,39 @@ pub const Request = struct {
         var it = self.getAllHeaders(name);
         while (it.next()) |value| {
             if (found != null) return error.DuplicateHeaderValue;
+            found = value;
+        }
+        return found;
+    }
+
+    pub const TrailerIterator = struct {
+        trailers: []const Trailer,
+        name: []const u8,
+        index: usize = 0,
+
+        pub fn next(self: *TrailerIterator) ?[]const u8 {
+            while (self.index < self.trailers.len) {
+                const trailer = self.trailers[self.index];
+                self.index += 1;
+                if (std.ascii.eqlIgnoreCase(trailer.name, self.name)) return trailer.value;
+            }
+            return null;
+        }
+    };
+
+    /// Trailer values by name. Trailers are untrusted, arrive after the body,
+    /// and must not be used for authentication, routing, or origin decisions.
+    pub fn getAllTrailers(self: *const Request, name: []const u8) TrailerIterator {
+        return .{ .trailers = self.trailers, .name = name };
+    }
+
+    /// One trailer value, or `null`. The transport rejects repeated trailer
+    /// names, so a duplicate is only possible for hand-built requests.
+    pub fn getTrailerOne(self: *const Request, name: []const u8) error{DuplicateTrailerValue}!?[]const u8 {
+        var found: ?[]const u8 = null;
+        var it = self.getAllTrailers(name);
+        while (it.next()) |value| {
+            if (found != null) return error.DuplicateTrailerValue;
             found = value;
         }
         return found;

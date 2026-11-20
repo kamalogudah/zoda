@@ -22,7 +22,9 @@ documented beside its code in `src/plugins/`, and its support status is in
 
 Core middleware that is not a plugin (host authorization, default response
 headers, response timing, and static files) is documented in the
-[README](README.md#middleware).
+[README](README.md#middleware). Plugins and helpers read only initial
+request headers; chunked trailers are a separate, allowlisted API (see
+[README](README.md#chunked-request-trailers)).
 
 ## JSON responses
 
@@ -138,16 +140,23 @@ the slice. Query strings are never searched for credentials.
 
 Register `zoda.Sessions` as a plugin instance. Supply a trusted UTC Unix-second
 clock, a lifetime from 1 second to 30 days, and one or more application-owned
-keys of at least 32 cryptographically random bytes. The first key signs new cookies; older keys remain
-available for verification during rotation. Key IDs must be unique.
+keys of 32 cryptographically random bytes. The first key signs new cookies;
+older keys remain available for verification during rotation. Key IDs and
+secrets must be unique. See [Session keys](#session-keys) for generation,
+loading, rotation, and compromise response.
+
+> **Session payloads are signed, not encrypted.** The cookie holder can decode
+> every byte. Never store passwords, access tokens, API keys, secrets, or
+> sensitive personal data in the payload. Store an opaque identifier and keep
+> the data server-side. Stateless cookies are also not immediately revocable.
 
 ```zig
 const Plugins = struct { sessions: zoda.Sessions };
 
-// `unixSeconds` is the application's trusted wall-clock function. Keep the
-// secret bytes alive for the app lifetime; load them from secure configuration.
+// `unixSeconds` is the application's trusted wall-clock function. `key` comes
+// from runtime secret configuration (see "Session keys"); never from source.
 const plugins = Plugins{ .sessions = .{
-    .keys = &.{.{ .id = 1, .secret = app_secret }},
+    .keys = &.{key},
     .lifetime_seconds = 3600,
     .now_seconds = unixSeconds,
 } };
@@ -167,8 +176,11 @@ The MAC covers every field before it. Invalid, expired,
 oversized, or duplicate session cookies load as an empty session. Payloads are
 limited to 2,048 bytes and cookie values to 4,096 bytes. Signing authenticates
 contents but **does not make them confidential**; do not put secrets in the
-payload. A copied cookie can be replayed until its expiry. Removing a key stops
-accepting cookies signed by that key.
+payload. **In the default stateless mode a copied cookie can be replayed until
+its expiry, and `clear()` only deletes the browser's copy; it does not revoke
+the session.** Removing a key stops accepting cookies signed by that key. For
+logout, password reset, or suspension that must take effect immediately, use
+[revocable sessions](#revocable-sessions).
 
 `save` appends a separate `Set-Cookie` field with `Path=/; Secure; HttpOnly;
 SameSite=Lax` and `Max-Age` set to the configured lifetime. The `__Host-`
@@ -180,6 +192,110 @@ CSRF protection before using cookie sessions for state-changing requests.
 If a route fails after `save`, a propagated error discards its partial response.
 Recovery middleware can call `res.clear()` and then explicitly `save` the
 recovered session; cleanup never creates or restores a cookie.
+
+### Session keys
+
+`Sessions` checks only that each secret is at least 32 bytes and that IDs and
+secrets are unique. **A length check is not an entropy check**: the framework
+cannot detect a guessable, reused, or leaked key, and anyone who learns a key
+can forge a cookie for any payload. Key quality is the deployer's job.
+
+**Generate** 32 random bytes from the OS CSPRNG, once, outside the app:
+
+```sh
+openssl rand -base64 32
+```
+
+**Load** the value at startup from protected runtime configuration (a secret
+manager, an orchestrator secret, or a root-only file or environment variable
+that is not in version control, images, logs, or crash reports) with
+`Key.fromBase64`, which requires exactly 32 decoded bytes and fails closed:
+
+```zig
+pub fn main(init: std.process.Init) !void {
+    const encoded = init.environ_map.get("ZODA_SESSION_KEY") orelse
+        return error.MissingSessionKey; // refuse to start; never fall back
+    var key_buf: [zoda.plugins.sessions.key_bytes]u8 = undefined; // outlives the app
+    const key = try zoda.plugins.sessions.Key.fromBase64(1, encoded, &key_buf);
+    // ... .sessions = .{ .keys = &.{key}, .lifetime_seconds = 3600, .now_seconds = unixSeconds }
+}
+```
+
+`Key.generate(io, id, &buf)` fills a key from the CSPRNG for development and
+tests. A generated key is lost on restart, so every user is signed out, and it
+differs per process, so it breaks multi-instance deployments. Do not use it in
+production. Every key literal in this repository (`"TEST-ONLY-do-not-deploy-this-key!"`
+and the repeated-letter keys in unit tests) is **TEST ONLY**, public, and must
+never be deployed.
+
+**Rotate** on a schedule you choose and whenever a key may have been exposed:
+
+1. Generate a new key with a new unused ID, for example 2.
+2. Deploy `.keys = &.{ key2, key1 }`. New cookies are signed with key 2; cookies
+   signed by key 1 still verify. Every instance must run this configuration
+   before the next step, or instances that only know key 2 reject key 1 cookies.
+3. Keep key 1 for at least `lifetime_seconds` (cookies carry a bounded expiry),
+   then deploy `.keys = &.{key2}`.
+
+Effects: a cookie is re-signed only when the app calls `save`, so an unsaved
+old cookie keeps its old key ID until it expires. **Removing a key (or reusing
+its ID with a different secret) invalidates every cookie it signed**; those
+requests load as an empty session and users must sign in again. Up to 8 keys
+may be configured.
+
+**Compromise response.** Overlap keeps a leaked key trusted, so for a suspected
+leak do not overlap: deploy a new key *without* the old one, accept the forced
+sign-out, and treat everything signed by the old key as forged. For
+store-backed sessions the HMAC no longer protects identity (it comes from the
+store record), but a leaked key still lets an attacker forge payload, CSRF
+secret, and flash content, so rotate anyway and call `revokeSubject` for
+affected accounts. Then fix how the key leaked.
+
+### Revocable sessions
+
+Set `Sessions.store` to a server-side registry to get revocation. Contract:
+
+- **Allowlist.** A session is valid only while the store holds its record.
+  Unknown, revoked, expired, and forged IDs all load as an empty session.
+- **Cookie.** `v4.<key-id>.<expiry>.<base64url-128-bit-ID>.<payload>.<CSRF>.<flash>.<HMAC>`.
+  The MAC and expiry are still checked first, so unsigned input never reaches
+  the store. With a store configured, stateless v1-v3 cookies are rejected (they
+  could not be revoked); without one, v4 is rejected.
+- **Identity.** Read the account from `state.subject()`, which comes from the
+  store record, never from the payload. An empty subject means anonymous.
+- **Login.** After verifying credentials, `try sessions.login(io, &state, "user-42")`
+  then `save`. This issues a fresh random ID (revoking any prior one, so session
+  fixation is not possible) and a fresh CSRF secret.
+- **Logout.** `try sessions.logout(&state)` revokes the record, then `save`
+  sends the deletion cookie. A copied cookie fails on its next use. If it
+  returns `SessionStoreUnavailable` the record may still be live: do not report
+  success; retry or alert.
+- **Revoke an account.** `try sessions.revokeSubject("user-42")` after a password
+  reset, suspension, or privilege change removes every session of that account.
+  Mint a new session afterwards with `login`.
+- **Emergency invalidation.** Key rotation still works: remove a key from
+  `keys` to drop every cookie it signed, with or without a store.
+
+Failure semantics: `initRequest` returns `error.SessionStoreUnavailable` when a
+presented session cannot be checked. It never falls back to the signed cookie.
+Handle it as 503 (anonymous pages may choose to proceed without a session).
+`login` returns `SessionStoreFull` when capacity is exhausted. `Store` calls
+must be bounded, thread-safe, and linearizable: once `revoke`/`revokeSubject`
+returns, no later `lookup` may succeed, so a cache with stale reads breaks
+revocation.
+
+Deployment requirements:
+
+- **Persistence and scaling.** `MemoryStore(capacity)` is process-local, fixed
+  size, O(capacity) per call, and lost on restart. It suits tests and a single
+  process. Multiple processes or hosts need a shared implementation of
+  `sessions.Store` (a database or Redis) so a revocation is visible everywhere.
+- **Cleanup.** Records carry an absolute expiry (`lifetime_seconds` from login;
+  cookie refreshes do not extend it). `MemoryStore` reclaims expired slots on
+  `login`; external stores should purge expired rows periodically.
+- **Capacity.** Size the store for concurrent logins; a full store rejects new
+  logins instead of evicting live sessions.
+- **Clock.** The store and `Sessions.now_seconds` must use a trusted clock.
 
 ## CSRF helpers
 
@@ -527,6 +643,90 @@ registration and checks each outcome below.
 - **Other middleware.** Register `RequestTrace` and timing before both entries
   so they record the final response. Register `default_headers` before them so
   replacement pages also get the default headers.
+
+## Protected routes and middleware order
+
+Registering `BearerToken` or `Sessions` does not protect anything by itself:
+`BearerToken.guard_routes` defaults to `false`, CSRF checks are explicit calls,
+and a plugin only sees what runs after it. `zoda.route_table` makes the
+decision visible at registration and checks it in a fixed order.
+
+```zig
+const rt = zoda.route_table;
+const Routes = rt.Table(App, .{
+    .authenticate = rt.sessionAuth(App, "sessions"), // or rt.bearerAuth(App, "bearer")
+    .csrf_sessions = "sessions",
+});
+const routes = [_]Routes.Route{
+    .{ .method = .get, .path = "/health", .access = .public, .handler = health },
+    .{ .method = .post, .path = "/login", .access = .public, .handler = login },
+    .{ .method = .get, .path = "/notes", .access = .protected, .handler = list },
+    .{ .method = .delete, .path = "/notes/:id", .access = .protected, .handler = remove },
+};
+// .route_fn = App.composeRoute(Routes.route(&routes))
+```
+
+- **No silent default.** `access` has no default value, so a route without a
+  public/protected decision does not compile. A protected route without
+  `Options.authenticate`, and a route that needs CSRF without
+  `Options.csrf_sessions`, also fail at compile time. Duplicate method and
+  path shapes fail too.
+- **Order per route:** authentication (`401`, optional `WWW-Authenticate`),
+  then CSRF proof (`403`), then the handler. Handlers read the body, so the
+  body is never parsed for a request that failed either check.
+- **CSRF on unsafe methods.** Everything but GET, HEAD, OPTIONS, and TRACE
+  requires proof (`X-CSRF-Token` by default, or `csrf_header =
+  csrf.xsrf_header_name`) unless the row says `.csrf = .exempt`. Use the
+  exemption only where no ambient credential exists, such as a
+  bearer-token API, and keep it visible in review.
+- **Path matching.** Patterns are absolute; `:name` captures one segment,
+  available as `Params` (`params.int(u64, 0)`). A path or method that matches
+  no row is left unhandled, so the default 404 answers and no handler runs.
+- **Route map.** `Routes.entries(&routes)` returns the access and CSRF
+  requirement of every row, derived from the same array the router uses. Tests
+  iterate it so new routes are covered automatically.
+- **`sessionAuth`** requires a revocable `Sessions.store`; without one it
+  fails closed. **`bearerAuth`** uses `BearerToken.authorized`, which rejects
+  absent, malformed, duplicate, and oversized credentials.
+
+### Protecting static files and other responders
+
+The table guards only routes it dispatches. Static files and any middleware
+that answers without calling `next` run before the route function, so a check
+registered after them cannot protect them. Use `rt.gate`, registered before
+the responder:
+
+```zig
+const private: rt.Gate = .{ .prefix = &.{"private"} };
+.middleware = &.{
+    try security_policy.middleware(App, &policies),      // 1. headers on everything below
+    try zoda.default_headers.middleware(App, &defaults), // 2.
+    try zoda.host_authorization.middleware(App, &hosts), // 3. before any responder
+    rt.gate(App, authenticate, &private),                // 4. authenticate /private/*
+    zoda.static.middleware(App, &private_files),         // 5. protected files
+    zoda.static.middleware(App, &public_files),          // 6. public files
+},
+```
+
+Limitation: middleware registered after a short-circuiting responder never
+runs for the requests that responder answers. A gate refuses unauthenticated
+requests under its prefix even when the file does not exist, so existence is
+not revealed.
+
+### Production checklist
+
+1. Host authorization before every responder (static, gates, routes).
+2. Security-policy and default-header middleware outermost, so 401, 403, 404,
+   and static responses carry them.
+3. A `gate` ahead of every static prefix or custom responder that is not public.
+4. Every route declared in one table with an explicit `access`.
+5. Unsafe methods keep the default CSRF requirement; each `.exempt` has a reason.
+6. Tests enumerate the table: no credential, malformed, duplicate, revoked,
+   and expired sessions get `401`; missing, malformed, duplicate, and
+   other-session CSRF proof gets `403`; neither reaches a handler.
+
+The runnable reference is [examples/secure_notes.zig](examples/secure_notes.zig)
+(`zig build run-secure-notes`); its contract tests are the template for step 6.
 
 ## Security response policies
 
@@ -1458,11 +1658,35 @@ fn logSsrFailure(req: *const zoda.router.Request, failure: zoda.plugins.inertia.
 
 | `Ssr` field | Default | Meaning |
 | --- | --- | --- |
-| `address` | `127.0.0.1:13714` | Literal `std.Io.net.IpAddress` of the SSR server. No name lookup happens. |
+| `address` | `127.0.0.1:13714` | Literal loopback `std.Io.net.IpAddress` (127.0.0.0/8 or `::1`) of the SSR server. No name lookup happens. Any other address is `error.InvalidSsr`. |
 | `path` | `"/render"` | Request path: `/` then printable ASCII without spaces, at most 256 bytes. |
 | `timeout_ms` | `1000` | Total budget for connecting, sending, and reading, 1 to 60,000. |
 | `max_response_bytes` | 1 MiB | Most bytes of the SSR server's answer, head included. |
 
+- **Trust boundary.** Read this before enabling `ssr`.
+  - *Transport.* Plain HTTP with no authentication or encryption, so only
+    loopback destinations are supported. `validate()` and `render` reject
+    every non-loopback `address` (including `0.0.0.0`, `::`, and
+    IPv4-mapped IPv6) with `error.InvalidSsr`; there is no remote mode and
+    no silent plaintext fallback. To reach a renderer on another host,
+    run it on the same machine; do not tunnel it behind the loopback port
+    unless that tunnel is itself authenticated and encrypted and you own
+    both ends.
+  - *Data exposure.* The renderer receives the full page JSON: every
+    prop, including flash data and shared props. Keep secrets, tokens, and
+    anything not needed to render the page out of props.
+  - *Markup trust.* The renderer is part of the trusted computing base.
+    Its `head` and `body` are inserted verbatim, unescaped, into a
+    document served from your origin. Anything that controls the renderer
+    controls the page. Never pass third-party or user-supplied renderer
+    output through it.
+  - *Service isolation.* Bind the renderer to loopback only (for
+    `@inertiajs/*/server`, pass `host: '127.0.0.1'`; its default is
+    `0.0.0.0`), run it as an unprivileged user, and
+    restrict who can reach the port (a dedicated user or network
+    namespace, container-private network, or firewall rule). Any local
+    process that can connect to the port can read page props sent to it,
+    and a local process that wins the port can serve markup.
 - **Request.** `POST <path> HTTP/1.1` with `Content-Type: application/json`
   and `Connection: close`. The body is exactly the page object an
   `X-Inertia` visit would get, unescaped.
@@ -1470,7 +1694,7 @@ fn logSsrFailure(req: *const zoda.router.Request, failure: zoda.plugins.inertia.
   missing; other fields are ignored), framed by `Content-Length`, chunked
   encoding, or the connection close. The `head` elements, joined with
   newlines, replace `@inertiaHead`; `body` replaces `@inertia`. Both are
-  inserted as is: the SSR server is trusted like the layout. In v3 `body`
+  inserted as is: the SSR server is trusted like the layout (see Trust boundary). In v3 `body`
   holds the `<script data-page>` element and
   `<div data-server-rendered="true" id="app">`, built from the page JSON
   Zoda sent, so `root_id` and `initial_page` must match the SSR server's
@@ -1484,10 +1708,10 @@ fn logSsrFailure(req: *const zoda.router.Request, failure: zoda.plugins.inertia.
 - **Deadline.** The budget is one absolute deadline on the monotonic clock,
   checked before every syscall, so a hung or slow SSR server costs at most
   `timeout_ms`. During that time the request holds its connection task:
-  keep the SSR server local and the timeout short.
+  the SSR server must be local and the timeout short.
 - **Settings.** `validate()` and `render` return `error.InvalidSsr` for a
-  zero or over-limit `timeout_ms`, a zero `max_response_bytes`, or a bad
-  `path`. `@inertiaHead` after `@inertia`, or twice, is
+  non-loopback `address`, a zero or over-limit `timeout_ms`, a zero
+  `max_response_bytes`, or a bad `path`. `@inertiaHead` after `@inertia`, or twice, is
   `error.InvalidLayout`.
 - **Not covered.** Only full visits are rendered; `X-Inertia` responses are
   JSON as always. The SSR server's error details (its 500 body) are not
