@@ -17,6 +17,9 @@ pub const response = @import("response.zig");
 /// Strict `multipart/form-data` parser for buffered request bodies.
 pub const multipart = @import("multipart.zig");
 
+/// Optional S3-compatible storage: AWS SigV4 signer and put/get/delete client.
+pub const s3 = @import("s3.zig");
+
 /// Embedded HTML templates with typed text interpolation (ADR-0001 Phase 3.5).
 pub const template = @import("template.zig");
 
@@ -100,6 +103,7 @@ comptime {
     std.testing.refAllDecls(request);
     std.testing.refAllDecls(response);
     std.testing.refAllDecls(multipart);
+    std.testing.refAllDecls(s3);
     std.testing.refAllDecls(template);
     std.testing.refAllDecls(buffering);
     std.testing.refAllDecls(transport);

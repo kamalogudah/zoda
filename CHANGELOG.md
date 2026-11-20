@@ -7,6 +7,12 @@ All notable changes to Zoda are recorded here. The format follows
 
 ### Added
 
+- `zoda.s3`: optional S3-compatible storage (S3, R2, MinIO, SeaweedFS). `sign`
+  is a pure AWS Signature V4 signer with injected time, verified against the
+  published AWS S3 GET and PUT examples; `Store` offers buffered path-style
+  `put`/`get`/`delete` over `std.http.Client` with `keep_alive = false` (works
+  around the stdlib hang on keep-alive `204` DELETE responses). No streaming,
+  multipart upload, listing, or presigned URLs (#98).
 - `response_limits` on `App.Options` (and the `App` struct): configures
   `response.Limits` for every response the app builds, parallel to
   `server.Config.request_limits`. Raise `max_body_bytes` (default 1 MiB) to
