@@ -57,6 +57,10 @@ pub const Config = struct {
     /// path-segment prefix wins). Lets one upload route accept a larger body
     /// without raising the limit for every route.
     body_limit_rules: []const transport.BodyLimitRule = &.{},
+    /// Renders the response for an over-limit request body (see
+    /// `transport.BodyTooLargeHook`). The connection is closed after it is
+    /// written. Null sends the bare 413.
+    on_body_too_large: ?transport.BodyTooLargeHook = null,
     /// Observation threshold only: a handler that runs longer is counted in
     /// `Stats.handlers_over_budget`. It does NOT cancel or time out the
     /// handler; its response is still written. Null disables the counter.
@@ -181,6 +185,7 @@ pub fn serve(
                 .{
                     .request_limits = context.config.request_limits,
                     .body_limit_rules = context.config.body_limit_rules,
+                    .on_body_too_large = context.config.on_body_too_large,
                     .max_requests = context.config.max_requests_per_connection,
                     .deadlines = connection_io.deadlineHooks(),
                     .handler_hooks = .{

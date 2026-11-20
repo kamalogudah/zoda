@@ -37,6 +37,22 @@ pub const Config = struct {
     /// Optional observation hooks around `app.dispatch`. They measure handler
     /// time; they cannot interrupt, cancel, or bound it.
     handler_hooks: ?HandlerHooks = null,
+    /// Lets the app render the response for an over-limit request body. See
+    /// `BodyTooLargeHook`. Null keeps the bare 413.
+    on_body_too_large: ?BodyTooLargeHook = null,
+};
+
+/// Invoked when a request body exceeds its limit (global `max_body_bytes` or a
+/// matching `BodyLimitRule`), instead of the transport's bare 413. `render`
+/// receives the request head (method, target, segments, query, headers; the
+/// body is empty because it was not read) and the limit that was exceeded, and
+/// returns the response to send. The transport writes it, releases it with
+/// `deinit`, and closes the connection: the unread body makes keep-alive
+/// unusable. If `render` fails or returns an invalid status, the bare 413 is
+/// sent. The hook does not run for other rejections (400, 431, ...).
+pub const BodyTooLargeHook = struct {
+    context: *anyopaque,
+    render: *const fn (context: *anyopaque, head: *router.Request, limit: usize) anyerror!response.Response,
 };
 
 /// Overrides the body limit for requests whose decoded path starts with
@@ -150,7 +166,7 @@ pub fn serveConnection(
         };
 
         const keep_alive = wire_req.head.keep_alive and request_index + 1 < config.max_requests;
-        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, config.body_limit_rules, keep_alive, config.deadlines, config.handler_hooks);
+        const outcome = try processRequest(AppType, allocator, &wire_req, app, config.request_limits, config.body_limit_rules, keep_alive, config.deadlines, config.handler_hooks, config.on_body_too_large);
         if (outcome == .close) return;
     }
 }
@@ -167,6 +183,7 @@ fn processRequest(
     keep_alive: bool,
     deadlines: ?Deadlines,
     handler_hooks: ?HandlerHooks,
+    too_large_hook: ?BodyTooLargeHook,
 ) anyerror!Outcome {
     const version = wire_req.head.version;
     const wire_method = wire_req.head.method;
@@ -190,12 +207,6 @@ fn processRequest(
 
     // Decided from the decoded path, before any body byte is read.
     const max_body = bodyLimitFor(body_rules, arena.segments, limits.max_body_bytes);
-    if (content_length) |len| {
-        if (len > max_body) {
-            try reject(wire_req, .payload_too_large, version, deadlines);
-            return .close;
-        }
-    }
 
     var headers: std.ArrayList(request.Header) = .empty;
     var trailer_list: std.ArrayList(request.Trailer) = .empty;
@@ -252,6 +263,21 @@ fn processRequest(
         try reject(wire_req, .bad_request, version, deadlines);
         return .close;
     }
+    // Still before any body byte is read. Done after the head fields are
+    // collected so the hook can see them.
+    var head_view: router.Request = .{
+        .method = methodFromStd(wire_method),
+        .target = arena.target,
+        .segments = arena.segments,
+        .query = arena.query,
+        .headers = headers.items,
+    };
+    if (content_length) |len| {
+        if (len > max_body) {
+            try rejectBodyTooLarge(allocator, wire_req, version, deadlines, too_large_hook, &head_view, max_body);
+            return .close;
+        }
+    }
     if (transfer_encoding != .none or content_length != null) {
         if (deadlines) |operation_deadlines| operation_deadlines.body();
         var body = buffering.BoundedAccumulator.init(arena.allocator(), max_body);
@@ -260,8 +286,12 @@ fn processRequest(
 
         if (transfer_encoding == .chunked) {
             readChunked(wire_req.server.reader.in, &body, &trailer_section, arena.allocator(), limits.trailer_bytes) catch |err| {
+                if (err == error.BodyTooLarge) {
+                    try rejectBodyTooLarge(allocator, wire_req, version, deadlines, too_large_hook, &head_view, max_body);
+                    return .close;
+                }
                 try reject(wire_req, switch (err) {
-                    error.BodyTooLarge => .payload_too_large,
+                    error.BodyTooLarge => unreachable,
                     error.TrailersTooLarge => .request_header_fields_too_large,
                     error.OutOfMemory => .internal_server_error,
                     error.Malformed, error.ReadFailed => .bad_request,
@@ -285,7 +315,7 @@ fn processRequest(
                 if (n == 0) break;
                 body.append(chunk[0..n]) catch |err| switch (err) {
                     error.BodyTooLarge => {
-                        try reject(wire_req, .payload_too_large, version, deadlines);
+                        try rejectBodyTooLarge(allocator, wire_req, version, deadlines, too_large_hook, &head_view, max_body);
                         return .close;
                     },
                     error.OutOfMemory => {
@@ -372,6 +402,19 @@ fn processRequest(
     };
     defer res.deinit();
 
+    return writeResponse(allocator, wire_req, &res, version, keep_alive, deadlines);
+}
+
+/// Writes `res` (status already must be valid unless it is rejected here as
+/// 500). Shared by the normal dispatch path and the over-limit hook.
+fn writeResponse(
+    allocator: std.mem.Allocator,
+    wire_req: *std.http.Server.Request,
+    res: *const response.Response,
+    version: std.http.Version,
+    keep_alive: bool,
+    deadlines: ?Deadlines,
+) anyerror!Outcome {
     if (!validStatus(res.status_code)) {
         try reject(wire_req, .internal_server_error, version, deadlines);
         return .close;
@@ -415,6 +458,30 @@ fn processRequest(
         .extra_headers = extra.items,
     });
     return if (keep_alive) .keep_alive else .close;
+}
+
+/// Refuses an over-limit body. With a hook, the app's response is written
+/// (connection closed); otherwise, or if the hook fails or returns an invalid
+/// status, the bare 413 is sent.
+fn rejectBodyTooLarge(
+    allocator: std.mem.Allocator,
+    wire_req: *std.http.Server.Request,
+    version: std.http.Version,
+    deadlines: ?Deadlines,
+    hook: ?BodyTooLargeHook,
+    head: *router.Request,
+    limit: usize,
+) !void {
+    if (hook) |h| render: {
+        var res = h.render(h.context, head, limit) catch break :render;
+        defer res.deinit();
+        if (!validStatus(res.status_code)) break :render;
+        // Do not invite the body of a request being refused.
+        wire_req.head.expect = null;
+        _ = try writeResponse(allocator, wire_req, &res, version, false, deadlines);
+        return;
+    }
+    try reject(wire_req, .payload_too_large, version, deadlines);
 }
 
 /// Trailer fields accepted from clients: integrity digests only. Everything
@@ -732,6 +799,66 @@ test "body limit rules override the limit per path before the body is read" {
     defer std.testing.allocator.free(chunked);
     try std.testing.expect(std.mem.startsWith(u8, chunked, "HTTP/1.1 413"));
     try std.testing.expectEqual(@as(usize, 2), calls);
+}
+
+const TooLargeCtx = struct {
+    seen_limit: usize = 0,
+    seen_target_len: usize = 0,
+    mode: enum { json, fail, bad_status } = .json,
+
+    fn render(context: *anyopaque, head: *router.Request, limit: usize) anyerror!response.Response {
+        const self: *TooLargeCtx = @ptrCast(@alignCast(context));
+        self.seen_limit = limit;
+        self.seen_target_len = head.target.len;
+        if (self.mode == .fail) return error.Boom;
+        var res = response.Response.init(std.testing.allocator);
+        errdefer res.deinit();
+        try res.text(if (self.mode == .bad_status) 0 else 413, "{\"error\":\"too big\"}");
+        try res.setHeader("Content-Type", "application/json");
+        try res.setHeader("X-Custom", "yes");
+        return res;
+    }
+};
+
+test "app renders the 413 for an over-limit body and the connection closes" {
+    var calls: usize = 0;
+    const app: TestApp = .{ .allocator = std.testing.allocator, .calls = &calls };
+    var ctx: TooLargeCtx = .{};
+    const hook: BodyTooLargeHook = .{ .context = &ctx, .render = TooLargeCtx.render };
+    const cfg: Config = .{ .request_limits = .{ .max_body_bytes = 2 }, .on_body_too_large = hook };
+
+    // Content-Length path; a second pipelined request must never be served.
+    const cl = try runTest("POST /up HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\n\r\n", &app, cfg);
+    defer std.testing.allocator.free(cl);
+    try std.testing.expect(std.mem.startsWith(u8, cl, "HTTP/1.1 413"));
+    try std.testing.expect(std.mem.indexOf(u8, cl, "application/json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cl, "x-custom: yes") != null or std.mem.indexOf(u8, cl, "X-Custom: yes") != null);
+    try std.testing.expect(std.mem.endsWith(u8, cl, "{\"error\":\"too big\"}"));
+    try std.testing.expect(std.mem.indexOf(u8, cl, "connection: close") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, cl, "HTTP/1.1 "));
+    try std.testing.expectEqual(@as(usize, 2), ctx.seen_limit);
+    try std.testing.expectEqual(@as(usize, 3), ctx.seen_target_len);
+
+    // Chunked path.
+    const chunked = try runTest("POST /up HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", &app, cfg);
+    defer std.testing.allocator.free(chunked);
+    try std.testing.expect(std.mem.endsWith(u8, chunked, "{\"error\":\"too big\"}"));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+
+    // A failing or invalid hook falls back to the bare 413.
+    for ([_]@TypeOf(ctx.mode){ .fail, .bad_status }) |mode| {
+        ctx.mode = mode;
+        const fallback = try runTest("POST /up HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", &app, cfg);
+        defer std.testing.allocator.free(fallback);
+        try std.testing.expect(std.mem.startsWith(u8, fallback, "HTTP/1.1 413 Content Too Large") or std.mem.startsWith(u8, fallback, "HTTP/1.1 413"));
+        try std.testing.expect(std.mem.indexOf(u8, fallback, "too big") == null);
+    }
+
+    // Within the limit the hook is not used.
+    ctx.mode = .json;
+    const ok = try runTest("POST /up HTTP/1.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi", &app, cfg);
+    defer std.testing.allocator.free(ok);
+    try std.testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
 }
 
 test "target, header count, and malformed syntax map to bounded errors" {

@@ -7,6 +7,11 @@ All notable changes to Zoda are recorded here. The format follows
 
 ### Added
 
+- `server.Config.on_body_too_large` (`transport.BodyTooLargeHook`): the app can
+  render the response for an over-limit request body (JSON error, custom
+  headers, ...). The hook gets the request head and the exceeded limit; its
+  response is written and the connection closed. A failing hook or invalid
+  status falls back to the bare 413 (#99).
 - `zoda.s3`: optional S3-compatible storage (S3, R2, MinIO, SeaweedFS). `sign`
   is a pure AWS Signature V4 signer with injected time, verified against the
   published AWS S3 GET and PUT examples; `Store` offers buffered path-style
@@ -22,8 +27,7 @@ All notable changes to Zoda are recorded here. The format follows
   request body limits matched on decoded path-segment prefixes, longest prefix
   wins. The limit is chosen from the request head, so an over-limit
   `Content-Length` is refused with 413 before any body is buffered. Lets one
-  upload route exceed the global `max_body_bytes` (#96). Streaming and
-  app-rendered 413 responses are not included.
+  upload route exceed the global `max_body_bytes` (#96). Streaming is not included.
 - `zoda.multipart.parse(allocator, content_type, body)`: strict
   `multipart/form-data` parsing (RFC 2046/7578 framing) into zero-copy parts
   with `name`, optional `filename` and `content_type`, and `data`; malformed
