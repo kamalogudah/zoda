@@ -7,6 +7,18 @@ All notable changes to Zoda are recorded here. The format follows
 
 ### Added
 
+- `Response.streamBody(status, content_type, response.BodyStream)` and
+  `BodyStream.fromReader`: a handler can attach a pull source (file, reader)
+  that the transport writes to the socket in 64 KiB chunks instead of
+  buffering the body. `Content-Length` when `length` is known, chunked (or
+  close-delimited for HTTP/1.0) otherwise; HEAD, 1xx, 204 and 304 never read
+  the source. `Response` owns the source and closes it exactly once on every
+  path, including client disconnect. Failures after the head closes the
+  connection; the write deadline is re-armed per chunk; streamed bodies are
+  not bounded by `max_body_bytes`. `http_cache.setBodyETag` returns
+  `error.StreamedBody`; `status_handler` and Inertia treat a stream as a body.
+  `static.zig` is unchanged (no Range yet). New
+  [ADR-0003](adr_0003_response_streaming.md) supersedes ADR-0001 §4.2.5 (#101).
 - `server.Config.body_stream` (`transport.BodyStreamHook` / `BodySink`): the
   app can stream selected request bodies to a caller-provided sink (file,
   hasher, multipart parser) instead of buffering them in the request arena.

@@ -27,10 +27,13 @@
 //! Response framing (Content-Length, Transfer-Encoding, HEAD/bodyless rules)
 //! is the wire adapter's responsibility and intentionally absent here (§3.4).
 //!
-//! Buffered only: a `Response` holds its complete body, bounded by
-//! `Limits.max_body_bytes` (configurable via `App.Options.response_limits`).
-//! Response streaming is not supported and is not
-//! implied by this type (ADR-0001 §4.2.5).
+//! Buffered or streamed: a buffered `Response` holds its complete body, bounded
+//! by `Limits.max_body_bytes` (configurable via `App.Options.response_limits`).
+//! `streamBody` instead attaches a `BodyStream`, a pull source the transport
+//! writes to the socket in chunks without holding the body in memory (ADR-0003,
+//! which supersedes ADR-0001 §4.2.5). A streamed response has an empty `body`,
+//! is not bounded by `max_body_bytes`, and owns its source: `deinit`, `clear`,
+//! and every body-replacing helper call the source's `close` exactly once.
 const std = @import("std");
 
 /// Configurable response bounds (§3.4 defaults: 100 headers / 32 KiB header
@@ -58,6 +61,43 @@ pub const BodyError = error{
     OutOfMemory,
     BodyTooLarge,
 };
+
+/// A streamed body source (ADR-0003). The transport pulls it in chunks and
+/// writes each chunk to the socket, so memory per response is one chunk.
+pub const BodyStream = struct {
+    /// Passed to `read` and `close`.
+    context: ?*anyopaque = null,
+    /// Exact body length when known. Known: the transport sends
+    /// `Content-Length` and treats a source that yields fewer or more bytes as
+    /// a failure that closes the connection. Null: `Transfer-Encoding: chunked`
+    /// (HTTP/1.1), or a close-delimited body for an HTTP/1.0 client.
+    length: ?u64 = null,
+    /// Copies up to `buffer.len` bytes into `buffer` and returns the count;
+    /// zero means end of body. Runs on the connection thread and blocks it.
+    /// An error after the head is sent aborts the connection: Zoda never sends
+    /// a second status line.
+    read: *const fn (context: ?*anyopaque, buffer: []u8) anyerror!usize,
+    /// Releases the source (closes the file, ...). Called exactly once, by
+    /// whichever of `deinit`, `clear`, or a body replacement drops the stream:
+    /// after a complete send, a failed send, a client disconnect, a HEAD
+    /// request that never read it, or a middleware that discarded it.
+    close: ?*const fn (context: ?*anyopaque) void = null,
+
+    /// A source over a `std.Io.Reader`. `reader` must outlive the response; the
+    /// caller owns it and `close` is null. `length` is the exact byte count
+    /// when known.
+    pub fn fromReader(reader: *std.Io.Reader, length: ?u64) BodyStream {
+        return .{ .context = reader, .length = length, .read = readerRead };
+    }
+
+    fn readerRead(context: ?*anyopaque, buffer: []u8) anyerror!usize {
+        const reader: *std.Io.Reader = @ptrCast(@alignCast(context.?));
+        return reader.readSliceShort(buffer);
+    }
+};
+
+/// Errors from `streamBody`.
+pub const StreamError = error{ OutOfMemory, InvalidContentType };
 
 /// Errors from `replaceOwnedBody`.
 pub const OwnedBodyError = BodyError || error{InvalidContentType};
@@ -96,6 +136,8 @@ pub const Response = struct {
     status_code: u16 = 0,
     /// Owned body bytes.
     body: []u8 = &.{},
+    /// Streamed body source; when set, `body` is empty. See `streamBody`.
+    stream: ?BodyStream = null,
     /// Owned content type, empty when unset.
     content_type: []const u8 = &.{},
     /// Header field values at `[0..header_count]`; allocation length is
@@ -135,6 +177,7 @@ pub const Response = struct {
     }
 
     fn release(self: *Response) void {
+        self.dropStream();
         if (self.body.len != 0) self.allocator.free(self.body);
         if (self.content_type.len != 0) self.allocator.free(@constCast(self.content_type));
         for (self.headers[0..self.header_count]) |header| {
@@ -151,6 +194,33 @@ pub const Response = struct {
         self.status_code = 0;
         self.handled = false;
         self.generated = false;
+    }
+
+    /// Closes and detaches a streamed body source, if any. Idempotent. Body
+    /// rewriting code that replaces or discards the body must call this.
+    pub fn dropStream(self: *Response) void {
+        const stream = self.stream orelse return;
+        self.stream = null;
+        if (stream.close) |close| close(stream.context);
+    }
+
+    /// Replaces the body, status, and content type with a streamed body and
+    /// marks handled. `content_type` is copied and must not contain CR, LF, or
+    /// NUL. On success the response owns `stream` and will call its `close`; on
+    /// any error the response is unchanged and the caller still owns it. The
+    /// body is not subject to `Limits.max_body_bytes`. Headers set by the
+    /// caller are kept; the transport owns `Content-Length` and
+    /// `Transfer-Encoding`.
+    pub fn streamBody(
+        self: *Response,
+        status_code: u16,
+        content_type: []const u8,
+        stream: BodyStream,
+    ) StreamError!void {
+        if (content_type.len == 0 or hasForbiddenValueByte(content_type)) return error.InvalidContentType;
+        const owned_type = try self.allocator.dupe(u8, content_type);
+        self.commit(&.{}, status_code, owned_type);
+        self.stream = stream;
     }
 
     /// Writes dispatch's default `404 Not Found` and marks it generated, so a
@@ -216,6 +286,7 @@ pub const Response = struct {
     /// have fully allocated the new storage first, so a replacement never
     /// destroys the old response on a failure path.
     fn commit(self: *Response, body: []u8, status_code: u16, content_type: []const u8) void {
+        self.dropStream();
         if (self.body.len != 0) self.allocator.free(self.body);
         if (self.content_type.len != 0) self.allocator.free(@constCast(self.content_type));
         self.body = body;
@@ -276,6 +347,7 @@ pub const Response = struct {
     /// policy, `Vary`, and `Set-Cookie` still reach the client. Infallible.
     /// The transport omits Content-Length and Content-Type on a 304.
     pub fn notModified(self: *Response) void {
+        self.dropStream();
         if (self.body.len != 0) self.allocator.free(self.body);
         if (self.content_type.len != 0) self.allocator.free(@constCast(self.content_type));
         self.body = &.{};
@@ -740,4 +812,91 @@ test "only the default 404 is generated until a helper replaces it" {
     try res.defaultNotFound();
     res.clear();
     try std.testing.expect(!res.generated and !res.handled);
+}
+
+const CountingSource = struct {
+    closes: usize = 0,
+
+    fn read(_: ?*anyopaque, _: []u8) anyerror!usize {
+        return 0;
+    }
+
+    fn close(context: ?*anyopaque) void {
+        const self: *CountingSource = @ptrCast(@alignCast(context.?));
+        self.closes += 1;
+    }
+
+    fn stream(self: *CountingSource) BodyStream {
+        return .{ .context = self, .read = read, .close = close };
+    }
+};
+
+test "streamBody owns the source and closes it exactly once on every path" {
+    var deinit_src: CountingSource = .{};
+    {
+        var res = Response.init(std.testing.allocator);
+        defer res.deinit();
+        try res.streamBody(200, "application/pdf", deinit_src.stream());
+        try std.testing.expect(res.handled and res.stream != null);
+        try std.testing.expectEqual(@as(usize, 0), res.body.len);
+        try std.testing.expectEqualStrings("application/pdf", res.content_type);
+    }
+    try std.testing.expectEqual(@as(usize, 1), deinit_src.closes);
+
+    var replaced: CountingSource = .{};
+    var res = Response.init(std.testing.allocator);
+    defer res.deinit();
+    try res.streamBody(200, "text/plain", replaced.stream());
+    try res.text(500, "oops");
+    try std.testing.expectEqual(@as(usize, 1), replaced.closes);
+    try std.testing.expect(res.stream == null);
+    try std.testing.expectEqualStrings("oops", res.body);
+
+    var cleared: CountingSource = .{};
+    try res.streamBody(200, "text/plain", cleared.stream());
+    res.clear();
+    res.clear();
+    try std.testing.expectEqual(@as(usize, 1), cleared.closes);
+
+    var not_modified: CountingSource = .{};
+    try res.streamBody(200, "text/plain", not_modified.stream());
+    res.notModified();
+    try std.testing.expectEqual(@as(usize, 1), not_modified.closes);
+    try std.testing.expectEqual(@as(u16, 304), res.status_code);
+
+    // Restreaming drops the previous source.
+    var first: CountingSource = .{};
+    var second: CountingSource = .{};
+    try res.streamBody(200, "text/plain", first.stream());
+    try res.streamBody(200, "text/plain", second.stream());
+    try std.testing.expectEqual(@as(usize, 1), first.closes);
+    try std.testing.expectEqual(@as(usize, 0), second.closes);
+}
+
+test "a rejected or failed streamBody leaves the response and the caller's source alone" {
+    var src: CountingSource = .{};
+    var res = Response.init(std.testing.allocator);
+    defer res.deinit();
+    try res.text(200, "kept");
+    try std.testing.expectError(error.InvalidContentType, res.streamBody(200, "bad\r\ntype", src.stream()));
+    try std.testing.expectError(error.InvalidContentType, res.streamBody(200, "", src.stream()));
+    try std.testing.expectEqualStrings("kept", res.body);
+    try std.testing.expect(res.stream == null);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var fres = Response.init(failing.allocator());
+    defer fres.deinit();
+    try std.testing.expectError(error.OutOfMemory, fres.streamBody(200, "text/plain", src.stream()));
+    try std.testing.expect(!fres.handled and fres.stream == null);
+    try std.testing.expectEqual(@as(usize, 0), src.closes);
+}
+
+test "fromReader streams a reader's bytes" {
+    var reader = std.Io.Reader.fixed("abcdef");
+    const stream = BodyStream.fromReader(&reader, 6);
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try stream.read(stream.context, &buf));
+    try std.testing.expectEqualStrings("abcd", &buf);
+    try std.testing.expectEqual(@as(usize, 2), try stream.read(stream.context, &buf));
+    try std.testing.expectEqual(@as(usize, 0), try stream.read(stream.context, &buf));
 }

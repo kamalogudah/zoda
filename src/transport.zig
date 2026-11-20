@@ -567,12 +567,82 @@ fn writeResponse(
         try writeBodylessHead(wire_req.server.out, version, status, keep_alive, extra.items);
         return if (keep_alive) .keep_alive else .close;
     }
+    if (res.stream) |stream| {
+        return writeStreamed(allocator, wire_req, stream, version, status, keep_alive, extra.items, deadlines);
+    }
     try wire_req.respond(res.body, .{
         .version = version,
         .status = status,
         .keep_alive = keep_alive,
         .extra_headers = extra.items,
     });
+    return if (keep_alive) .keep_alive else .close;
+}
+
+/// Bytes pulled from a `response.BodyStream` per write. Memory per streamed
+/// response, and the unit of the write deadline.
+pub const stream_chunk_bytes = 64 * 1024;
+
+/// Writes a streamed body (ADR-0003). The head is sent before the source is
+/// read, so after that point any failure (source error, wrong length, write
+/// error or deadline) closes the connection without a second status line.
+/// A known length is sent as Content-Length, an unknown one as chunked, or, for
+/// an HTTP/1.0 client, delimited by closing the connection. HEAD gets the head
+/// and framing headers without reading the source. The write deadline is
+/// re-armed per chunk, so a slow client must accept one chunk per
+/// `write_timeout`; the total is bounded by the source, not the transport.
+fn writeStreamed(
+    allocator: std.mem.Allocator,
+    wire_req: *std.http.Server.Request,
+    stream: response.BodyStream,
+    version: std.http.Version,
+    status: std.http.Status,
+    keep_alive_requested: bool,
+    extra_headers: []const std.http.Header,
+    deadlines: ?Deadlines,
+) anyerror!Outcome {
+    const chunk = allocator.alloc(u8, stream_chunk_bytes) catch {
+        try reject(wire_req, .internal_server_error, version, deadlines);
+        return .close;
+    };
+    defer allocator.free(chunk);
+
+    const close_delimited = stream.length == null and version == .@"HTTP/1.0";
+    const keep_alive = keep_alive_requested and !close_delimited;
+    var buffer: [512]u8 = undefined;
+    var body = try wire_req.respondStreaming(&buffer, .{
+        .content_length = stream.length,
+        .respond_options = .{
+            .version = version,
+            .status = status,
+            .keep_alive = keep_alive,
+            .extra_headers = extra_headers,
+            .transfer_encoding = if (close_delimited) .none else null,
+        },
+    });
+    const out = wire_req.server.out;
+
+    if (wire_req.head.method == .HEAD) {
+        out.flush() catch return .close;
+        return if (keep_alive) .keep_alive else .close;
+    }
+
+    var sent: u64 = 0;
+    while (true) {
+        const n = stream.read(stream.context, chunk) catch return .close;
+        if (n == 0) break;
+        if (stream.length) |length| {
+            if (n > length - sent) return .close;
+        }
+        sent += n;
+        if (deadlines) |operation_deadlines| operation_deadlines.write();
+        body.writer.writeAll(chunk[0..n]) catch return .close;
+        body.writer.flush() catch return .close;
+        out.flush() catch return .close;
+    }
+    if (stream.length) |length| if (sent != length) return .close;
+    if (deadlines) |operation_deadlines| operation_deadlines.write();
+    body.end() catch return .close;
     return if (keep_alive) .keep_alive else .close;
 }
 
@@ -1350,4 +1420,192 @@ test "malformed chunked framing aborts the sink" {
     try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 400"));
     try std.testing.expect(ctx.aborted and !ctx.finished);
     try std.testing.expectEqual(@as(usize, 0), calls);
+}
+
+/// Test source over a byte slice that counts reads and closes and can fail or
+/// lie about its length.
+const SliceSource = struct {
+    data: []const u8,
+    pos: usize = 0,
+    reads: usize = 0,
+    closes: usize = 0,
+    fail_after: ?usize = null,
+    /// Bytes handed out per `read`, to force several chunks.
+    step: usize = 4,
+
+    fn read(context: ?*anyopaque, buffer: []u8) anyerror!usize {
+        const self: *SliceSource = @ptrCast(@alignCast(context.?));
+        self.reads += 1;
+        if (self.fail_after) |limit| if (self.pos >= limit) return error.SourceFailed;
+        const n = @min(@min(buffer.len, self.step), self.data.len - self.pos);
+        @memcpy(buffer[0..n], self.data[self.pos..][0..n]);
+        self.pos += n;
+        return n;
+    }
+
+    fn close(context: ?*anyopaque) void {
+        const self: *SliceSource = @ptrCast(@alignCast(context.?));
+        self.closes += 1;
+    }
+
+    fn stream(self: *SliceSource, length: ?u64) response.BodyStream {
+        return .{ .context = self, .length = length, .read = read, .close = close };
+    }
+};
+
+/// Decodes the chunked body of a single response in `out`.
+fn decodeChunked(out: []const u8) ![]u8 {
+    var decoded: std.ArrayList(u8) = .empty;
+    errdefer decoded.deinit(std.testing.allocator);
+    var rest = out[std.mem.indexOf(u8, out, "\r\n\r\n").? + 4 ..];
+    while (true) {
+        const eol = std.mem.indexOf(u8, rest, "\r\n").?;
+        const len = try std.fmt.parseInt(usize, rest[0..eol], 16);
+        if (len == 0) break;
+        try decoded.appendSlice(std.testing.allocator, rest[eol + 2 ..][0..len]);
+        rest = rest[eol + 2 + len + 2 ..];
+    }
+    return decoded.toOwnedSlice(std.testing.allocator);
+}
+
+const StreamApp = struct {
+    source: *SliceSource,
+    length: ?u64,
+    status: u16 = 200,
+
+    fn dispatch(self: *const StreamApp, req: *router.Request) !response.Response {
+        _ = req;
+        var res = response.Response.init(std.testing.allocator);
+        errdefer res.deinit();
+        try res.setHeader("X-Kept", "yes");
+        try res.setHeader("Content-Length", "999");
+        try res.streamBody(self.status, "application/pdf", self.source.stream(self.length));
+        return res;
+    }
+};
+
+fn runStream(input: []const u8, app: *const StreamApp) ![]u8 {
+    var in = std.Io.Reader.fixed(input);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer out.deinit();
+    var server = std.http.Server.init(&in, &out.writer);
+    try serveConnection(StreamApp, std.testing.allocator, &server, app, .{});
+    return out.toOwnedSlice();
+}
+
+test "streamed body with a known length uses Content-Length and keeps the connection" {
+    var src: SliceSource = .{ .data = "hello world" };
+    const app: StreamApp = .{ .source = &src, .length = 11 };
+    const out = try runStream("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &app);
+    defer std.testing.allocator.free(out);
+    // The second request reuses the same source, which is already drained and
+    // closed once per response; only the first response carries the body.
+    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "content-length: 11\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "content-length: 999") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "transfer-encoding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "X-Kept: yes\r\n") != null or std.mem.indexOf(u8, out, "x-kept: yes\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\r\n\r\nhello world") != null);
+    try std.testing.expectEqual(@as(usize, 2), src.closes);
+}
+
+test "streamed body of unknown length is chunked, or close-delimited for HTTP/1.0" {
+    var src: SliceSource = .{ .data = "hello world" };
+    const app: StreamApp = .{ .source = &src, .length = null };
+    const chunked = try runStream("GET / HTTP/1.1\r\nHost: x\r\n\r\n", &app);
+    defer std.testing.allocator.free(chunked);
+    try std.testing.expect(std.mem.indexOf(u8, chunked, "transfer-encoding: chunked\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunked, "content-length") == null);
+    try std.testing.expect(std.mem.endsWith(u8, chunked, "0\r\n\r\n"));
+    const decoded_small = try decodeChunked(chunked);
+    defer std.testing.allocator.free(decoded_small);
+    try std.testing.expectEqualStrings("hello world", decoded_small);
+    try std.testing.expectEqual(@as(usize, 1), src.closes);
+
+    var src10: SliceSource = .{ .data = "hello world" };
+    const app10: StreamApp = .{ .source = &src10, .length = null };
+    const old = try runStream("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", &app10);
+    defer std.testing.allocator.free(old);
+    try std.testing.expect(std.mem.indexOf(u8, old, "transfer-encoding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, old, "content-length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, old, "keep-alive") == null);
+    try std.testing.expect(std.mem.endsWith(u8, old, "\r\n\r\nhello world"));
+    try std.testing.expectEqual(@as(usize, 1), src10.closes);
+}
+
+test "HEAD and bodyless statuses send no streamed body and still close the source" {
+    var head_src: SliceSource = .{ .data = "hello world" };
+    const head_app: StreamApp = .{ .source = &head_src, .length = 11 };
+    const head = try runStream("HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &head_app);
+    defer std.testing.allocator.free(head);
+    try std.testing.expect(std.mem.indexOf(u8, head, "content-length: 11\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, head, "\r\n\r\n"));
+    try std.testing.expectEqual(@as(usize, 0), head_src.reads);
+    try std.testing.expectEqual(@as(usize, 1), head_src.closes);
+
+    var nc_src: SliceSource = .{ .data = "hello world" };
+    const nc_app: StreamApp = .{ .source = &nc_src, .length = 11, .status = 204 };
+    const nc = try runStream("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &nc_app);
+    defer std.testing.allocator.free(nc);
+    try std.testing.expect(std.mem.startsWith(u8, nc, "HTTP/1.1 204 "));
+    try std.testing.expect(std.mem.indexOf(u8, nc, "content-length") == null);
+    try std.testing.expect(std.mem.endsWith(u8, nc, "\r\n\r\n"));
+    try std.testing.expectEqual(@as(usize, 0), nc_src.reads);
+    try std.testing.expectEqual(@as(usize, 1), nc_src.closes);
+}
+
+test "a streamed body that fails or lies about its length closes the connection" {
+    const pipelined = "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    var short_src: SliceSource = .{ .data = "hello" };
+    const short_app: StreamApp = .{ .source = &short_src, .length = 11 };
+    const short = try runStream(pipelined, &short_app);
+    defer std.testing.allocator.free(short);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, short, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.endsWith(u8, short, "\r\n\r\nhello"));
+    try std.testing.expectEqual(@as(usize, 1), short_src.closes);
+
+    var long_src: SliceSource = .{ .data = "hello world!!" };
+    const long_app: StreamApp = .{ .source = &long_src, .length = 5 };
+    const long = try runStream(pipelined, &long_app);
+    defer std.testing.allocator.free(long);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, long, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.indexOf(u8, long, "hello world") == null);
+    try std.testing.expectEqual(@as(usize, 1), long_src.closes);
+
+    var err_src: SliceSource = .{ .data = "hello world", .fail_after = 4 };
+    const err_app: StreamApp = .{ .source = &err_src, .length = null };
+    const failed = try runStream(pipelined, &err_app);
+    defer std.testing.allocator.free(failed);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, failed, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.indexOf(u8, failed, "0\r\n\r\n") == null);
+    try std.testing.expectEqual(@as(usize, 1), err_src.closes);
+}
+
+test "a client that disconnects mid-body still releases the source" {
+    const data = try std.testing.allocator.alloc(u8, 3 * stream_chunk_bytes);
+    defer std.testing.allocator.free(data);
+    @memset(data, 'x');
+    var src: SliceSource = .{ .data = data, .step = stream_chunk_bytes };
+    const app: StreamApp = .{ .source = &src, .length = data.len };
+    var in = std.Io.Reader.fixed("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var sink: [stream_chunk_bytes + 1024]u8 = undefined;
+    var out = std.Io.Writer.fixed(&sink);
+    var server = std.http.Server.init(&in, &out);
+    try serveConnection(StreamApp, std.testing.allocator, &server, &app, .{});
+    try std.testing.expect(src.pos < data.len);
+    try std.testing.expectEqual(@as(usize, 1), src.closes);
+}
+
+test "a multi-chunk streamed body arrives intact" {
+    const data = try std.testing.allocator.alloc(u8, 2 * stream_chunk_bytes + 123);
+    defer std.testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var src: SliceSource = .{ .data = data, .step = stream_chunk_bytes };
+    const app: StreamApp = .{ .source = &src, .length = null };
+    const out = try runStream("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &app);
+    defer std.testing.allocator.free(out);
+    const decoded = try decodeChunked(out);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, data, decoded);
 }

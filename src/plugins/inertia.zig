@@ -1912,6 +1912,7 @@ fn conflict(res: *response.Response, url: []const u8) RenderError!void {
 
 /// Replaces the body and content type with nothing, like `redirectPath`.
 fn emptyBody(res: *response.Response, status: u16) void {
+    res.dropStream();
     if (res.body.len != 0) res.allocator.free(res.body);
     if (res.content_type.len != 0) res.allocator.free(@constCast(res.content_type));
     res.body = &.{};

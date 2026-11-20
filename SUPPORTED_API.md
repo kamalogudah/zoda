@@ -364,11 +364,12 @@ dotfiles, and no URL prefix (`max_file_bytes` itself is unbounded). Session
 keys, clock, and lifetime have no usable defaults; supply all
 three explicitly.
 
-Response streaming, HTTP/2, native TLS, automatic 405/`Allow`, HEAD-to-GET
+HTTP/2, native TLS, automatic 405/`Allow`, HEAD-to-GET
 fallback, named captures, a route DSL, runtime template loading, directory
 listing, and index-file lookup are unsupported. HTTP/2 and TLS can terminate
-at a reverse proxy that forwards HTTP/1.1. Streaming requires a separate ADR
-and demonstrated use; HTTP/2 requires a new transport decision and integration
+at a reverse proxy that forwards HTTP/1.1. Response bodies can be streamed with
+`Response.streamBody` ([ADR-0003](adr_0003_response_streaming.md)); `static.zig`
+does not use it and there is no `Range` support. HTTP/2 requires a new transport decision and integration
 tests. These gates and other conditional follow-ups are in
 [the roadmap](zoda_plan.md#6-verification-and-remaining-decisions).
 
@@ -406,7 +407,7 @@ The 2026-10-27 rerun on the Ubuntu 24.04.4 host measured five valid edits at
 the reported 2 s target.
 
 The [streaming decision](zoda_plan.md#425-phase-2b-response-streaming-decision--issue-18)
-is buffered-only. The [HTTP/2 decision](zoda_plan.md#426-phase-2c-http2-feasibility--issue-19)
+was buffered-only and is superseded by [ADR-0003](adr_0003_response_streaming.md). The [HTTP/2 decision](zoda_plan.md#426-phase-2c-http2-feasibility--issue-19)
 is HTTP/1.0 and HTTP/1.1 only because pinned `std.http.Server` has no HTTP/2
 server path. The transport tests pin prior-knowledge h2c rejection and lack of
 an h2c upgrade. Zoda differs from Roda in Zig's explicit allocator and slice
